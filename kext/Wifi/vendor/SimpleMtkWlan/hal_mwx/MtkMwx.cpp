@@ -2082,13 +2082,16 @@ mwx_intr(void *arg)
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
-	/* MtkWireless: all ones is a device that left the bus (surprise
-	 * removal, PCIe link down); there is nothing to service. */
+	/* MtkWireless: all ones means the register is unreadable (device left
+	 * the bus, link down, or a transient read while asleep): nothing to
+	 * service. Re-enable as for a spurious interrupt, so a transient read
+	 * cannot leave interrupts off; a write to a gone device is dropped. */
 	if (intr == 0xffffffff) {
 		static uint32_t gone_log_count;
 
 		if (gone_log_count++ < 4)
-			MWX_DEV_LOG(sc, "interrupt status reads all ones: device not present\n");
+			MWX_DEV_LOG(sc, "interrupt status reads all ones\n");
+		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 		return 0;
 	}
 	if (intr == 0) {
