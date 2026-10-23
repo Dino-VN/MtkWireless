@@ -95,6 +95,9 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 3. Wi-Fi MAC: RXD, packet class, TX-free (done), TXWI, TXS, rates.
 4. Wi-Fi control TLVs and HAL state machine.
 5. DMA rings and interrupts in Rust.
+6. AWDL (`include/AWDL`): protocol and scheduling to Rust (in progress).
+
+Nothing has been run on hardware yet (as of phase 3b).
 
 Baseline for porting: SimpleMtkWlan `dfca847`, SimpleMtkBtFw `07a77db` plus
 its uncommitted LE-features shim. Upstream behavior notes for Bluetooth are in
