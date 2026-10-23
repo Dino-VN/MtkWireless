@@ -14,6 +14,8 @@ extern crate mtk_kernel;
 #[cfg(feature = "bt")]
 mod bt;
 mod selftest;
+#[cfg(feature = "wifi")]
+mod wifi;
 
 use core::ffi::c_char;
 use mtk_kernel::log::{self, LogSink};

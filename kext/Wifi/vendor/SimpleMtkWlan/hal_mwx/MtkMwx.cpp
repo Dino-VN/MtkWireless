@@ -29,6 +29,7 @@
  */
 
 #include "MtkMwx.hpp"
+#include "mtk_wlan.h"
 #include <AWDL/AwdlProtocol.hpp>
 
 #include <linux/kernel.h>
@@ -4465,11 +4466,9 @@ mwx_mcu_gen_dl_mode(uint8_t feature_set)
 int
 mwx_load_firmware(struct mwx_softc *sc)
 {
-	struct mwx_patch_hdr *hdr;
-	struct mwx_fw_trailer *fwhdr;
 	const char *rompatch, *fw;
-	u_char *buf = NULL, *fwbuf = NULL, *dl;
-	size_t buflen = 0, fwlen = 0, offset = 0;
+	u_char *buf = NULL, *fwbuf = NULL;
+	size_t buflen = 0, fwlen = 0;
 	uint32_t reg, n_region, override = 0, option = 0;
 	int i, rv, sem;
 
@@ -4531,61 +4530,35 @@ mwx_load_firmware(struct mwx_softc *sc)
 	}
 	MWX_DEV_LOG(sc, "patch semaphore acquired\n");
 
-	if (buflen < sizeof(*hdr)) {
-		MWX_DEV_LOG(sc, "invalid patch firmware size=%zu min=%zu\n",
-		    buflen, sizeof(*hdr));
-		rv = EINVAL;
+	/* MtkWireless: image layout is parsed and bounds-checked in Rust
+	 * (rust/mtk-wlan/src/connac2/fw.rs). */
+	mtk_wlan_patch_info pinfo;
+	if ((rv = mtk_wlan_patch_parse(buf, buflen, &pinfo)) != 0) {
+		MWX_DEV_LOG(sc, "invalid patch firmware size=%zu\n", buflen);
 		goto out;
 	}
-	hdr = (struct mwx_patch_hdr *)buf;
-	n_region = be32toh(hdr->desc.n_region);
-	if (buflen < sizeof(*hdr) + n_region * sizeof(struct mwx_patch_sec)) {
-		MWX_DEV_LOG(sc, "invalid patch firmware short header size=%zu regions=%u\n",
-		    buflen, n_region);
-		rv = EINVAL;
-		goto out;
-	}
+	n_region = pinfo.regions;
 	MWX_DEV_LOG(sc, "patch header hw_sw=0x%x patch_ver=0x%x regions=%u build=%.15s\n",
-	    be32toh(hdr->hw_sw_ver), be32toh(hdr->patch_ver),
-	    n_region, hdr->build_date);
+	    pinfo.hw_sw_ver, pinfo.patch_ver, n_region, pinfo.build_date);
 
 	for (i = 0; i < n_region; i++) {
-		struct mwx_patch_sec *sec;
-		uint32_t len, addr, mode, sec_info;
+		mtk_wlan_fw_region region;
 
-		sec = (struct mwx_patch_sec *)(buf + sizeof(*hdr) +
-		    i * sizeof(*sec));
-		if ((be32toh(sec->type) & PATCH_SEC_TYPE_MASK) !=
-		    PATCH_SEC_TYPE_INFO) {
-			MWX_DEV_LOG(sc, "invalid patch region index=%d type=0x%x\n",
-			    i, be32toh(sec->type));
-			rv = EINVAL;
+		if ((rv = mtk_wlan_patch_region(buf, buflen, i, &region)) != 0) {
+			MWX_DEV_LOG(sc, "invalid patch region index=%d\n", i);
 			goto out;
 		}
+		MWX_DEV_LOG(sc, "patch region index=%d addr=0x%08x len=%u mode=0x%08x\n",
+		    i, region.addr, region.len, region.mode);
 
-		addr = be32toh(sec->info.addr);
-		len = be32toh(sec->info.len);
-		dl = buf + be32toh(sec->offs);
-		sec_info = be32toh(sec->info.sec_key_idx);
-		mode = mwx_get_data_mode(sc, sec_info);
-		MWX_DEV_LOG(sc, "patch region index=%d addr=0x%08x len=%u mode=0x%08x sec=0x%08x\n",
-		    i, addr, len, mode, sec_info);
-
-		if (dl + len > buf + buflen) {
-			MWX_DEV_LOG(sc, "patch region index=%d exceeds payload len=%u\n",
-			    i, len);
-			rv = EINVAL;
-			goto out;
-		}
-
-		rv = mwx_mcu_init_download(sc, addr, len, mode);
+		rv = mwx_mcu_init_download(sc, region.addr, region.len, region.mode);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "patch download request failed index=%d error=%d\n",
 			    i, rv);
 			goto out;
 		}
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    dl, len, MWX_FW_CHUNK);
+		    buf + region.offset, region.len, MWX_FW_CHUNK);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "patch send failed index=%d error=%d\n",
 			    i, rv);
@@ -4608,56 +4581,29 @@ out:
 	if (rv != 0)
 		goto fail;
 
-	if (fwlen < sizeof(*fwhdr)) {
-		MWX_DEV_LOG(sc, "invalid WM firmware size=%zu min=%zu\n",
-		    fwlen, sizeof(*fwhdr));
-		rv = EINVAL;
+	mtk_wlan_ram_info rinfo;
+	if ((rv = mtk_wlan_ram_parse(fwbuf, fwlen, &rinfo)) != 0) {
+		MWX_DEV_LOG(sc, "invalid WM firmware size=%zu\n", fwlen);
 		goto fail;
 	}
-	fwhdr = (struct mwx_fw_trailer *)(fwbuf + fwlen - sizeof(*fwhdr));
 	MWX_DEV_LOG(sc, "WM header version=%.10s build=%.15s chip=0x%02x eco=0x%02x regions=%u\n",
-	    fwhdr->fw_ver, fwhdr->build_date, fwhdr->chip_id,
-	    fwhdr->eco_code, fwhdr->n_region);
+	    rinfo.fw_ver, rinfo.build_date, rinfo.chip_id,
+	    rinfo.eco_code, rinfo.regions);
 
-	if (fwlen < sizeof(*fwhdr) +
-	    fwhdr->n_region * sizeof(struct mwx_fw_region)) {
-		MWX_DEV_LOG(sc, "invalid WM firmware short header size=%zu regions=%u\n",
-		    fwlen, fwhdr->n_region);
-		rv = EINVAL;
-		goto fail;
-	}
+	for (i = 0; i < rinfo.regions; i++) {
+		mtk_wlan_fw_region region;
 
-	for (i = 0; i < fwhdr->n_region; i++) {
-		struct mwx_fw_region *region;
-		uint32_t len, addr, mode;
-
-		region = (struct mwx_fw_region *)((u_char *)fwhdr -
-		    (fwhdr->n_region - i) * sizeof(*region));
-
-		addr = le32toh(region->addr);
-		len = le32toh(region->len);
-		mode = mwx_mcu_gen_dl_mode(region->feature_set);
-
-		if (region->feature_set & FW_FEATURE_OVERRIDE_ADDR)
-			override = addr;
-		MWX_DEV_LOG(sc, "WM region index=%d addr=0x%08x len=%u mode=0x%08x feature=0x%02x offset=%zu ebusy_sleeps=%u enomem_retries=%u\n",
-		    i, addr, len, mode, region->feature_set, offset,
-		    mwx_ebusy_sleeps, mwx_enomem_retries);
-
-		if (offset + len > fwlen - sizeof(*fwhdr) -
-		    fwhdr->n_region * sizeof(struct mwx_fw_region)) {
-			MWX_DEV_LOG(sc, "WM region index=%d exceeds payload len=%u offset=%zu\n",
-			    i, len, offset);
-			rv = EINVAL;
+		if ((rv = mtk_wlan_ram_region(fwbuf, fwlen, i, &region)) != 0) {
+			MWX_DEV_LOG(sc, "invalid WM region index=%d\n", i);
 			goto fail;
 		}
-
-		if (region->feature_set & FW_FEATURE_NON_DL) {
-			offset += len;
+		MWX_DEV_LOG(sc, "WM region index=%d addr=0x%08x len=%u mode=0x%08x feature=0x%02x offset=%zu ebusy_sleeps=%u enomem_retries=%u\n",
+		    i, region.addr, region.len, region.mode, region.feature,
+		    region.offset, mwx_ebusy_sleeps, mwx_enomem_retries);
+		if (!region.download)
 			continue;
-		}
 
-		rv = mwx_mcu_init_download(sc, addr, len, mode);
+		rv = mwx_mcu_init_download(sc, region.addr, region.len, region.mode);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "WM download request failed index=%d error=%d\n",
 			    i, rv);
@@ -4665,18 +4611,16 @@ out:
 		}
 
 		rv = mwx_mcu_send_firmware(sc, MCU_CMD_FW_SCATTER,
-		    fwbuf + offset, len, MWX_FW_CHUNK);
+		    fwbuf + region.offset, region.len, MWX_FW_CHUNK);
 		if (rv != 0) {
 			MWX_DEV_LOG(sc, "WM send failed index=%d error=%d\n",
 			    i, rv);
 			goto fail;
 		}
-		offset += len;
 	}
 
-	if (override != 0)
-		option |= FW_START_OVERRIDE;
-
+	override = rinfo.override_addr;
+	option = rinfo.start_option;
 	rv = mwx_mcu_start_firmware(sc, override, option);
 	if (rv != 0) {
 		MWX_DEV_LOG(sc, "firmware start failed override=0x%08x option=0x%08x error=%d\n",

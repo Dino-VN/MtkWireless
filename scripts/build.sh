@@ -196,7 +196,7 @@ for variant in Tahoe:__MAC_26_0; do
         "-DSMTW_VERSION=\"MtkWireless $VERSION\"" '-DGIT_COMMIT=""' -DIEEE80211_STA_ONLY
         $(for d in "${WIFI_QUOTE_DIRS[@]}"; do printf -- '-iquote %s ' "$V/$d"; done)
         -I "$KSDK/Headers" -I "$V/include/Airport" -I "$V/AirportMtkWlan" -I "$V/SimpleMtkWlan"
-        -I "$V/SimpleMtkWlan/hal_mwx" -I "$ROOT/kext/common" -I "$WIFI_GEN"
+        -I "$V/SimpleMtkWlan/hal_mwx" -I "$ROOT/kext/common" -I "$ROOT/kext/Wifi" -I "$WIFI_GEN"
         -isystem "$V/mtk80211/openbsd" -isystem "$V/mtk80211" -isystem "$V/include"
         -I "$PRIVATE_HEADERS" -I "$KSDK/Headers")
     compile "$OBJ/wifi-$name" "${WIFI_FLAGS[@]}" -w \

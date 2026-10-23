@@ -40,8 +40,10 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
   target, MacKernelSDK before the SDK's PrivateHeaders, header-map dirs as
   `-iquote`. Changing any of these changes IOKit vtable layouts; diff
   `nm -u` against an Xcode build after touching the flags. Tahoe
-  (`__IO80211_TARGET=__MAC_26_0`) only for now. Local edits:
-  `include/FwData.h` (embedded firmware lookup).
+  (`__IO80211_TARGET=__MAC_26_0`) only for now. Local edits (search for
+  "MtkWireless:" / `mtk_wlan_`): `include/FwData.h` (embedded firmware
+  lookup), `hal_mwx/MtkMwx.cpp` `mwx_load_firmware` (image parsing in Rust).
+  Rust ABI for the HAL: `kext/Wifi/mtk_wlan.h`.
 - `kext/common/EmbeddedFirmware.cpp`: zlib firmware table shared by both kexts.
 - `firmware/wifi/*`: extracted from SimpleMtkWlan's `FwBinary.cpp`.
 - `firmware/bt/*.bin`: embedded by `scripts/embed_firmware.py` (zlib +
@@ -85,7 +87,9 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 0. Toolchain, self-test stubs (done).
 1. BT in Rust, parity with SimpleMtkBtFw 1.1.0 + LE-features shim (done,
    not yet run on hardware).
-2. Wi-Fi parsers: firmware patch/RAM, MCU messages and events.
+2. Wi-Fi parsers: firmware patch/RAM (done; `cargo run -p mtk-wlan --example
+   dump_regions -- ../firmware/wifi/*` prints the download plan), MCU
+   messages and events.
 3. Wi-Fi MAC: RXD/TXWI, tx-free, rates.
 4. Wi-Fi control TLVs and HAL state machine.
 5. DMA rings and interrupts in Rust.

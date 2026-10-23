@@ -30,3 +30,6 @@ version = "0.1.0"
 [[package]]
 name = "mtk-wlan"
 version = "0.1.0"
+dependencies = [
+ "mtk-common",
+]

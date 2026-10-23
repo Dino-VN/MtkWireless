@@ -8,3 +8,4 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod chip;
+pub mod connac2;

@@ -9,7 +9,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSString.h>
 
-#include "mtk_rust.h"
+#include "mtk_wlan.h"
 
 #define super IOService
 OSDefineMetaClassAndStructors(MtkWirelessWifi, IOService)
