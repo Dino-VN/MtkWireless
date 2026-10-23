@@ -11,8 +11,9 @@ pub enum Chip {
 }
 
 impl Chip {
+    /// Exact register value, as `btmtk_usb_setup` switches on it.
     pub const fn from_dev_id(dev_id: u32) -> Option<Self> {
-        match dev_id & 0xffff {
+        match dev_id {
             0x7961 => Some(Chip::Mt7961),
             0x7922 => Some(Chip::Mt7922),
             _ => None,
@@ -55,6 +56,13 @@ impl FirmwareName {
             (fw_version & 0xff) + 1
         );
         name
+    }
+
+    /// The name followed by a NUL, for C callers.
+    pub fn to_c_bytes(&self) -> [u8; 49] {
+        let mut out = [0; 49];
+        out[..self.len].copy_from_slice(&self.buf[..self.len]);
+        out
     }
 
     pub fn as_str(&self) -> &str {
@@ -107,5 +115,6 @@ mod tests {
     #[test]
     fn unknown_dev_id() {
         assert_eq!(Chip::from_dev_id(0x7663), None);
+        assert_eq!(Chip::from_dev_id(0x1_7961), None);
     }
 }

@@ -5,3 +5,6 @@ license = "GPL-3.0-only"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+[dependencies]
+mtk-common.workspace = true

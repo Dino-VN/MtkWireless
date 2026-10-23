@@ -11,6 +11,8 @@ extern crate alloc;
 // Links the allocator and panic handler on the kext target.
 extern crate mtk_kernel;
 
+#[cfg(feature = "bt")]
+mod bt;
 mod selftest;
 
 use core::ffi::c_char;

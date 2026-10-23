@@ -33,6 +33,31 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 - `rust/mtk-ffi`: the staticlib, built once per kext with feature `wifi` or
   `bt`. C header: `kext/include/mtk_rust.h` (keep in sync by hand).
 - `kext/Wifi`, `kext/BT`: C++ shells and Info.plists (`@MODULE_VERSION@`).
+  BT: `BtLoader` (IOUSBHostDevice, runs `mtk_bt_setup`), `Patcher` (Lilu
+  routes), `BtFirmware` (kernel zlib), `mtk_bt.h` (Rust ABI).
+- `firmware/bt/*.bin`: embedded by `scripts/embed_firmware.py` (zlib +
+  `.incbin`) into `build/gen/bt`.
+
+## How macOS uses the Bluetooth controller (do not regress)
+
+- `bluetoothd` (bm3_usb) talks to the USB device from user space; the kernel
+  only loads firmware. HCI commands = EP0 class requests, events = interrupt
+  IN, ACL = bulk, SCO = isochronous interface 1.
+- Leave the USB "Product Name" alone: `Found_USB_Dongle()` skips devices named
+  "Bluetooth USB Host Controller" (Apple's internal module, assumed Broadcom).
+  The third-party dongle path needs NVRAM `bluetoothInternalControllerInfo`
+  (14 bytes) and `bluetoothExternalDongleFailed` (`00`).
+- `HCI_Read_Clock(handle, 0)`: MediaTek returns handle 0 and AAC-ELD to
+  AirPods never plays; the route sends `Which_Clock = 1`.
+- ACL to MediaTek must be non-flushable (PB 0b00) or AAC-ELD frames break.
+- `0xFD3C` LE feature mask is rejected by MediaTek; the shim turns the
+  rejection into Command Complete (docs/BLE-ADVERTISING.md). Unverified on
+  hardware.
+- `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
+  AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
+  crashes make launchd throttle it (640–1200 s).
+- The core's `sse` future-incompat warning from `core` is expected on a
+  soft-float target and harmless.
 
 ## Rules
 
@@ -49,7 +74,8 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 ## Phases
 
 0. Toolchain, self-test stubs (done).
-1. BT in Rust, parity with SimpleMtkBtFw 1.1.0 + LE-features shim.
+1. BT in Rust, parity with SimpleMtkBtFw 1.1.0 + LE-features shim (done,
+   not yet run on hardware).
 2. Wi-Fi parsers: firmware patch/RAM, MCU messages and events.
 3. Wi-Fi MAC: RXD/TXWI, tx-free, rates.
 4. Wi-Fi control TLVs and HAL state machine.

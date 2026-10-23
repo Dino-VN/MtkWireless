@@ -13,19 +13,16 @@ Successor of [SimpleMtkWlan](https://github.com/Dino-VN/SimpleMtkWlan) and
 
 ## Status
 
-**Phase 0 (toolchain).** Both kexts attach to `IOResources`, run the Rust
-core self-test and publish the result; they do not drive the hardware yet.
-They are safe to load next to SimpleMtkWlan / SimpleMtkBtFw.
+| | |
+|---|---|
+| **MtkWirelessBT** | Full replacement for SimpleMtkBtFw + SimpleMtkBtPatcher (firmware load, AirPods fixes, BLE feature-mask shim), protocol logic in Rust. Built and unit-tested; not yet run on hardware. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md). |
+| **MtkWirelessWifi** | Self-test stub (attaches to `IOResources` only). Keep AirportMtkWlan for Wi-Fi until it is replaced. |
 
-Check after boot:
+After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 
 ```sh
-ioreg -l -w0 | grep -E 'RustCore|RustSelfTestFailed'   # Wi-Fi: on the MtkWirelessWifi entry
-ioreg -l -w0 -n IOResources | grep -A3 MtkWirelessBT     # BT: on IOResources
+ioreg -l -w0 | grep -E 'RustCore|RustSelfTestFailed'
 ```
-
-`RustSelfTestFailed = 0` means the kernel runtime works (heap, aligned heap,
-formatting, 128-bit math, bounds checks, chip tables).
 
 ## Build
 
@@ -40,5 +37,6 @@ scripts/package.sh Release    # dist/MtkWireless-<version>-RELEASE.zip
 
 ## Install (OpenCore)
 
-Copy both kexts to `EFI/OC/Kexts` and add the entries from
-`docs/config-snippet.plist` to `Kernel → Add` (Lilu first).
+Copy the kexts to `EFI/OC/Kexts` and merge `docs/config-snippet.plist`
+(`Kernel → Add` in order, NVRAM variables for Bluetooth). Remove
+SimpleMtkBtFw and SimpleMtkBtPatcher first. Details: [docs/BLUETOOTH.md](docs/BLUETOOTH.md).

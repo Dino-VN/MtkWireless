@@ -1,66 +1,116 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  OpenCore Kernel -> Add entries, in this order (Lilu first).
-  MtkWirelessWifi and MtkWirelessBT are independent: either can be disabled.
-  Phase 0 builds only run a self-test; keep SimpleMtkWlan/SimpleMtkBtFw
-  enabled for working Wi-Fi and Bluetooth until phase 1.
+  Merge into OpenCore config.plist: Kernel -> Add (keep this order, Lilu
+  first) and NVRAM -> Add / Delete. MtkWirelessWifi and MtkWirelessBT are
+  independent; disable either one. Do not also load SimpleMtkBtFw or
+  SimpleMtkBtPatcher. MtkWirelessWifi is still a self-test stub (phase 0):
+  keep AirportMtkWlan for working Wi-Fi until it is replaced.
 -->
 <plist version="1.0">
-<array>
+<dict>
+	<key>Kernel</key>
 	<dict>
-		<key>Arch</key>
-		<string>x86_64</string>
-		<key>BundlePath</key>
-		<string>Lilu.kext</string>
-		<key>Comment</key>
-		<string>Lilu (needed by MtkWirelessBT)</string>
-		<key>Enabled</key>
-		<true/>
-		<key>ExecutablePath</key>
-		<string>Contents/MacOS/Lilu</string>
-		<key>MaxKernel</key>
-		<string></string>
-		<key>MinKernel</key>
-		<string></string>
-		<key>PlistPath</key>
-		<string>Contents/Info.plist</string>
+		<key>Add</key>
+		<array>
+			<dict>
+				<key>Arch</key>
+				<string>x86_64</string>
+				<key>BundlePath</key>
+				<string>Lilu.kext</string>
+				<key>Comment</key>
+				<string>Lilu (needed by MtkWirelessBT)</string>
+				<key>Enabled</key>
+				<true/>
+				<key>ExecutablePath</key>
+				<string>Contents/MacOS/Lilu</string>
+				<key>MaxKernel</key>
+				<string></string>
+				<key>MinKernel</key>
+				<string></string>
+				<key>PlistPath</key>
+				<string>Contents/Info.plist</string>
+			</dict>
+			<dict>
+				<key>Arch</key>
+				<string>x86_64</string>
+				<key>BundlePath</key>
+				<string>BlueToolFixup.kext</string>
+				<key>Comment</key>
+				<string>BrcmPatchRAM BlueToolFixup</string>
+				<key>Enabled</key>
+				<true/>
+				<key>ExecutablePath</key>
+				<string>Contents/MacOS/BlueToolFixup</string>
+				<key>MaxKernel</key>
+				<string></string>
+				<key>MinKernel</key>
+				<string>21.0.0</string>
+				<key>PlistPath</key>
+				<string>Contents/Info.plist</string>
+			</dict>
+			<dict>
+				<key>Arch</key>
+				<string>x86_64</string>
+				<key>BundlePath</key>
+				<string>MtkWirelessWifi.kext</string>
+				<key>Comment</key>
+				<string>MediaTek MT7921/MT7922 Wi-Fi</string>
+				<key>Enabled</key>
+				<true/>
+				<key>ExecutablePath</key>
+				<string>Contents/MacOS/MtkWirelessWifi</string>
+				<key>MaxKernel</key>
+				<string></string>
+				<key>MinKernel</key>
+				<string></string>
+				<key>PlistPath</key>
+				<string>Contents/Info.plist</string>
+			</dict>
+			<dict>
+				<key>Arch</key>
+				<string>x86_64</string>
+				<key>BundlePath</key>
+				<string>MtkWirelessBT.kext</string>
+				<key>Comment</key>
+				<string>MediaTek MT7921/MT7922 Bluetooth</string>
+				<key>Enabled</key>
+				<true/>
+				<key>ExecutablePath</key>
+				<string>Contents/MacOS/MtkWirelessBT</string>
+				<key>MaxKernel</key>
+				<string></string>
+				<key>MinKernel</key>
+				<string></string>
+				<key>PlistPath</key>
+				<string>Contents/Info.plist</string>
+			</dict>
+		</array>
 	</dict>
+	<key>NVRAM</key>
 	<dict>
-		<key>Arch</key>
-		<string>x86_64</string>
-		<key>BundlePath</key>
-		<string>MtkWirelessWifi.kext</string>
-		<key>Comment</key>
-		<string>MediaTek MT7921/MT7922 Wi-Fi</string>
-		<key>Enabled</key>
-		<true/>
-		<key>ExecutablePath</key>
-		<string>Contents/MacOS/MtkWirelessWifi</string>
-		<key>MaxKernel</key>
-		<string></string>
-		<key>MinKernel</key>
-		<string></string>
-		<key>PlistPath</key>
-		<string>Contents/Info.plist</string>
+		<key>Add</key>
+		<dict>
+			<key>7C436110-AB2A-4BBB-A880-FE41995C9F82</key>
+			<dict>
+				<key>bluetoothExternalDongleFailed</key>
+				<data>
+				AA==
+				</data>
+				<key>bluetoothInternalControllerInfo</key>
+				<data>
+				AAAAAAAAAAAAAAAAAAA=
+				</data>
+			</dict>
+		</dict>
+		<key>Delete</key>
+		<dict>
+			<key>7C436110-AB2A-4BBB-A880-FE41995C9F82</key>
+			<array>
+				<string>bluetoothInternalControllerInfo</string>
+				<string>bluetoothExternalDongleFailed</string>
+			</array>
+		</dict>
 	</dict>
-	<dict>
-		<key>Arch</key>
-		<string>x86_64</string>
-		<key>BundlePath</key>
-		<string>MtkWirelessBT.kext</string>
-		<key>Comment</key>
-		<string>MediaTek MT7921/MT7922 Bluetooth</string>
-		<key>Enabled</key>
-		<true/>
-		<key>ExecutablePath</key>
-		<string>Contents/MacOS/MtkWirelessBT</string>
-		<key>MaxKernel</key>
-		<string></string>
-		<key>MinKernel</key>
-		<string></string>
-		<key>PlistPath</key>
-		<string>Contents/Info.plist</string>
-	</dict>
-</array>
+</dict>
 </plist>

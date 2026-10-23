@@ -93,7 +93,10 @@ build_kext() {
     objs+=("$objdir/${name}_info.o")
     for src in "$@"; do
         local o="$objdir/$(basename "${src%.*}").o"
-        "$CXX" "${CFLAGS[@]}" "${CXXFLAGS[@]}" ${extra[@]+"${extra[@]}"} -c "$src" -o "$o"
+        case "$src" in
+            *.s) "$CC" "${TARGET[@]}" -c "$src" -o "$o" ;;
+            *)   "$CXX" "${CFLAGS[@]}" "${CXXFLAGS[@]}" ${extra[@]+"${extra[@]}"} -c "$src" -o "$o" ;;
+        esac
         objs+=("$o")
     done
 
@@ -114,8 +117,11 @@ build_kext MtkWirelessWifi com.dinovn.MtkWirelessWifi "$WIFI_LIB" 0 0 \
     -- kext/Wifi/MtkWirelessWifi.cpp
 
 BT_LIB="$(rust_lib bt)"
+BT_GEN="$ROOT/build/gen/bt"
+python3 scripts/embed_firmware.py mtkbt "$BT_GEN" firmware/bt/*.bin
 build_kext MtkWirelessBT com.dinovn.MtkWirelessBT "$BT_LIB" MtkWirelessBT_kern_start MtkWirelessBT_kern_stop \
-    -DPRODUCT_NAME=MtkWirelessBT -isystem "$LILU" \
-    -- kext/BT/MtkWirelessBT.cpp "$LILU/Library/plugin_start.cpp"
+    -DPRODUCT_NAME=MtkWirelessBT -isystem "$LILU" -I "$ROOT/kext/BT" -I "$BT_GEN" \
+    -- kext/BT/MtkWirelessBT.cpp kext/BT/BtLoader.cpp kext/BT/BtFirmware.cpp kext/BT/USBDeviceController.cpp \
+       kext/BT/Patcher.cpp "$LILU/Library/plugin_start.cpp" "$BT_GEN/firmware.s"
 
 scripts/check.sh "$CONF"

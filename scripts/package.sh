@@ -14,7 +14,7 @@ for name in MtkWirelessWifi MtkWirelessBT; do
     test -d "build/$CONF/$name.kext" || { echo "missing build/$CONF/$name.kext" >&2; exit 1; }
     cp -R "build/$CONF/$name.kext" "$stage/Kexts/"
 done
-cp docs/config-snippet.plist "$stage/"
+cp docs/config-snippet.plist docs/*.md "$stage/"
 cp LICENSES/*.txt "$stage/"
 (cd "$(dirname "$stage")" && zip -qry "$OLDPWD/dist/$(basename "$stage").zip" "$(basename "$stage")")
 rm -rf "$(dirname "$stage")"
