@@ -3455,13 +3455,14 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 
 	while ((m = ml_dequeue(ml)) != NULL) {
 		data = mtod(m, uint32_t *);
-		rxd = le32toh(data[0]);
-
-		type = MT_RXD0_PKT_TYPE_GET(rxd);
-		flag = (rxd & MT_RXD0_PKT_FLAG_MASK) >> MT_RXD0_PKT_FLAG_SHIFT;
-
-		if (type == PKT_TYPE_RX_EVENT && flag == 0x1)
-			type = PKT_TYPE_NORMAL_MCU;
+		/* MtkWireless: classified in Rust, which also rejects packets
+		 * too short to hold the first dword. */
+		if (!mtk_wlan_rx_classify(mtod(m, const uint8_t *), mbuf_len(m),
+		    &type, &flag, &rxd)) {
+			unknown_count++;
+			m_freem(m);
+			continue;
+		}
 
 		switch (type) {
 		case PKT_TYPE_RX_EVENT:
@@ -3473,11 +3474,11 @@ mwx_dma_rx_process(struct mwx_softc *sc, struct mbuf_list *ml)
 			mwx_mac_tx_free(sc, m);
 			break;
 		case PKT_TYPE_TXS: {
-			size_t words = mbuf_len(m) / sizeof(uint32_t);
+			size_t records = mtk_wlan_txs_records(mbuf_len(m));
 			size_t i;
 
-			for (i = 2; i + 8 <= words; i += 8)
-				mt7921_mac_add_txs(sc, &data[i]);
+			for (i = 0; i < records; i++)
+				mt7921_mac_add_txs(sc, &data[2 + 8 * i]);
 			m_freem(m);
 			break;
 		}
@@ -6688,53 +6689,33 @@ void
 mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 {
 	struct mwx_txwi *mt;
-	uint32_t *txfree;
-	uint32_t txval;
-	int count, i;
 
 	mwx_dma_tx_cleanup(sc, &sc->sc_txq);
 
 	/* Both the event header and each PAIR/MSDU word must be present. */
-	if (mbuf_pkthdr_len(m) < 2 * sizeof(txval))
+	if (mbuf_pkthdr_len(m) < 2 * sizeof(uint32_t))
 		goto out;
 
 	if ((m = m_pullup(m, mbuf_pkthdr_len(m))) == NULL)
 		return;
 
-	txfree = mtod(m, uint32_t *);
-	txval = le32toh(txfree[0]);
-	m_adj(m, 2 * sizeof(txval));
+	/* MtkWireless: words and PAIR entries are walked in Rust
+	 * (rust/mtk-wlan/src/connac2/event.rs). */
+	mtk_wlan_tx_free_iter it;
+	mtk_wlan_tx_freed freed;
 
-	count = MT_TX_FREE0_MSDU_CNT_GET(txval);
-
-	if (count * sizeof(txval) > mbuf_len(m))
-		goto out;
-
-	txfree = mtod(m, uint32_t *);
-	for (i = 0; i < count; i++) {
-		uint16_t msdu;
-
-		/* PAIR words extend count, but never the received payload. */
-		if ((size_t)i >= mbuf_len(m) / sizeof(*txfree))
-			break;
-		txval = le32toh(txfree[i]);
-		if (txval & MT_TX_FREE_PAIR) {
-			count++;
+	mtk_wlan_tx_free_begin(mtod(m, const uint8_t *), mbuf_len(m), &it);
+	while (mtk_wlan_tx_free_next(&it, &freed)) {
+		if (freed.msdu >= sc->sc_txwi.mt_count)
 			continue;
-		}
-
-		msdu = MT_TX_FREE_MSDU_ID_GET(txval);
-		if (msdu >= sc->sc_txwi.mt_count)
-			continue;
-		mt = &sc->sc_txwi.mt_data[msdu];
+		mt = &sc->sc_txwi.mt_data[freed.msdu];
 		if (mt->mt_busy == 0)
 			continue;
 		if (mt->mt_eapol) {
 			/* status 0 = acked; count = transmissions */
 			MWX_DEV_LOG(sc, "eapol txfree msdu=%u stat=%u count=%u "
-			    "raw=0x%08x\n", msdu,
-			    (txval & MT_TX_FREE_STATUS_MASK) >> 13,
-			    txval & MT_TX_FREE_COUNT_MASK, txval);
+			    "raw=0x%08x\n", freed.msdu, freed.status, freed.count,
+			    freed.raw);
 			mt->mt_eapol = 0;
 		}
 		mwx_txwi_put(sc, mt);

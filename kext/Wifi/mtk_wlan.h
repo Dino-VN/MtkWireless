@@ -83,6 +83,30 @@ uint32_t mtk_wlan_rx_parse(const uint8_t *frame, size_t len, uint8_t num_streams
                            uint32_t antenna_mask, mtk_wlan_rx_info *info);
 const char *mtk_wlan_rx_drop_name(uint32_t reason);
 
+/* RX ring packet class (rust/mtk-wlan/src/connac2/event.rs). PKT_TYPE_*
+ * values; an RX event with flag 1 is reported as PKT_TYPE_NORMAL_MCU.
+ * false for packets shorter than one dword. */
+bool mtk_wlan_rx_classify(const uint8_t *packet, size_t len, uint32_t *kind, uint32_t *flag,
+                          uint32_t *rxd0);
+/* 8-dword TX status records in a TXS packet of len bytes (from dword 2). */
+size_t mtk_wlan_txs_records(size_t len);
+
+/* MSDUs released by a TXRX_NOTIFY packet. */
+typedef struct mtk_wlan_tx_free_iter {
+    const uint8_t *words;
+    size_t len;
+    size_t index;
+    size_t count;
+} mtk_wlan_tx_free_iter;
+typedef struct mtk_wlan_tx_freed {
+    uint16_t msdu; /* still range-check against the TXWI table */
+    uint8_t status; /* 0 = acknowledged */
+    uint16_t count; /* transmissions */
+    uint32_t raw;
+} mtk_wlan_tx_freed;
+void mtk_wlan_tx_free_begin(const uint8_t *packet, size_t len, mtk_wlan_tx_free_iter *it);
+bool mtk_wlan_tx_free_next(mtk_wlan_tx_free_iter *it, mtk_wlan_tx_freed *out);
+
 #ifdef __cplusplus
 }
 #endif

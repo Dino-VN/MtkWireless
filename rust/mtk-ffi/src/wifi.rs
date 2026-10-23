@@ -265,3 +265,110 @@ pub extern "C" fn mtk_wlan_rx_drop_name(reason: u32) -> *const c_char {
     };
     name.as_ptr()
 }
+
+/// Packet class of an RX ring buffer. Returns false for a packet shorter
+/// than one dword.
+///
+/// # Safety
+/// `packet` points to `len` bytes; outputs are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_rx_classify(
+    packet: *const u8,
+    len: usize,
+    kind: *mut u32,
+    flag: *mut u32,
+    rxd0: *mut u32,
+) -> bool {
+    let Some(class) = mtk_wlan::connac2::event::classify(unsafe { image(packet, len) }) else {
+        return false;
+    };
+    unsafe {
+        if let Some(k) = kind.as_mut() {
+            *k = class.kind;
+        }
+        if let Some(f) = flag.as_mut() {
+            *f = class.flag;
+        }
+        if let Some(r) = rxd0.as_mut() {
+            *r = class.rxd0;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mtk_wlan_txs_records(len: usize) -> usize {
+    mtk_wlan::connac2::event::txs_records(len)
+}
+
+#[repr(C)]
+pub struct MtkWlanTxFreeIter {
+    words: *const u8,
+    len: usize,
+    index: usize,
+    count: usize,
+}
+
+#[repr(C)]
+pub struct MtkWlanTxFreed {
+    pub msdu: u16,
+    pub status: u8,
+    pub count: u16,
+    pub raw: u32,
+}
+
+/// Starts iterating the MSDUs of a TXRX_NOTIFY packet. The packet must stay
+/// valid while iterating.
+///
+/// # Safety
+/// `packet` points to `len` bytes; `it` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_tx_free_begin(
+    packet: *const u8,
+    len: usize,
+    it: *mut MtkWlanTxFreeIter,
+) {
+    let Some(it) = (unsafe { it.as_mut() }) else {
+        return;
+    };
+    let (words, index, count) =
+        mtk_wlan::connac2::event::TxFree::new(unsafe { image(packet, len) }).into_parts();
+    *it = MtkWlanTxFreeIter {
+        words: words.as_ptr(),
+        len: words.len(),
+        index,
+        count,
+    };
+}
+
+/// Next released MSDU; false at the end.
+///
+/// # Safety
+/// `it` was set up by `mtk_wlan_tx_free_begin` and its packet is still valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_tx_free_next(
+    it: *mut MtkWlanTxFreeIter,
+    out: *mut MtkWlanTxFreed,
+) -> bool {
+    let (Some(it), Some(out)) = (unsafe { it.as_mut() }, unsafe { out.as_mut() }) else {
+        return false;
+    };
+    let words = unsafe { image(it.words, it.len) };
+    let mut iter = mtk_wlan::connac2::event::TxFree::from_parts(words, it.index, it.count);
+    let next = iter.next();
+    let (_, index, count) = iter.into_parts();
+    it.index = index;
+    it.count = count;
+    match next {
+        Some(f) => {
+            *out = MtkWlanTxFreed {
+                msdu: f.msdu,
+                status: f.status,
+                count: f.count,
+                raw: f.raw,
+            };
+            true
+        }
+        None => false,
+    }
+}
