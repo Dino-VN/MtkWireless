@@ -1,0 +1,7 @@
+# The kext target needs -Z build-std and a JSON target spec, both nightly-only.
+# Pinned because the target-spec format and soft-float ABI checks change
+# between nightlies.
+[toolchain]
+channel = "nightly-2026-10-23"
+components = ["rust-src", "clippy", "rustfmt"]
+profile = "minimal"

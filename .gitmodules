@@ -1,0 +1,3 @@
+[submodule "third_party/MacKernelSDK"]
+	path = third_party/MacKernelSDK
+	url = https://github.com/acidanthera/MacKernelSDK

@@ -1,0 +1,22 @@
+[package]
+name = "mtk-ffi"
+description = "C ABI of the Rust core, built once per kext (feature `wifi` or `bt`)"
+license = "MIT"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# Exactly one: MtkWirelessWifi is GPL-2.0, MtkWirelessBT is GPL-3.0-only, and
+# the two must stay separate binaries.
+wifi = ["dep:mtk-wlan"]
+bt = ["dep:mtk-bt"]
+
+[dependencies]
+mtk-kernel.workspace = true
+mtk-common.workspace = true
+mtk-wlan = { workspace = true, optional = true }
+mtk-bt = { workspace = true, optional = true }

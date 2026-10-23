@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["mtk-kernel", "mtk-common", "mtk-bt", "mtk-wlan", "mtk-ffi"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+mtk-kernel = { path = "mtk-kernel" }
+mtk-common = { path = "mtk-common" }
+mtk-bt = { path = "mtk-bt" }
+mtk-wlan = { path = "mtk-wlan" }
+
+[profile.dev]
+panic = "abort"
+# Unoptimized builds keep unused parts of core/compiler_builtins, which
+# reference libm (rint, fma) that the kernel does not export.
+opt-level = 1
+lto = true
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = true
+codegen-units = 1
+lto = true

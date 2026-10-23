@@ -1,0 +1,6 @@
+.DS_Store
+._*
+build/
+dist/
+rust/target/
+third_party/Lilu.kext
