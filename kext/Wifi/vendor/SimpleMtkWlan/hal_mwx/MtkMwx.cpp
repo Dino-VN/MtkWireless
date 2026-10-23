@@ -4925,8 +4925,11 @@ mt7921_mcu_get_nic_capability(struct mwx_softc *sc)
 				break;
 			cap = mtod(m, struct mt76_connac_phy_cap *);
 
-			sc->sc_capa.num_streams = cap->nss;
-			sc->sc_capa.antenna_mask = (1U << cap->nss) - 1;
+			/* MtkWireless: the chip has at most 4 chains; a larger
+			 * value from firmware would overflow the shift. */
+			sc->sc_capa.num_streams = MIN(cap->nss, 4);
+			sc->sc_capa.antenna_mask =
+			    (1U << sc->sc_capa.num_streams) - 1;
 			sc->sc_capa.has_2ghz = cap->hw_path & 0x01;
 			sc->sc_capa.has_5ghz = cap->hw_path & 0x02;
 			break;
@@ -6285,365 +6288,36 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
     struct ieee80211_rxinfo *rxi)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
-	uint32_t *rxd, *rxv = NULL;
-	uint32_t rxd0, rxd1, rxd2, rxd3, rxd4;
-//	uint32_t mode = 0;
-	uint16_t hdr_gap /*, seq_ctrl = 0, fc = 0 */;
-	uint8_t chfnum, remove_pad /*, qos_ctl = 0, amsdu_info */;
-	int idx, unicast, num_rxd = 6;
-	int i;
-//	bool insert_ccmp_hdr = false;
+	mtk_wlan_rx_info info;
+	uint32_t drop;
 
-	sc->sc_rx_cur_rate = 0;
-	if (mbuf_len(m) < num_rxd * sizeof(uint32_t)) {
-		if (sc->sc_rx_fill_fail < 64) {
-			MWX_DEV_LOG(sc,
-			    "rx drop reason=short-rxd len=%zu need=%zu\n",
-			    mbuf_len(m), num_rxd * sizeof(uint32_t));
+	/* MtkWireless: descriptor layout and bounds are checked in Rust
+	 * (rust/mtk-wlan/src/connac2/rxd.rs) before any group is read. */
+	drop = mtk_wlan_rx_parse(mtod(m, const uint8_t *), mbuf_len(m),
+	    sc->sc_capa.num_streams, sc->sc_capa.antenna_mask, &info);
+	sc->sc_rx_cur_rate = info.rate;
+	if (drop != MTK_WLAN_RX_OK) {
+		int rv = drop == MTK_WLAN_RX_MAX_LEN ? -EINVAL : -1;
+
+		if (drop == MTK_WLAN_RX_ICV) {
+			ic->ic_stats.is_rx_decryptcrc++;
+		} else if (drop == MTK_WLAN_RX_TKIP_MIC) {
+			/* report MIC failures to net80211 for TKIP */
+			ic->ic_stats.is_rx_locmicfail++;
+			ieee80211_michael_mic_failure(ic, 0/* XXX */);
 		}
-		return -1;
+		MWX_RX_DROP_LOG(sc, mtk_wlan_rx_drop_name(drop), rv, info.rxd[0],
+		    info.rxd[1], info.rxd[2], info.rxd[3], info.rxd[4]);
+		return rv;
 	}
 
-	rxd = mtod(m, uint32_t *);
-	rxd0 = le32toh(rxd[0]);
-	rxd1 = le32toh(rxd[1]);
-	rxd2 = le32toh(rxd[2]);
-	rxd3 = le32toh(rxd[3]);
-	rxd4 = le32toh(rxd[4]);
-
-	if (rxd1 & MT_RXD1_NORMAL_BAND_IDX) {
-		MWX_RX_DROP_LOG(sc, "band-idx", -1, rxd0, rxd1, rxd2,
-		    rxd3, rxd4);
-		return -1;
-	}
-
-	if (rxd2 & MT_RXD2_NORMAL_AMSDU_ERR) {
-		MWX_RX_DROP_LOG(sc, "amsdu-err", -1, rxd0, rxd1, rxd2,
-		    rxd3, rxd4);
-		return -1;
-	}
-
-	if (rxd2 & MT_RXD2_NORMAL_HDR_TRANS) {
-		MWX_RX_DROP_LOG(sc, "hdr-trans", -1, rxd0, rxd1, rxd2,
-		    rxd3, rxd4);
-		return -1;
-	}
-
-	/* ICV error or CCMP/BIP/WPI MIC error */
-	if (rxd1 & MT_RXD1_NORMAL_ICV_ERR) {
-		MWX_RX_DROP_LOG(sc, "icv", -1, rxd0, rxd1, rxd2, rxd3,
-		    rxd4);
-		ic->ic_stats.is_rx_decryptcrc++;
-		return -1;
-	}
-
-	if (rxd1 & MT_RXD1_NORMAL_FCS_ERR) {
-		MWX_RX_DROP_LOG(sc, "fcs", -1, rxd0, rxd1, rxd2, rxd3,
-		    rxd4);
-		return -1;
-	}
-
-	if (rxd1 & MT_RXD1_NORMAL_TKIP_MIC_ERR) {
-		/* report MIC failures to net80211 for TKIP */
-		MWX_RX_DROP_LOG(sc, "tkip-mic", -1, rxd0, rxd1, rxd2,
-		    rxd3, rxd4);
-		ic->ic_stats.is_rx_locmicfail++;
-		ieee80211_michael_mic_failure(ic, 0/* XXX */);
-		return -1;
-	}
-
-
-	chfnum = (rxd3 & MT_RXD3_NORMAL_CH_NUM_MASK) >>
-	    MT_RXD3_NORMAL_CH_NUM_SHIFT;
-	unicast = (rxd3 & MT_RXD3_NORMAL_ADDR_TYPE_MASK) == MT_RXD3_NORMAL_U2M;
-	idx = rxd1 & MT_RXD1_NORMAL_WLAN_IDX_MASK;
-
-#if 0
-	status->wcid = mt7921_rx_get_wcid(dev, idx, unicast);
-	if (status->wcid) {
-		struct mt7921_sta *msta;
-
-		msta = container_of(status->wcid, struct mt7921_sta, wcid);
-		spin_lock_bh(&dev->sta_poll_lock);
-		if (list_empty(&msta->poll_list))
-			list_add_tail(&msta->poll_list, &dev->sta_poll_list);
-		spin_unlock_bh(&dev->sta_poll_lock);
-	}
-#endif
-
-#if NOTYET
-	if ((rxd0 & (MT_RXD0_NORMAL_IP_SUM | MT_RXD0_NORMAL_UDP_TCP_SUM)) ==
-	    (MT_RXD0_NORMAL_IP_SUM | MT_RXD0_NORMAL_UDP_TCP_SUM)) {
-		m->m_pkthdr.csum_flags = M_IPV4_CSUM_IN_OK |
-		    M_TCP_CSUM_IN_OK | M_UDP_CSUM_IN_OK;
-	}
-#endif
-
-	if ((rxd1 & MT_RXD1_NORMAL_SEC_MODE_MASK) != 0 &&
-	    !(rxd1 & (MT_RXD1_NORMAL_CLM | MT_RXD1_NORMAL_CM))) {
+	if (info.hw_decrypted)
 		rxi->rxi_flags |= IEEE80211_RXI_HWDEC;
-	}
+	if (info.has_rssi)
+		rxi->rxi_rssi = info.rssi;
 
-	remove_pad = (rxd2 & MT_RXD2_NORMAL_HDR_OFFSET_MASK) >>
-	    MT_RXD2_NORMAL_HDR_OFFSET_SHIFT;
-
-	if (rxd2 & MT_RXD2_NORMAL_MAX_LEN_ERROR) {
-		MWX_RX_DROP_LOG(sc, "max-len", -EINVAL, rxd0, rxd1, rxd2,
-		    rxd3, rxd4);
-		return -EINVAL;
-	}
-
-	rxd += 6;
-
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_4) {
-		num_rxd += 4;
-		rxd += 4;
-	}
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_1) {
-		num_rxd += 4;
-		rxd += 4;
-	}
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_2) {
-		num_rxd += 2;
-		rxd += 2;
-	}
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_3) {	
-		uint32_t v0, v1;
-		int8_t chain[4], signal;
-
-		rxv = rxd;
-		num_rxd += 2;
-		rxd += 2;
-
-		v0 = le32toh(rxv[0]);
-		sc->sc_rx_cur_rate = v0;
-		v1 = le32toh(rxv[1]);
-
-		if (rxd1 & MT_RXD1_NORMAL_GROUP_5) {
-			num_rxd += 18;
-			rxd += 6;
-			rxv = rxd;
-			v1 = le32toh(rxv[0]); 
-			rxd += 12;
-		}
-	
-
-		chain[0] = rcpi_to_rssi(MT_PRXV_RCPI0_SHIFT, v1);
-		chain[1] = rcpi_to_rssi(MT_PRXV_RCPI1_SHIFT, v1);
-		chain[2] = rcpi_to_rssi(MT_PRXV_RCPI2_SHIFT, v1);
-		chain[3] = rcpi_to_rssi(MT_PRXV_RCPI3_SHIFT, v1);
-
-		signal = -128;
-		for (i = 0; i < sc->sc_capa.num_streams; i++) {
-			if (!(sc->sc_capa.antenna_mask & (1U << i)))
-				continue;	
-			if (chain[i] >= 0)
-				continue;
-			signal = MAX(signal, chain[i]);
-		}
-		rxi->rxi_rssi = signal;
-		}
-
-	if (mbuf_len(m) < num_rxd * sizeof(uint32_t)) {
-		if (sc->sc_rx_fill_fail < 64) {
-			MWX_DEV_LOG(sc,
-			    "rx drop reason=short-groups len=%zu need=%zu rxd=%08x/%08x/%08x/%08x/%08x\n",
-			    mbuf_len(m), num_rxd * sizeof(uint32_t),
-			    rxd0, rxd1, rxd2, rxd3, rxd4);
-		}
-		return -1;
-	}
-
-#if 0
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_4) {
-		uint32_t v0 = le32toh(rxd[0]);
-		uint32_t v2 = le32toh(rxd[2]);
-
-		fc = htole16(FIELD_GET(MT_RXD6_FRAME_CONTROL, v0));
-		seq_ctrl = FIELD_GET(MT_RXD8_SEQ_CTRL, v2);
-		qos_ctl = FIELD_GET(MT_RXD8_QOS_CTL, v2);
-
-		rxd += 4;
-	}
-
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_1) {
-		u8 *data = (u8 *)rxd;
-
-		if (status->flag & RX_FLAG_DECRYPTED) {
-			switch (FIELD_GET(MT_RXD1_NORMAL_SEC_MODE, rxd1)) {
-			case MT_CIPHER_AES_CCMP:
-			case MT_CIPHER_CCMP_CCX:
-			case MT_CIPHER_CCMP_256:
-				insert_ccmp_hdr =
-					(rxd2 & MT_RXD2_NORMAL_FRAG);
-				/* FALLTHROUGH */
-			case MT_CIPHER_TKIP:
-			case MT_CIPHER_TKIP_NO_MIC:
-			case MT_CIPHER_GCMP:
-			case MT_CIPHER_GCMP_256:
-				status->iv[0] = data[5];
-				status->iv[1] = data[4];
-				status->iv[2] = data[3];
-				status->iv[3] = data[2];
-				status->iv[4] = data[1];
-				status->iv[5] = data[0];
-				break;
-			default:
-				break;
-			}
-		}
-		rxd += 4;
-	}
-
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_2) {
-		status->timestamp = le32_to_cpu(rxd[0]);
-		status->flag |= RX_FLAG_MACTIME_START;
-
-		if (!(rxd2 & MT_RXD2_NORMAL_NON_AMPDU)) {
-			status->flag |= RX_FLAG_AMPDU_DETAILS;
-
-			/* all subframes of an A-MPDU have the same timestamp */
-			if (phy->rx_ampdu_ts != status->timestamp) {
-				if (!++phy->ampdu_ref)
-					phy->ampdu_ref++;
-			}
-			phy->rx_ampdu_ts = status->timestamp;
-
-			status->ampdu_ref = phy->ampdu_ref;
-		}
-
-		rxd += 2;
-	}
-
-	/* RXD Group 3 - P-RXV */
-	if (rxd1 & MT_RXD1_NORMAL_GROUP_3) {
-		u8 stbc, gi;
-		u32 v0, v1;
-		bool cck;
-
-		rxv = rxd;
-		rxd += 2;
-
-		v0 = le32_to_cpu(rxv[0]);
-		v1 = le32_to_cpu(rxv[1]);
-
-		if (v0 & MT_PRXV_HT_AD_CODE)
-			status->enc_flags |= RX_ENC_FLAG_LDPC;
-
-		status->chains = mphy->antenna_mask;
-		status->chain_signal[0] = to_rssi(MT_PRXV_RCPI0, v1);
-		status->chain_signal[1] = to_rssi(MT_PRXV_RCPI1, v1);
-		status->chain_signal[2] = to_rssi(MT_PRXV_RCPI2, v1);
-		status->chain_signal[3] = to_rssi(MT_PRXV_RCPI3, v1);
-		status->signal = -128;
-		for (i = 0; i < hweight8(mphy->antenna_mask); i++) {
-			if (!(status->chains & BIT(i)) ||
-			    status->chain_signal[i] >= 0)
-				continue;
-
-			status->signal = max(status->signal,
-					     status->chain_signal[i]);
-		}
-
-		stbc = FIELD_GET(MT_PRXV_STBC, v0);
-		gi = FIELD_GET(MT_PRXV_SGI, v0);
-		cck = false;
-
-		idx = i = FIELD_GET(MT_PRXV_TX_RATE, v0);
-		mode = FIELD_GET(MT_PRXV_TX_MODE, v0);
-
-		switch (mode) {
-		case MT_PHY_TYPE_CCK:
-			cck = true;
-			fallthrough;
-		case MT_PHY_TYPE_OFDM:
-			i = mt76_get_rate(&dev->mt76, sband, i, cck);
-			break;
-		case MT_PHY_TYPE_HT_GF:
-		case MT_PHY_TYPE_HT:
-			status->encoding = RX_ENC_HT;
-			if (i > 31)
-				return -EINVAL;
-			break;
-		case MT_PHY_TYPE_VHT:
-			status->nss =
-				FIELD_GET(MT_PRXV_NSTS, v0) + 1;
-			status->encoding = RX_ENC_VHT;
-			if (i > 9)
-				return -EINVAL;
-			break;
-		case MT_PHY_TYPE_HE_MU:
-		case MT_PHY_TYPE_HE_SU:
-		case MT_PHY_TYPE_HE_EXT_SU:
-		case MT_PHY_TYPE_HE_TB:
-			status->nss =
-				FIELD_GET(MT_PRXV_NSTS, v0) + 1;
-			status->encoding = RX_ENC_HE;
-			i &= GENMASK(3, 0);
-
-			if (gi <= NL80211_RATE_INFO_HE_GI_3_2)
-				status->he_gi = gi;
-
-			status->he_dcm = !!(idx & MT_PRXV_TX_DCM);
-			break;
-		default:
-			return -EINVAL;
-		}
-
-		status->rate_idx = i;
-
-		switch (FIELD_GET(MT_PRXV_FRAME_MODE, v0)) {
-		case IEEE80211_STA_RX_BW_20:
-			break;
-		case IEEE80211_STA_RX_BW_40:
-			if (mode & MT_PHY_TYPE_HE_EXT_SU &&
-			    (idx & MT_PRXV_TX_ER_SU_106T)) {
-				status->bw = RATE_INFO_BW_HE_RU;
-				status->he_ru =
-					NL80211_RATE_INFO_HE_RU_ALLOC_106;
-			} else {
-				status->bw = RATE_INFO_BW_40;
-			}
-			break;
-		case IEEE80211_STA_RX_BW_80:
-			status->bw = RATE_INFO_BW_80;
-			break;
-		case IEEE80211_STA_RX_BW_160:
-			status->bw = RATE_INFO_BW_160;
-			break;
-		default:
-			return -EINVAL;
-		}
-
-		status->enc_flags |= RX_ENC_FLAG_STBC_MASK * stbc;
-		if (mode < MT_PHY_TYPE_HE_SU && gi)
-			status->enc_flags |= RX_ENC_FLAG_SHORT_GI;
-
-		if (rxd1 & MT_RXD1_NORMAL_GROUP_5) {
-			rxd += 18;
-		}
-	}
-
-	amsdu_info = FIELD_GET(MT_RXD4_NORMAL_PAYLOAD_FORMAT, rxd4);
-	status->amsdu = !!amsdu_info;
-	if (status->amsdu) {
-		status->first_amsdu = amsdu_info == MT_RXD4_FIRST_AMSDU_FRAME;
-		status->last_amsdu = amsdu_info == MT_RXD4_LAST_AMSDU_FRAME;
-	}
-#endif
-
-	hdr_gap = num_rxd * sizeof(uint32_t) + 2 * remove_pad;
-	if (mbuf_len(m) < hdr_gap + sizeof(struct ieee80211_frame_min)) {
-		if (sc->sc_rx_fill_fail < 64) {
-			MWX_DEV_LOG(sc,
-			    "rx drop reason=short-80211 len=%zu hdr_gap=%u rxd=%08x/%08x/%08x/%08x/%08x\n",
-			    mbuf_len(m), hdr_gap, rxd0, rxd1, rxd2, rxd3,
-			    rxd4);
-		}
-		return -1;
-	}
-	m_adj(m, hdr_gap);
-    mwx_awdl_strip_deaggregate(m,rxd4);
+	m_adj(m, info.hdr_gap);
+	mwx_awdl_strip_deaggregate(m, info.rxd[4]);
 #if 0
 	if (status->amsdu) {
 		memmove(skb->data + 2, skb->data,
@@ -6673,7 +6347,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
 	status->qos_ctl = qos_ctl;
 #endif
-	rxi->rxi_chan = chfnum;
+	rxi->rxi_chan = info.channel;
 
 	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
 		/*

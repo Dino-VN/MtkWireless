@@ -51,6 +51,38 @@ int32_t mtk_wlan_patch_region(const uint8_t *image, size_t len, uint32_t index, 
 int32_t mtk_wlan_ram_parse(const uint8_t *image, size_t len, mtk_wlan_ram_info *info);
 int32_t mtk_wlan_ram_region(const uint8_t *image, size_t len, uint32_t index, mtk_wlan_fw_region *out);
 
+/* RX descriptor (rust/mtk-wlan/src/connac2/rxd.rs). */
+enum mtk_wlan_rx_drop {
+    MTK_WLAN_RX_OK = 0,
+    MTK_WLAN_RX_SHORT_RXD = 1,
+    MTK_WLAN_RX_BAND_IDX = 2,
+    MTK_WLAN_RX_AMSDU_ERR = 3,
+    MTK_WLAN_RX_HDR_TRANS = 4,
+    MTK_WLAN_RX_ICV = 5,
+    MTK_WLAN_RX_FCS = 6,
+    MTK_WLAN_RX_TKIP_MIC = 7,
+    MTK_WLAN_RX_MAX_LEN = 8,
+    MTK_WLAN_RX_SHORT_GROUPS = 9,
+    MTK_WLAN_RX_SHORT_80211 = 10,
+};
+
+typedef struct mtk_wlan_rx_info {
+    uint32_t rxd[5];
+    size_t hdr_gap; /* descriptor + padding before the 802.11 header */
+    uint32_t rate;  /* P-RXV word 0, 0 without group 3 */
+    uint16_t wlan_idx;
+    uint8_t channel;
+    bool unicast;
+    bool hw_decrypted;
+    bool has_rssi;
+    int8_t rssi;
+} mtk_wlan_rx_info;
+
+/* 0 or a drop reason. On success hdr_gap + 16 <= len. */
+uint32_t mtk_wlan_rx_parse(const uint8_t *frame, size_t len, uint8_t num_streams,
+                           uint32_t antenna_mask, mtk_wlan_rx_info *info);
+const char *mtk_wlan_rx_drop_name(uint32_t reason);
+
 #ifdef __cplusplus
 }
 #endif

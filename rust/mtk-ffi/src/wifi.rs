@@ -182,3 +182,86 @@ pub unsafe extern "C" fn mtk_wlan_ram_region(
         }
     }
 }
+
+#[repr(C)]
+pub struct MtkWlanRxInfo {
+    pub rxd: [u32; 5],
+    pub hdr_gap: usize,
+    pub rate: u32,
+    pub wlan_idx: u16,
+    pub channel: u8,
+    pub unicast: bool,
+    pub hw_decrypted: bool,
+    pub has_rssi: bool,
+    pub rssi: i8,
+}
+
+/// Parses the RX descriptor at the start of `frame`. Returns 0, or a drop
+/// reason (`mtk_wlan_rx_drop`). On a drop, `info.rxd` holds whatever of the
+/// fixed part was present (for logging) and the other fields are zero.
+///
+/// # Safety
+/// `frame` points to `len` bytes; `info` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_rx_parse(
+    frame: *const u8,
+    len: usize,
+    num_streams: u8,
+    antenna_mask: u32,
+    info: *mut MtkWlanRxInfo,
+) -> u32 {
+    use mtk_wlan::connac2::rxd;
+    let Some(info) = (unsafe { info.as_mut() }) else {
+        return rxd::Drop::ShortRxd as u32;
+    };
+    let frame = unsafe { image(frame, len) };
+    let mut words = [0u32; 5];
+    for (i, w) in words.iter_mut().enumerate() {
+        *w = mtk_common::bytes::le32_at(frame, i * 4).unwrap_or(0);
+    }
+    *info = MtkWlanRxInfo {
+        rxd: words,
+        hdr_gap: 0,
+        rate: 0,
+        wlan_idx: 0,
+        channel: 0,
+        unicast: false,
+        hw_decrypted: false,
+        has_rssi: false,
+        rssi: 0,
+    };
+    match rxd::parse(frame, num_streams, antenna_mask) {
+        Ok(rx) => {
+            info.hdr_gap = rx.hdr_gap;
+            info.rate = rx.rate;
+            info.wlan_idx = rx.wlan_idx;
+            info.channel = rx.channel;
+            info.unicast = rx.unicast;
+            info.hw_decrypted = rx.hw_decrypted;
+            info.has_rssi = rx.rssi.is_some();
+            info.rssi = rx.rssi.unwrap_or(0);
+            0
+        }
+        Err(drop) => drop as u32,
+    }
+}
+
+/// Short name of a drop reason, for logs.
+#[unsafe(no_mangle)]
+pub extern "C" fn mtk_wlan_rx_drop_name(reason: u32) -> *const c_char {
+    let name: &core::ffi::CStr = match reason {
+        0 => c"ok",
+        1 => c"short-rxd",
+        2 => c"band-idx",
+        3 => c"amsdu-err",
+        4 => c"hdr-trans",
+        5 => c"icv",
+        6 => c"fcs",
+        7 => c"tkip-mic",
+        8 => c"max-len",
+        9 => c"short-groups",
+        10 => c"short-80211",
+        _ => c"?",
+    };
+    name.as_ptr()
+}

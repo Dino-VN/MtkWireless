@@ -9,13 +9,26 @@ fn main() {
             let img = PatchImage::parse(&data).expect("patch");
             for i in 0..img.regions {
                 let r = img.region(i).expect("region");
-                println!("{name} P {i} {:#x} {} {:#x} {} 1", r.addr, r.data.len(), r.mode, r.offset);
+                println!(
+                    "{name} P {i} {:#x} {} {:#x} {} 1",
+                    r.addr,
+                    r.data.len(),
+                    r.mode,
+                    r.offset
+                );
             }
         } else {
             let img = RamImage::parse(&data).expect("ram");
             for i in 0..img.regions {
                 let r = img.region(i).expect("region");
-                println!("{name} R {i} {:#x} {} {:#x} {} {}", r.addr, r.data.len(), r.mode, r.offset, r.download as u8);
+                println!(
+                    "{name} R {i} {:#x} {} {:#x} {} {}",
+                    r.addr,
+                    r.data.len(),
+                    r.mode,
+                    r.offset,
+                    r.download as u8
+                );
             }
         }
     }
