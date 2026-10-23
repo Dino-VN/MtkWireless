@@ -7,5 +7,6 @@
 //! entry, a new family is a new module.
 #![cfg_attr(not(test), no_std)]
 
+pub mod awdl;
 pub mod chip;
 pub mod connac2;

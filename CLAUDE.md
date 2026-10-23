@@ -10,6 +10,7 @@ scripts/bootstrap.sh
 scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 (cd rust && cargo test --workspace)
 (cd rust && cargo test -p mtk-ffi --features wifi && cargo test -p mtk-ffi --features bt)
+scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 ```
 
 - Plain shell + clang, no Xcode project. Needs full Xcode; the scripts set
@@ -44,7 +45,13 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
   "MtkWireless:" / `mtk_wlan_`): `include/FwData.h` (embedded firmware
   lookup), `hal_mwx/MtkMwx.cpp`: `mwx_load_firmware` (image parsing in Rust),
   `mt7921_mac_fill_rx` (RX descriptor in Rust), `mwx_dma_rx_process` (packet
-  class), `mwx_mac_tx_free` (TX-free walk), NIC capability nss clamp.
+  class), `mwx_mac_tx_free` (TX-free walk), NIC capability nss clamp, and
+  `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
+  (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
+- AWDL structs are shared by C++ and Rust. When a field changes, change both
+  and the two layout tables (`AwdlLayout.hpp`, `LAYOUT` in awdl.rs);
+  `scripts/test-awdl.sh` and the kext self-test (`AwdlLayoutOk`) compare them.
+  `tests/awdl` and `tools/awdl` are upstream's, run unchanged.
   Rust ABI for the HAL: `kext/Wifi/mtk_wlan.h`.
 - `kext/common/EmbeddedFirmware.cpp`: zlib firmware table shared by both kexts.
 - `firmware/wifi/*`: extracted from SimpleMtkWlan's `FwBinary.cpp`.
@@ -95,9 +102,10 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 3. Wi-Fi MAC: RXD, packet class, TX-free (done), TXWI, TXS, rates.
 4. Wi-Fi control TLVs and HAL state machine.
 5. DMA rings and interrupts in Rust.
-6. AWDL (`include/AWDL`): protocol and scheduling to Rust (in progress).
+6. AWDL protocol, election/clock, timeline and ROC planning (done; all 14
+   upstream tests pass against the Rust core).
 
-Nothing has been run on hardware yet (as of phase 3b).
+Nothing has been run on hardware yet.
 
 Baseline for porting: SimpleMtkWlan `dfca847`, SimpleMtkBtFw `07a77db` plus
 its uncommitted LE-features shim. Upstream behavior notes for Bluetooth are in

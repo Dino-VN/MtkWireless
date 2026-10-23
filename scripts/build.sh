@@ -58,7 +58,7 @@ rust_lib() {
     local dir="$ROOT/build/rust-$1"
     (cd rust && MACOSX_DEPLOYMENT_TARGET=10.12 "$CARGO" build -p mtk-ffi --features "$1" --profile "$PROFILE" \
         --target targets/x86_64-apple-kext.json -Z build-std=core,alloc \
-        -Z json-target-spec --target-dir "$dir") >&2
+        -Z json-target-spec --target-dir "$dir") >&2 || exit 1  # fails the $(...) caller
     echo "$dir/x86_64-apple-kext/$PROFILE_DIR/libmtk_ffi.a"
 }
 

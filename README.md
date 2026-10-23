@@ -16,7 +16,7 @@ Successor of [SimpleMtkWlan](https://github.com/Dino-VN/SimpleMtkWlan) and
 | | |
 |---|---|
 | **MtkWirelessBT** | Full replacement for SimpleMtkBtFw + SimpleMtkBtPatcher (firmware load, AirPods fixes, BLE feature-mask shim), protocol logic in Rust. Built and unit-tested; not yet run on hardware. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md). |
-| **MtkWirelessWifi** | AirportMtkWlan `dfca847` built here (Tahoe only); replaces AirportMtkWlan. In Rust so far: firmware image parsing, RX descriptors, RX packet class, TX-free reports. Built; not yet run on hardware. See [docs/WIFI.md](docs/WIFI.md). |
+| **MtkWirelessWifi** | AirportMtkWlan `dfca847` built here (Tahoe only); replaces AirportMtkWlan. In Rust so far: firmware image parsing, RX descriptors, RX packet class, TX-free reports, AWDL (protocol, election, timeline). Built; not yet run on hardware. See [docs/WIFI.md](docs/WIFI.md). |
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 
@@ -35,8 +35,9 @@ keeping a bootable fallback EFI:
    `LeFeaturesShimEnabled = true`), pairing, AirPods audio. Then run
    `scripts/Collect-AirDrop-BT.command` for the BLE advertising check.
 2. **MtkWirelessWifi** instead of AirportMtkWlan (same load method as
-   before). Check `RustSelfTestFailed = 0`, then scan, join, DHCP, throughput
-   and `mtkctl log` (firmware regions and RX drops are logged as before).
+   before). Check `RustSelfTestFailed = 0` and `AwdlLayoutOk = Yes`, then scan,
+   join, DHCP, throughput and `mtkctl log` (firmware regions and RX drops are
+   logged as before). Then AirDrop/AWDL as with AirportMtkWlan.
 
 ## Build
 

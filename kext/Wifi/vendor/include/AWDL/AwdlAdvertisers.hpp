@@ -6,6 +6,11 @@
 #include <stddef.h>
 #include <string.h>
 
+namespace mtkawdl { struct AdvertiserRecord; }
+// MtkWireless: decoding in rust/mtk-wlan/src/awdl/advertisers.rs.
+extern "C" bool mtk_awdl_decode_advertiser_record(const uint8_t *raw, size_t length,
+                                                  mtkawdl::AdvertiserRecord *out);
+
 namespace mtkawdl {
 
 // Tahoe's native AWDL_ADVERTISERS control record. Integer fields are encoded
@@ -49,27 +54,7 @@ inline uint32_t advertiserBE32(const uint8_t *p) {
 
 inline bool decodeAdvertiserRecord(const uint8_t *raw, size_t length,
                                    AdvertiserRecord &out) {
-    if (!raw || length != 44) return false;
-    memset(&out, 0, sizeof(out));
-    out.awCounter = advertiserLE16(raw + 0);
-    out.downCounter = advertiserLE16(raw + 2);
-    out.syncContention = advertiserLE16(raw + 4);
-    out.afPeriod = advertiserLE16(raw + 6);
-    out.raw8 = advertiserLE16(raw + 8);
-    out.raw10 = advertiserLE16(raw + 10);
-    out.awPeriod = advertiserLE16(raw + 12);
-    out.rssi = static_cast<int8_t>(raw[14]);
-    out.reserved15 = raw[15];
-    out.presence = raw[16];
-    out.reserved17 = raw[17];
-    out.raw18 = raw[18];
-    out.reserved19 = raw[19];
-    out.fwAfRxTime = advertiserBE32(raw + 20);
-    out.peerSelfMetric = advertiserLE32(raw + 24);
-    out.rootMetric = advertiserLE32(raw + 28);
-    memcpy(out.rootMaster, raw + 32, 6);
-    memcpy(out.immediatePeer, raw + 38, 6);
-    return true;
+    return mtk_awdl_decode_advertiser_record(raw, length, &out);
 }
 
 inline bool sameAdvertiserRecord(const AdvertiserRecord &a,
