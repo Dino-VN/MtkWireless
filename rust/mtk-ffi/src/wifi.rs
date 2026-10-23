@@ -372,3 +372,45 @@ pub unsafe extern "C" fn mtk_wlan_tx_free_next(
         None => false,
     }
 }
+
+/// Validates a ring index read from the hardware.
+///
+/// # Safety
+/// `out` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_dma_hw_index(raw: u32, count: u32, out: *mut u32) -> bool {
+    match (mtk_wlan::connac2::dma::hw_index(raw, count), unsafe {
+        out.as_mut()
+    }) {
+        (Some(i), Some(out)) => {
+            *out = i;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Length/end flag of a completed RX descriptor; false when the length does
+/// not fit the posted buffer.
+///
+/// # Safety
+/// Outputs are writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_dma_rx_segment(
+    ctrl: u32,
+    capacity: u32,
+    len: *mut u32,
+    last: *mut bool,
+) -> bool {
+    let (Some(len), Some(last)) = (unsafe { len.as_mut() }, unsafe { last.as_mut() }) else {
+        return false;
+    };
+    match mtk_wlan::connac2::dma::rx_segment(ctrl, capacity) {
+        Some(seg) => {
+            *len = seg.len;
+            *last = seg.last;
+            true
+        }
+        None => false,
+    }
+}

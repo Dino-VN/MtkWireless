@@ -45,7 +45,9 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   "MtkWireless:" / `mtk_wlan_`): `include/FwData.h` (embedded firmware
   lookup), `hal_mwx/MtkMwx.cpp`: `mwx_load_firmware` (image parsing in Rust),
   `mt7921_mac_fill_rx` (RX descriptor in Rust), `mwx_dma_rx_process` (packet
-  class), `mwx_mac_tx_free` (TX-free walk), NIC capability nss clamp, and
+  class), `mwx_mac_tx_free` (TX-free walk), `mwx_dma_rx_dequeue` /
+  `mwx_dma_tx_cleanup_locked` (hardware ring index and RX length checks),
+  `mwx_intr` (all-ones status = device gone), NIC capability nss clamp, and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both
@@ -101,7 +103,8 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
    messages and events.
 3. Wi-Fi MAC: RXD, packet class, TX-free (done), TXWI, TXS, rates.
 4. Wi-Fi control TLVs and HAL state machine.
-5. DMA rings and interrupts in Rust.
+5. DMA rings and interrupts: hardware index/length validation in Rust (done);
+   ring memory management stays in C.
 6. AWDL protocol, election/clock, timeline and ROC planning (done; all 14
    upstream tests pass against the Rust core).
 

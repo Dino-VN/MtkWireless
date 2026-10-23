@@ -107,6 +107,10 @@ typedef struct mtk_wlan_tx_freed {
 void mtk_wlan_tx_free_begin(const uint8_t *packet, size_t len, mtk_wlan_tx_free_iter *it);
 bool mtk_wlan_tx_free_next(mtk_wlan_tx_free_iter *it, mtk_wlan_tx_freed *out);
 
+/* WFDMA values read from the hardware (rust/mtk-wlan/src/connac2/dma.rs). */
+bool mtk_wlan_dma_hw_index(uint32_t raw, uint32_t count, uint32_t *out);
+bool mtk_wlan_dma_rx_segment(uint32_t ctrl, uint32_t capacity, uint32_t *len, bool *last);
+
 #ifdef __cplusplus
 }
 #endif

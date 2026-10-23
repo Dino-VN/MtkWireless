@@ -2082,6 +2082,15 @@ mwx_intr(void *arg)
 
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+	/* MtkWireless: all ones is a device that left the bus (surprise
+	 * removal, PCIe link down); there is nothing to service. */
+	if (intr == 0xffffffff) {
+		static uint32_t gone_log_count;
+
+		if (gone_log_count++ < 4)
+			MWX_DEV_LOG(sc, "interrupt status reads all ones: device not present\n");
+		return 0;
+	}
 	if (intr == 0) {
 		mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, mask);
 		return 0;
@@ -3364,8 +3373,13 @@ mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
 	struct mwx_desc *desc;
 	int idx, last;
 
+	uint32_t hw;
+
 	idx = q->mq_cons;
-	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+	if (!mtk_wlan_dma_hw_index(mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX),
+	    q->mq_count, &hw))
+		return 0;
+	last = hw;
 
 	if (idx == last)
 		return 0;
@@ -3405,8 +3419,10 @@ mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
 
 		/* check if more data made it in */
 		/* XXX should we actually do that? */
-		if (idx == last)
-			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+		if (idx == last &&
+		    mtk_wlan_dma_hw_index(mwx_read(sc,
+		    q->mq_regbase + MT_DMA_DMA_IDX), q->mq_count, &hw))
+			last = hw;
 	}
 
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
@@ -3548,9 +3564,19 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	struct mwx_desc *desc;
 	struct mbuf *m, *m0 = NULL, *mtail = NULL;
 	int idx, last;
+	uint32_t hw;
+	bool bad = false;
 
 	idx = q->mq_cons;
-	last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+	/* MtkWireless: hardware indices and lengths are validated in Rust
+	 * (rust/mtk-wlan/src/connac2/dma.rs); 0xffffffff means the device
+	 * is gone and must not drive the loop below. */
+	if (!mtk_wlan_dma_hw_index(mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX),
+	    q->mq_count, &hw)) {
+		sc->sc_rx_fill_fail++;
+		return;
+	}
+	last = hw;
 
 	if (idx == last)
 		return;
@@ -3559,17 +3585,28 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 	     BUS_DMASYNC_PREREAD);
 
 	while (idx != last) {
-		uint32_t ctrl;
+		uint32_t ctrl, seglen;
+		bool seglast;
 
 		md = &q->mq_data[idx];
 		desc = &q->mq_desc[idx];
 
+		/* A slot that could not be refilled holds no buffer. */
+		if (md->md_mbuf == NULL)
+			break;
+
 		/* only buf0 is used on RX rings */
 		ctrl = le32toh(desc->ctrl);
+		if (!mtk_wlan_dma_rx_segment(ctrl, (uint32_t)md->md_map->dm_mapsize,
+		    &seglen, &seglast)) {
+			/* longer than the posted buffer: drop the frame */
+			bad = true;
+			seglen = 0;
+			seglast = (ctrl & MT_DMA_CTL_LAST_SEC0) != 0;
+		}
 
 		/* only copy back what the device wrote */
-		bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
-		    MIN(MT_DNA_CTL_SD_GET_LEN0(ctrl), md->md_map->dm_mapsize),
+		bus_dmamap_sync(sc->sc_dmat, md->md_map, 0, seglen,
 		    BUS_DMASYNC_POSTREAD);
 		bus_dmamap_unload(sc->sc_dmat, md->md_map);
 
@@ -3577,7 +3614,7 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 		m = md->md_mbuf;
 		md->md_mbuf = NULL;
 
-		mbuf_setlen(m, MT_DNA_CTL_SD_GET_LEN0(ctrl));
+		mbuf_setlen(m, seglen);
 
 		if (m0 == NULL) {
 			m0 = mtail = m;
@@ -3591,22 +3628,34 @@ mwx_dma_rx_dequeue(struct mwx_softc *sc, struct mwx_queue *q,
 		/* TODO handle desc->info */
 
 		/* check if this was the last mbuf of the chain */
-		if (ctrl & MT_DMA_CTL_LAST_SEC0) {
-			ml_enqueue(ml, m0);
+		if (seglast) {
+			if (bad) {
+				m_freem(m0);
+				sc->sc_rx_fill_fail++;
+			} else {
+				ml_enqueue(ml, m0);
+			}
 			m0 = NULL;
 			mtail = NULL;
+			bad = false;
 		}
 
 		idx = (idx + 1) % q->mq_count;
 
 		/* check if more data made it in */
 		/* XXX should we actually do that? */
-		if (idx == last)
-			last = mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX);
+		if (idx == last &&
+		    mtk_wlan_dma_hw_index(mwx_read(sc,
+		    q->mq_regbase + MT_DMA_DMA_IDX), q->mq_count, &hw))
+			last = hw;
 	}
 
-	/* XXX make sure we don't have half processed data */
-	KASSERT(m0 == NULL);
+	/* A chain without its last segment (the C version asserted here,
+	 * letting the hardware panic the kernel): drop it. */
+	if (m0 != NULL) {
+		m_freem(m0);
+		sc->sc_rx_fill_fail++;
+	}
 
 	bus_dmamap_sync(sc->sc_dmat, q->mq_map, 0, q->mq_map->dm_mapsize,
 	    BUS_DMASYNC_POSTREAD);
