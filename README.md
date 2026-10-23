@@ -5,7 +5,7 @@ protocol logic written in Rust. Two independent kexts:
 
 | Kext | Does | Needs | License |
 |---|---|---|---|
-| `MtkWirelessWifi.kext` | PCIe Wi-Fi (IO80211/Skywalk) | — | GPL-2.0 |
+| `MtkWirelessWifi.kext` | PCIe Wi-Fi (IO80211/Skywalk), macOS 26 Tahoe | — | GPL-2.0 |
 | `MtkWirelessBT.kext` | USB Bluetooth firmware + bluetoothd fixes | Lilu | GPL-3.0-only |
 
 Successor of [SimpleMtkWlan](https://github.com/Dino-VN/SimpleMtkWlan) and
@@ -16,7 +16,7 @@ Successor of [SimpleMtkWlan](https://github.com/Dino-VN/SimpleMtkWlan) and
 | | |
 |---|---|
 | **MtkWirelessBT** | Full replacement for SimpleMtkBtFw + SimpleMtkBtPatcher (firmware load, AirPods fixes, BLE feature-mask shim), protocol logic in Rust. Built and unit-tested; not yet run on hardware. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md). |
-| **MtkWirelessWifi** | Self-test stub (attaches to `IOResources` only). Keep AirportMtkWlan for Wi-Fi until it is replaced. |
+| **MtkWirelessWifi** | AirportMtkWlan `dfca847` built here (Tahoe only) plus the Rust self-test; replaces AirportMtkWlan. Parts move to Rust phase by phase. See [docs/WIFI.md](docs/WIFI.md). |
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 

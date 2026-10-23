@@ -1,14 +1,12 @@
 //
-//  BtFirmware.cpp
+//  EmbeddedFirmware.cpp
 //  MtkWireless
 //
 
-#include "BtFirmware.hpp"
+#include "EmbeddedFirmware.hpp"
 
 #include <IOKit/IOLib.h>
 #include <libkern/zlib.h>
-
-#include "Log.h"
 
 struct FirmwareEntry {
     const char *name;
@@ -17,7 +15,7 @@ struct FirmwareEntry {
     uint32_t size; /* decompressed */
 };
 
-/* Generated: build/gen/bt/firmware_table.inc */
+/* Generated: build/gen/<kext>/firmware_table.inc */
 #include "firmware_table.inc"
 
 namespace {
@@ -88,16 +86,10 @@ OSData *inflateFirmware(const FirmwareEntry &fw)
 
 } // namespace
 
-OSData *mtkBtCopyFirmware(const char *name)
+OSData *mtkCopyEmbeddedFirmware(const char *name)
 {
-    for (const FirmwareEntry &fw : kFirmware) {
-        if (strcmp(fw.name, name) != 0)
-            continue;
-        OSData *data = inflateFirmware(fw);
-        if (!data)
-            BTLog("firmware %s failed to inflate\n", name);
-        return data;
-    }
-    BTLog("firmware %s not embedded\n", name);
+    for (const FirmwareEntry &fw : kFirmware)
+        if (strcmp(fw.name, name) == 0)
+            return inflateFirmware(fw);
     return nullptr;
 }

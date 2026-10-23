@@ -35,6 +35,15 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 - `kext/Wifi`, `kext/BT`: C++ shells and Info.plists (`@MODULE_VERSION@`).
   BT: `BtLoader` (IOUSBHostDevice, runs `mtk_bt_setup`), `Patcher` (Lilu
   routes), `BtFirmware` (kernel zlib), `mtk_bt.h` (Rust ABI).
+- `kext/Wifi/vendor`: SimpleMtkWlan `dfca847` (AirportMtkWlan target), built
+  by `scripts/build.sh` with the Xcode target's flags: macOS 15.2 deployment
+  target, MacKernelSDK before the SDK's PrivateHeaders, header-map dirs as
+  `-iquote`. Changing any of these changes IOKit vtable layouts; diff
+  `nm -u` against an Xcode build after touching the flags. Tahoe
+  (`__IO80211_TARGET=__MAC_26_0`) only for now. Local edits:
+  `include/FwData.h` (embedded firmware lookup).
+- `kext/common/EmbeddedFirmware.cpp`: zlib firmware table shared by both kexts.
+- `firmware/wifi/*`: extracted from SimpleMtkWlan's `FwBinary.cpp`.
 - `firmware/bt/*.bin`: embedded by `scripts/embed_firmware.py` (zlib +
   `.incbin`) into `build/gen/bt`.
 

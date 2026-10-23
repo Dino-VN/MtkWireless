@@ -1,0 +1,40 @@
+//
+//  PrivateSPI.pch
+//  SimpleMtkWlan
+//
+//  Created by laobamac (王孝慈) on 2026/4/3.
+//  Copyright © 2026 laobamac (王孝慈). All rights reserved.
+//
+
+#include <libkern/libkern.h>
+#include <IOKit/IOTypes.h>
+#include <machine/types.h>
+#ifdef __PRIVATE_SPI__
+typedef u_int32_t ifnet_ctl_cmd_t;
+#endif
+
+#ifndef __MAC_12_0
+#define __MAC_12_0  120000
+#endif
+
+#ifndef __MAC_13_0
+#define __MAC_13_0  130000
+#endif
+
+#ifndef __MAC_14_0
+#define __MAC_14_0  140000
+#endif
+
+#ifndef __MAC_14_4
+#define __MAC_14_4  140400
+#endif
+
+#ifndef __MAC_15_2
+#define __MAC_15_2  150200
+#endif
+
+// MacKernelSDK predates Tahoe. Without this, __MAC_26_0 expands to 0 in #if and
+// every "__IO80211_TARGET == __MAC_15_2" check would be wrong for a Tahoe build.
+#ifndef __MAC_26_0
+#define __MAC_26_0  260000
+#endif

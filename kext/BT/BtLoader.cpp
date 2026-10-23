@@ -12,7 +12,7 @@
 #include <libkern/OSByteOrder.h>
 #include <libkern/version.h>
 
-#include "BtFirmware.hpp"
+#include "EmbeddedFirmware.hpp"
 #include "Log.h"
 #include "USBDeviceController.hpp"
 #include "mtk_bt.h"
@@ -88,9 +88,11 @@ void sleepMs(void *, uint32_t ms)
 
 const void *fwLoad(void *, const char *name, const uint8_t **data, size_t *len)
 {
-    OSData *fw = mtkBtCopyFirmware(name);
-    if (!fw)
+    OSData *fw = mtkCopyEmbeddedFirmware(name);
+    if (!fw) {
+        BTLog("firmware %s missing or corrupt\n", name);
         return nullptr;
+    }
     *data = static_cast<const uint8_t *>(fw->getBytesNoCopy());
     *len = fw->getLength();
     return fw;

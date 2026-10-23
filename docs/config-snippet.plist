@@ -4,8 +4,8 @@
   Merge into OpenCore config.plist: Kernel -> Add (keep this order, Lilu
   first) and NVRAM -> Add / Delete. MtkWirelessWifi and MtkWirelessBT are
   independent; disable either one. Do not also load SimpleMtkBtFw or
-  SimpleMtkBtPatcher. MtkWirelessWifi is still a self-test stub (phase 0):
-  keep AirportMtkWlan for working Wi-Fi until it is replaced.
+  SimpleMtkBtPatcher, or AirportMtkWlan. MtkWirelessWifi is the macOS 26
+  (Tahoe) build: set its MinKernel 25.0.0 / MaxKernel 25.99.99.
 -->
 <plist version="1.0">
 <dict>
@@ -55,15 +55,15 @@
 				<key>BundlePath</key>
 				<string>MtkWirelessWifi.kext</string>
 				<key>Comment</key>
-				<string>MediaTek MT7921/MT7922 Wi-Fi</string>
+				<string>MediaTek MT7921/MT7922 Wi-Fi (macOS 26)</string>
 				<key>Enabled</key>
 				<true/>
 				<key>ExecutablePath</key>
 				<string>Contents/MacOS/MtkWirelessWifi</string>
 				<key>MaxKernel</key>
-				<string></string>
+				<string>25.99.99</string>
 				<key>MinKernel</key>
-				<string></string>
+				<string>25.0.0</string>
 				<key>PlistPath</key>
 				<string>Contents/Info.plist</string>
 			</dict>
