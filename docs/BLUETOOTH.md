@@ -10,7 +10,7 @@ never load them together with MtkWirelessBT (both would claim the device).
 | A2DP (SBC/AAC), AirPods AAC-ELD, controls, switching | ✅ via Read Clock and ACL fixes |
 | BLE scanning | ✅ |
 | BLE advertising / AirDrop | ⚠️ feature-mask shim, see [BLE-ADVERTISING.md](BLE-ADVERTISING.md) |
-| HFP microphone | ⚠️ CVSD only, quiet and choppy |
+| HFP microphone | ⚠️ CVSD by default; experimental 16 kHz mSBC on the tested MT7922 below |
 
 Rewritten in Rust (rust/mtk-bt): firmware parsing, WMT, the bring-up
 sequence and every HCI rewrite. C++ keeps USB access, zlib and the Lilu routes.
@@ -45,6 +45,46 @@ were renamed (see below).
 | `-mtkbtdbg` | Lilu debug logging for the plugin |
 | `-mtkbtnolefix` | Disable the LE feature-mask shim only |
 | `-mtkbtrandaddr` | Send a fixed LE random address before scanning (was `-smbtrandaddr`) |
+| `-mtkbtmsbc` | Enable the experimental MT7922 mSBC bridge on Tahoe (off by default) |
+
+## Wideband microphone (Tahoe)
+
+The opt-in mSBC path was tested with an MT7922 USB `13d3:3610`, Galaxy
+Buds+, and macOS 26.7.1 (25G241), x86_64. Other USB IDs and macOS builds
+have not been tested. The bridge currently accepts only that USB ID.
+
+Add `-mtkbtmsbc` to OpenCore's `boot-args`, then reboot. Keep the normal
+Lilu and BlueToolFixup installation; no custom BlueToolFixup build is needed.
+Remove the argument to return to the default audio path.
+
+This enables 16 kHz mono microphone and playback together. It is still call
+audio: normal A2DP stereo returns when the microphone closes. On the tested
+Buds, playback stayed clean with the microphone open, including a 60-second
+duplex test, the usual calling-app/input test, and an ordinary reconnect.
+The F1 USB mouse receiver and native Wi-Fi continued working. Multi-hour
+stability and other headsets remain untested.
+
+The bridge encodes and decodes mSBC in software. It uses the controller's
+USB alternate setting 6 with complete 63-byte HCI packets, while preserving
+bluetoothd's 33-byte PCM view and timing. The two bluetoothd page patches
+enable wideband audio and keep the sender's PCM reads to complete chunks.
+They use exact 25G241 signatures and are applied only after the bridge is
+ready. `-mtkbtnoextadv` still controls advertising independently.
+
+After opening the Buds' microphone, inspect `MtkBtMsbcBridgeReady` and
+`SimpleMtkMsbcBridge` on IOResources. The `MtkWirelessBT` counters
+`BluetoothdWbsPatched` and `BluetoothdHfpFillPatched` report whether the
+wideband and PCM sender page patches matched. Published
+sample counts do not prove that playback is audible; check both directions
+in the calling app too.
+
+Host regression tests (no audio recording or driver loading):
+
+```sh
+python3 scripts/test-bt-msbc.py
+python3 scripts/test-bt-msbc-integration.py
+python3 scripts/test-bt-msbc-page-patches.py
+```
 
 ## Checking
 

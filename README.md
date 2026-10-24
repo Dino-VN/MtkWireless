@@ -44,6 +44,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | BLE scanning | ✅ | Mac sees the iPhone |
 | BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs the bluetoothd page patch (macOS 26.7.1 only), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
 | Mac connecting to an iPhone over BLE | - | |
+| HFP microphone | ⚠️ | CVSD by default; opt-in 16 kHz mSBC tested on MT7922 + Galaxy Buds+, see [wideband audio](docs/BLUETOOTH.md#wideband-microphone-tahoe) |
 
 ### Apple features
 
