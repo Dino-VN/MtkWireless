@@ -215,8 +215,8 @@ export! {
     fn mtk_awdl_roc_channel_observe(c: *mut RocChannelTiming, channel: u8, response_us: u32, preparation_us: u64) {
         if let Some(c) = c.as_mut() { c.observe(channel, response_us, preparation_us) }
     }
-    fn mtk_awdl_plan_radio(s: *const State, now: u64, out: *mut RadioPlan, lead_us: u32, skip_current: bool, timing: *const RocChannelTiming) -> bool {
-        match (s.as_ref().and_then(|s| t::plan_radio(s, now, lead_us, skip_current, timing.as_ref())), out.as_mut()) {
+    fn mtk_awdl_plan_radio(s: *const State, now: u64, out: *mut RadioPlan, lead_us: u32, skip_current: bool, timing: *const RocChannelTiming, only_channel: u8) -> bool {
+        match (s.as_ref().and_then(|s| t::plan_radio(s, now, lead_us, skip_current, timing.as_ref(), only_channel)), out.as_mut()) {
             (Some(plan), Some(out)) => { *out = plan; true }
             _ => false,
         }

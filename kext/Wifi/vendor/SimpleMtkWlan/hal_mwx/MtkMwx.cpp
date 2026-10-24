@@ -8820,6 +8820,22 @@ bool MtkMwx::awdlInterfaceReady()
     return ready;
 }
 
+uint8_t MtkMwx::awdlInfraChannel()
+{
+    if (!com || com->sc_ic.ic_opmode != IEEE80211_M_STA ||
+        com->sc_ic.ic_state != IEEE80211_S_RUN || !com->sc_ic.ic_bss ||
+        !com->sc_ic.ic_bss->ni_chan)
+        return 0;
+    unsigned channel = ieee80211_chan2ieee(&com->sc_ic, com->sc_ic.ic_bss->ni_chan);
+    return channel <= 165 ? uint8_t(channel) : 0;
+}
+
+bool MtkMwx::awdlChannelReachable(uint8_t channel)
+{
+    uint8_t infra = awdlInfraChannel();
+    return awdlChannelAllowed(channel) && (!infra || channel == infra);
+}
+
 bool MtkMwx::awdlChannelAllowed(uint8_t channel)
 {
     if (!com || !channel || channel>165) return false;

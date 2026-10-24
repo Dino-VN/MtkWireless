@@ -99,7 +99,7 @@ namespace mtkawdl { struct DataPeers{void reset(){}}; bool unicast(const uint8_t
 struct IC {uint8_t ic_myaddr[6]={2,1,2,3,4,5};int ic_state=IEEE80211_S_RUN;};
 struct MtkMwx:IOService {IC ic; bool channels=true,ready=true; std::function<void()> wait;
  bool awdlInterfaceReady(){return ready;}
- IC *get80211Controller(){return &ic;}bool awdlChannelAllowed(unsigned){return channels;}
+ IC *get80211Controller(){return &ic;}bool awdlChannelAllowed(unsigned){return channels;} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}
  IOReturn awdlEnable(const uint8_t*,bool){if(wait)wait();return 0;}};
 struct IOSkywalkPacketQueue;
 struct IOSkywalkPacket:OSObject {

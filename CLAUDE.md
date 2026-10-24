@@ -47,7 +47,9 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `mt7921_mac_fill_rx` (RX descriptor in Rust), `mwx_dma_rx_process` (packet
   class), `mwx_mac_tx_free` (TX-free walk), `mwx_dma_rx_dequeue` /
   `mwx_dma_tx_cleanup_locked` (hardware ring index and RX length checks),
-  `mwx_intr` (all-ones status = device gone), NIC capability nss clamp, and
+  `mwx_intr` (all-ones status = device gone), NIC capability nss clamp,
+  `awdlInfraChannel`/`awdlChannelReachable` (AWDL ROC stays on the AP channel
+  while associated, see below), and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both
@@ -59,6 +61,16 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 - `firmware/wifi/*`: extracted from SimpleMtkWlan's `FwBinary.cpp`.
 - `firmware/bt/*.bin`: embedded by `scripts/embed_firmware.py` (zlib +
   `.incbin`) into `build/gen/bt`.
+
+## Wi-Fi + AWDL coexistence (do not regress)
+
+- While associated, AWDL must not take the radio to another channel: there is
+  no power-save handshake with the AP, which disassociates us within ~2 s
+  (seen 2026-10-24: ROC to channel 6 while on AP channel 149). `planRadio`'s
+  `onlyChannel` and `MtkMwx::awdlChannelReachable` enforce it; validation of
+  native sequences still uses `awdlChannelAllowed`.
+- With AWDL on, the `other_bss` RX filter lets neighbor BSS traffic in; it
+  shows up as `rx drop reason=amsdu-err` with wcid 0x3ff. That is noise.
 
 ## How macOS uses the Bluetooth controller (do not regress)
 

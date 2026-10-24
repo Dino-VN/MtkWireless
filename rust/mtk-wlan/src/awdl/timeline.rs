@@ -192,17 +192,30 @@ pub struct RadioPlan {
 
 /// Plans the next ROC: the reachable window, when to request it and for how
 /// long (one grant covers adjacent equal-channel windows).
+///
+/// `only_channel` (0 = any): while associated to an AP, windows on other
+/// channels are treated as idle. Leaving the AP's channel without telling it
+/// (no power-save handshake here) gets us disassociated.
 pub fn plan_radio(
     s: &State,
     now: u64,
     lead_us: u32,
     skip_current: bool,
     timing: Option<&RocChannelTiming>,
+    only_channel: u8,
 ) -> Option<RadioPlan> {
-    let mut target = current_window(s, now)?;
+    let window = |at: u64| {
+        current_window(s, at).map(|mut w| {
+            if only_channel != 0 && w.channel != only_channel {
+                w.channel = 0;
+            }
+            w
+        })
+    };
+    let mut target = window(now)?;
     if skip_current || target.channel == 0 || now - target.start > 8000 {
         for _ in 0..s.sequence.count {
-            target = current_window(s, target.end)?;
+            target = window(target.end)?;
             if target.channel != 0 {
                 break;
             }
@@ -227,13 +240,13 @@ pub fn plan_radio(
             return None;
         }
         budget -= 1;
-        target = current_window(s, target.end)?;
+        target = window(target.end)?;
     };
     let at_ = target.start.saturating_sub(selected as u64).max(now);
     let mut end = target.end;
     let mut cursor = end;
     for _ in 1..s.sequence.count {
-        let Some(next) = current_window(s, cursor) else {
+        let Some(next) = window(cursor) else {
             break;
         };
         if next.channel != 0 && next.channel != target.channel {
@@ -448,5 +461,51 @@ impl Timeline {
         self.emitted = false;
         self.last_window_start = 0;
         self.radio_end = 0;
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    /// Two-slot schedule alternating 149 and 6, one AW per slot.
+    fn state() -> State {
+        let mut s = State::default();
+        s.init(&[2, 1, 2, 3, 4, 5], 10_000_000);
+        let mut seq = Sequence {
+            count: 2,
+            step: 0,
+            ..Sequence::default()
+        };
+        seq.channels[0] = 149;
+        seq.channels[1] = 6;
+        assert!(s.set_sequence(&seq, 10_000_000));
+        s
+    }
+
+    #[test]
+    fn only_channel_skips_other_channel_windows() {
+        let s = state();
+        let mut now = 10_000_000;
+        let mut off_channel = 0;
+        for _ in 0..64 {
+            let any = plan_radio(&s, now, ROC_LEAD_US, false, None, 0).unwrap();
+            let infra = plan_radio(&s, now, ROC_LEAD_US, false, None, 149).unwrap();
+            assert_eq!(
+                infra.window.channel, 149,
+                "never plans ROC off the AP channel"
+            );
+            assert!(infra.window.start >= any.window.start);
+            off_channel += (any.window.channel == 6) as u32;
+            now += AW_US as u64 / 3;
+        }
+        assert!(
+            off_channel > 0,
+            "without the restriction channel 6 is planned"
+        );
+        assert!(
+            plan_radio(&s, now, ROC_LEAD_US, false, None, 44).is_none(),
+            "channel not in the schedule"
+        );
     }
 }

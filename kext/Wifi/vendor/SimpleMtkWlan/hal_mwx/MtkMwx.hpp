@@ -79,6 +79,12 @@ public:
     // clear it after successful submission or permanent rejection.
     IOReturn awdlTryTransmit(mbuf_t *frame, uint8_t channel);
     bool awdlChannelAllowed(uint8_t channel);
+    // MtkWireless: the AP's channel while associated, else 0. AWDL may only
+    // take the radio there: an unannounced channel switch gets us
+    // disassociated.
+    uint8_t awdlInfraChannel();
+    // Allowed and, while associated, on the AP's channel.
+    bool awdlChannelReachable(uint8_t channel);
     IOReturn awdlPeer(const uint8_t *address, bool add);
     unsigned awdlPeerCapacity() const { return 3; }
 

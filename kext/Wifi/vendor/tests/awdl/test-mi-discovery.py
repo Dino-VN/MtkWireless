@@ -39,7 +39,7 @@ struct IO80211Buffer{uint8_t bytes[2048]{};unsigned length=0,returned=0;
 struct IO80211BufferPool{IO80211Buffer b;bool missing=false;IO80211Buffer*getBuffer(){return missing?nullptr:&b;}};
 struct Hal{
  bool grant=true,on=true,missingStation=false;IOReturn txResult=0,peerResult=0;unsigned peerCalls=0;uint64_t observedAt=clockUS;unsigned transmitted=0;std::vector<std::vector<uint8_t>> frames;
- IOReturn awdlPrepareChannel(unsigned){return 0;}bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;}
+ IOReturn awdlPrepareChannel(unsigned){return 0;}bool awdlIsEnabled(){return on;}void awdlAbort(){}bool awdlChannelAllowed(unsigned c){return c==6||c==149;} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){
   out={};out.granted=grant;out.channel=6;out.token=1;out.grantObservedAt=observedAt;
   out.deadline=clockUS+70000;return on;

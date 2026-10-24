@@ -854,7 +854,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         // Use the native 10-TU end tolerance after accounting for this
         // start's lateness. The prior 8ms cap left usable switching time idle.
         uint64_t early=awTimeline.switchLeadUS();
-        if(snapshot && nextValid && next.channel && hal->awdlChannelAllowed(next.channel) &&
+        if(snapshot && nextValid && next.channel && hal->awdlChannelReachable(next.channel) &&
            !mtkawdl::grantCoversWindow(next,live,next.start) &&
            !mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,live,now) &&
            early && awTimeline.active.end-now<=early) {
@@ -988,7 +988,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     // still terminate it, rather than manufacturing a short AW-end.
     if(awTimeline.open && awTimeline.matchesSchedule(state)) window=awTimeline.active;
     uint8_t channel=window.channel;
-    if(!channel || !hal->awdlChannelAllowed(channel)) {
+    if(!channel || !hal->awdlChannelReachable(channel)) {
         if(awTimeline.open) notifyAvailabilityWindowEnd(now);
         if(stopping || !enabled) return;
         // An idle slot may already be preparing the following channel.
@@ -1043,9 +1043,13 @@ void AirportMtkAwdlInterface::serviceInGate()
             // short presence still leaves us inside the start tolerance.
             // Reacquiring the closed EAW wastes the switching head start.
             bool skipCurrent=awTimeline.emitted && now<awTimeline.active.end;
-            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming)) { timer->setTimeoutMS(2); return; }
+            // MtkWireless: while associated, AWDL only uses the AP's channel.
+            // If no window is on it, back off instead of polling every 2ms.
+            uint8_t infraChannel=hal->awdlInfraChannel();
+            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
+                                   infraChannel)) { timer->setTimeoutMS(infraChannel ? 50 : 2); return; }
             mtkawdl::Window target=plan.window;
-            if(!target.channel || !hal->awdlChannelAllowed(target.channel)) {
+            if(!target.channel || !hal->awdlChannelReachable(target.channel)) {
                 timer->setTimeoutMS(1); return;
             }
             if(target.start>now && mtkawdl::grantCoversWindow(target,grant,target.start)) {
@@ -1122,7 +1126,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     // A grant prepared for the next slot cannot produce TX or a native AW
     // during a slot whose channel is unavailable.
-    if(!channel || !hal->awdlChannelAllowed(channel)) { timer->setTimeoutMS(1); return; }
+    if(!channel || !hal->awdlChannelReachable(channel)) { timer->setTimeoutMS(1); return; }
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
     if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
@@ -1249,7 +1253,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         mtkawdl::Window next={};
         uint64_t prepareAt=awTimeline.active.end-awTimeline.switchLeadUS();
         if(prepareAt>now && mtkawdl::currentWindow(state,awTimeline.active.end,next) &&
-           next.channel && hal->awdlChannelAllowed(next.channel) &&
+           next.channel && hal->awdlChannelReachable(next.channel) &&
            !mtkawdl::grantCoversWindow(next,grant,next.start) && prepareAt-now<delay)
             delay=prepareAt-now;
     }
