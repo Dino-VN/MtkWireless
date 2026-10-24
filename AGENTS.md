@@ -69,6 +69,15 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 ## Wi-Fi + AWDL coexistence (do not regress)
 
+- Instant Hotspot 1.0.0 capture (2026-10-24 21:13): sharingd activates
+  iPhone Dino on channel 149, then Apple80211Scan rejects SCAN_SSID_LIST
+  with -3903 before reaching the driver. Tahoe capability bit 73 selects
+  modern WCL SCAN_REQ; bit 22 selects legacy IOC 86 and must stay clear.
+  1.0.1 enables bit 73 and parses the driver-facing SSID list at 0x1318
+  (count) / 0x131c (10 entries, 56 bytes each) in Rust. Firmware v1 gets
+  four primary plus six extended targets, preserving Apple's empty wildcard
+  entry via ssid_type_ext. Regression: `python3 scripts/test-wifi-capabilities.py`
+  and `python3 scripts/test-wifi-scan.py`. Hardware verification pending.
 - While associated, AWDL may leave the AP's channel only behind a power-save
   handshake: `MtkMwx::awdlInfraSleep` sends Null data PM=1 to the AP before an
   off-channel ROC (awdlReserve waits 2 ms after it and caps the ROC at 300 ms;

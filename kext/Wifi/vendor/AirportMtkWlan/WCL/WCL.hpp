@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include "mtk_wlan.h"
 
 namespace AirportWCL {
 
@@ -360,6 +361,7 @@ struct ScanRequest {
     uint8_t bssid[6];
     uint32_t channelCount;
     uint8_t channels[32];
+    mtk_wlan_scan_ssids targets;
 };
 
 inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsigned channel) {
@@ -382,6 +384,8 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     out.channelCount = count;
     memcpy(out.ssid, p + 0x20, ssidLength);
     memcpy(out.bssid, p + 0x14, 6);
+    if (mtk_wlan_scan_ssids_parse(p, length, &out.targets))
+        return false;
     // Native entries are apple80211_channel: version, channel, flags (12 bytes).
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t *entry = p + 0x58 + size_t(i) * 12;

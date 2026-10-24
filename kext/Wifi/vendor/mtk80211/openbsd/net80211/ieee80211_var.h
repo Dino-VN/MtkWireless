@@ -84,6 +84,7 @@
 #include <net80211/ieee80211_proto.h>
 
 #include <IOKit/IOLib.h>
+#include "mtk_wlan.h"
 
 /* Mirror driver printf() output into a ring readable through the user client. */
 int mtk_printf(const char *fmt, ...) __printflike(1, 2);
@@ -462,6 +463,7 @@ struct ieee80211com {
     bool ic_wcl_scan_active;
     uint8_t ic_wcl_scan_ssid_length;
     uint8_t ic_wcl_scan_ssid[32];
+    mtk_wlan_scan_ssids ic_wcl_scan_targets;
     bool ic_wcl_scan_restricted;
     uint8_t ic_wcl_scan_channels[32];
     uint32_t ic_wcl_scan_away_time_ms; /* SET_SCAN_HOME_AWAY_TIME, 0 = unset */

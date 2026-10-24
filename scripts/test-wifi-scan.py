@@ -29,6 +29,7 @@ code = r'''
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+struct mtk_wlan_scan_ssids {uint8_t count=0;uint8_t lengths[10]{};uint8_t ssids[10][32]{};bool wildcard=false;};
 #define AIRPORT_WCL 1
 #define IEEE80211_STA_ONLY 1
 #define XYLog(...) ((void)0)
@@ -64,6 +65,7 @@ struct ieee80211com : _ifnet {
     bool ic_wcl_join_requested=false;
     unsigned ic_wcl_scan_ssid_length=0, ic_des_esslen=0;
     uint8_t ic_wcl_scan_ssid[32]{}, ic_wcl_scan_channels[32]{};
+    mtk_wlan_scan_ssids ic_wcl_scan_targets;
     ieee80211_channel ic_channels[197];
     int(*ic_newstate)(ieee80211com*,int,int)=nullptr;
     void(*ic_event_handler)(ieee80211com*,int,void*)=nullptr;
@@ -71,7 +73,8 @@ struct ieee80211com : _ifnet {
 struct Timer {int delay=-1; void setTimeoutMS(int n){delay=n;}
     void cancelTimeout(){delay=-1;}};
 struct apple80211ScanRequest {int type=1; unsigned ssidLength=0;
-    unsigned channelCount=0; uint8_t ssid[32]{}, channels[32]{};};
+    unsigned channelCount=0; uint8_t ssid[32]{}, channels[32]{};
+    mtk_wlan_scan_ssids targets;};
 namespace AirportWCL {
 using ScanRequest=apple80211ScanRequest;
 bool decodeScan(apple80211ScanRequest*p,unsigned,ScanRequest&out){out=*p;return true;}
@@ -131,6 +134,22 @@ int main(){
     assert(!d.scanCompleted && ic.ic_wcl_scan_requested && bssSelections==1);
     ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
     assert(d.scanCompleted && !ic.ic_wcl_scan_requested && bssSelections==1);
+    // A list target must also defer an unrelated firmware completion.
+    d.scanPending=false;ic.ic_wcl_scan_inflight=true;
+    request.ssidLength=0;request.targets.count=1;request.targets.lengths[0]=4;
+    memcpy(request.targets.ssids[0],"Dino",4);
+    assert(d.beginWCLScan(&request)==0 && d.scanSkipCompletion);
+    assert(ic.ic_wcl_scan_targets.count==1);
+    ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
+    assert(!d.scanCompleted && ic.ic_wcl_scan_requested);
+    ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
+    assert(d.scanCompleted && !ic.ic_wcl_scan_requested);
+    bssSelections=1;
+    // Passive scans clear directed targets inherited from an earlier request.
+    d.scanPending=false;ic.ic_wcl_scan_inflight=false;request.type=2;
+    assert(d.beginWCLScan(&request)==0 && !ic.ic_wcl_scan_targets.count);
+    ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
+    request.type=1;
     // Joining keeps candidate selection/retries, even after scan completion.
     ic.ic_wcl_join_requested=true;
     ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));

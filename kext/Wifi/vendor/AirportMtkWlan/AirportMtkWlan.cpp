@@ -845,6 +845,13 @@ getCARD_CAPABILITIES(OSObject *object,
     cd->capabilities[2] = (1 << (APPLE80211_CAP_WME - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_40MHZ - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_20MHZ - 16));
+    // MtkWireless: Instant Hotspot uses SCAN_SSID_LIST, even for one SSID.
+    // Tahoe Apple80211Scan uses bit 73 to encode lists in the 0x1598-byte
+    // SCAN_REQ accepted by WCL. Without it, it selects legacy IOC 86, then
+    // rejects it with -3903 because legacy multiple-scan bit 22 is absent.
+    // WCL preserves the target list in setWCL_SCAN_REQ; decodeScan parses it
+    // for the firmware's primary and extended SSID arrays.
+    cd->capabilities[9] |= 0x02;
     // BSD CARD_CAPABILITIES strips version and returns 21 capability bytes.
     // wifip2pd tests returned byte 4 bit 0 before requesting native AWDL.
 #ifdef MTK_NATIVE_AWDL

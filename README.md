@@ -51,7 +51,8 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | AirDrop iPhone → Mac, iOS 27 | ✅ | 0.1.13+: iOS 27 adds an 8-byte header to AWDL data frames; both framings are accepted |
 | Handoff, Universal Clipboard | ✅ | |
 | iPhone Mirroring | ❌ | passes the Mac checks, then pairing for iPhone unlock fails (Mac → iPhone BLE connect timeout). |
-| Auto Unlock, Sidecar, AirPlay to Mac, Instant Hotspot, Continuity Camera | — | |
+| Instant Hotspot (same iCloud / Family) | ⚠️ | iPhone activation succeeds; directed scan fails on 1.0.0. 1.0.1 fixes the scan path, pending hardware verification; see [diagnosis](docs/INSTANT-HOTSPOT.md). |
+| Auto Unlock, Sidecar, AirPlay to Mac, Continuity Camera | — | |
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 

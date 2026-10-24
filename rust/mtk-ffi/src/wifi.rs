@@ -9,6 +9,27 @@ use mtk_wlan::connac2::fw::{PatchImage, RamImage, Region};
 
 const EINVAL: i32 = 22;
 
+/// # Safety
+/// `data` points to `len` bytes; `out` is writable and does not overlap it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_scan_ssids_parse(
+    data: *const u8,
+    len: usize,
+    out: *mut mtk_wlan::scan::ScanSsids,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return EINVAL;
+    };
+    *out = mtk_wlan::scan::ScanSsids::default();
+    match mtk_wlan::scan::ScanSsids::parse_wcl(unsafe { image(data, len) }) {
+        Ok(targets) => {
+            *out = targets;
+            0
+        }
+        Err(_) => EINVAL,
+    }
+}
+
 #[repr(C)]
 pub struct MtkWlanFwRegion {
     pub addr: u32,

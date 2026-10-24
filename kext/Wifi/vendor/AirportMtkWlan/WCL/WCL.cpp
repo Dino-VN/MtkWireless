@@ -272,12 +272,16 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
     scanPending = true;
     scanCompleted = false;
     scanSkipCompletion = ic->ic_wcl_scan_inflight &&
-        ((scan.type != 2 && scan.ssidLength != 0) ||
-         ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
+        ((scan.type != 2 && (scan.ssidLength != 0 || scan.targets.count != 0)) ||
+         ic->ic_wcl_scan_ssid_length != 0 || ic->ic_wcl_scan_targets.count != 0 ||
+         ic->ic_des_esslen != 0);
     ic->ic_wcl_scan_requested = true;
     ic->ic_wcl_scan_active = scan.type != 2;
     ic->ic_wcl_scan_ssid_length = scan.type == 2 ? 0 : scan.ssidLength;
     memcpy(ic->ic_wcl_scan_ssid, scan.ssid, sizeof(scan.ssid));
+    ic->ic_wcl_scan_targets = scan.targets;
+    if (scan.type == 2)
+        ic->ic_wcl_scan_targets = {};
     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     scanSource->setTimeoutMS(20000);

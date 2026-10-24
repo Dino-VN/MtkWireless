@@ -1240,6 +1240,7 @@ mwx_stop(struct ifnet *ifp)
 		ic->ic_wcl_scan_inflight = false;
 		ic->ic_wcl_scan_active = false;
 		ic->ic_wcl_scan_ssid_length = 0;
+		ic->ic_wcl_scan_targets = {};
 		if (ic->ic_event_handler)
 			ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
 	}
@@ -5261,21 +5262,41 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		n_ssids++;
 	}
 #endif
-	/* A directed WCL scan probes for its SSID (hidden networks). */
+	/* MtkWireless: WCL lists carry Instant Hotspot/hidden-network targets.
+	 * Firmware v1 has four primary and six extended SSID slots. */
 	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_active &&
+	    ic->ic_wcl_scan_targets.count > 0 &&
+	    ic->ic_wcl_scan_targets.count <= MTK_WLAN_SCAN_MAX_SSIDS) {
+		for (unsigned i = 0; i < ic->ic_wcl_scan_targets.count; ++i) {
+			uint8_t len = ic->ic_wcl_scan_targets.lengths[i];
+			if (!len || len > IEEE80211_NWID_LEN)
+				continue;
+			auto target = n_ssids < 4 ? &req->ssids[n_ssids] :
+			    &req->ext_ssids[n_ssids - 4];
+			target->ssid_len = htole32(len);
+			memcpy(target->ssid, ic->ic_wcl_scan_targets.ssids[i], len);
+			++n_ssids;
+		}
+	}
+	/* Keep legacy single-SSID callers working. */
+	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_active &&
+	    n_ssids == 0 &&
 	    ic->ic_wcl_scan_ssid_length > 0 &&
 	    ic->ic_wcl_scan_ssid_length <= IEEE80211_NWID_LEN) {
 		req->ssids[0].ssid_len = htole32(ic->ic_wcl_scan_ssid_length);
 		memcpy(req->ssids[0].ssid, ic->ic_wcl_scan_ssid,
 		    ic->ic_wcl_scan_ssid_length);
 		n_ssids = 1;
+	}
+	if (n_ssids) {
 		req->scan_type = 1;
 		req->probe_req_num = 2;
 	}
 
 	req->ssid_type = n_ssids ? 0x4 : 0x1;
-	req->ssid_type_ext = n_ssids ? 1 : 0;
-	req->ssids_num = n_ssids;
+	req->ssid_type_ext = n_ssids && !ic->ic_wcl_scan_targets.wildcard ? 1 : 0;
+	req->ssids_num = MIN(n_ssids, 4);
+	req->ext_ssids_num = n_ssids > 4 ? n_ssids - 4 : 0;
 
 	for (nchan = 0, c = &ic->ic_channels[1];
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] &&
@@ -5362,12 +5383,13 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x\n",
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x ssids=%u ext_ssids=%u ssid_type_ext=%u\n",
 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
-	    le32toh(req->scan_func), req->ssid_type);
+	    le32toh(req->scan_func), req->ssid_type, req->ssids_num,
+	    req->ext_ssids_num, req->ssid_type_ext);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
 	if (rv != 0) {

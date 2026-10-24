@@ -51,6 +51,22 @@ int32_t mtk_wlan_patch_region(const uint8_t *image, size_t len, uint32_t index, 
 int32_t mtk_wlan_ram_parse(const uint8_t *image, size_t len, mtk_wlan_ram_info *info);
 int32_t mtk_wlan_ram_region(const uint8_t *image, size_t len, uint32_t index, mtk_wlan_fw_region *out);
 
+/* Tahoe WCL scan targets, parsed with mtk_common::Reader. */
+#define MTK_WLAN_SCAN_MAX_SSIDS 10
+typedef struct mtk_wlan_scan_ssids {
+    uint8_t count;
+    uint8_t lengths[MTK_WLAN_SCAN_MAX_SSIDS];
+    uint8_t ssids[MTK_WLAN_SCAN_MAX_SSIDS][32];
+    bool wildcard;
+} mtk_wlan_scan_ssids;
+int32_t mtk_wlan_scan_ssids_parse(const uint8_t *request, size_t len,
+                                 mtk_wlan_scan_ssids *out);
+#ifdef __cplusplus
+static_assert(sizeof(mtk_wlan_scan_ssids) == 332, "scan SSID Rust ABI");
+static_assert(offsetof(mtk_wlan_scan_ssids, ssids) == 11, "scan SSID offset");
+static_assert(offsetof(mtk_wlan_scan_ssids, wildcard) == 331, "scan wildcard offset");
+#endif
+
 /* RX descriptor (rust/mtk-wlan/src/connac2/rxd.rs). */
 enum mtk_wlan_rx_drop {
     MTK_WLAN_RX_OK = 0,
