@@ -8,7 +8,7 @@ protocol logic written in Rust. Two independent kexts:
 | `MtkWirelessWifi.kext` | PCIe Wi-Fi (IO80211/Skywalk), macOS 26 Tahoe | — | GPL-2.0 |
 | `MtkWirelessBT.kext` | USB Bluetooth firmware + bluetoothd fixes | Lilu | GPL-3.0-only |
 
-Successor of [SimpleMtkWlan](https://github.com/Dino-VN/SimpleMtkWlan) and
+Successor of [SimpleMtkWlan](https://github.com/eiyuumiru/SimpleMtkWlan) and
 [SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw).
 
 ## Status
@@ -22,8 +22,7 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 
 | Feature | Status | Notes |
 |---|---|---|
-| Wi-Fi menu, scan, join, DHCP | ✅ | WPA2 Personal AP, 5 GHz channel 149, 80 MHz, 802.11ac |
-| WPA3 | — | |
+| Wi-Fi menu, scan, join, DHCP | ✅ | WPA2 / WPA3-transition AP, 5 GHz channel 149, 80 MHz, 802.11ac |
 | Join while AirDrop/AWDL is active | ✅ | 0.1.3+: scans and joins take the radio from AWDL until associated |
 | 2.4 GHz, DFS channels, roaming | — | |
 | Throughput, sleep/wake | — | |
@@ -37,8 +36,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | Feature | Status | Notes |
 |---|---|---|
 | Firmware load, pairing | ✅ | `Chipset: THIRD_PARTY_DONGLE`, needs the NVRAM keys in [docs/BLUETOOTH.md](docs/BLUETOOTH.md) |
-| Audio (A2DP) | ✅ | music to a JBL speaker; non-flushable ACL fix (`AclPbRewritten`) |
-| AirPods AAC-ELD | — | Read Clock fix ported from SimpleMtkBtPatcher; not re-checked with MtkWirelessBT |
+| Audio (A2DP), AirPods AAC-ELD | ✅ | Read Clock and non-flushable ACL fixes |
 | BLE scanning | ✅ | Mac sees the iPhone |
 | BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs the bluetoothd page patch (macOS 26.7.1 only), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
 | Mac connecting to an iPhone over BLE | ❌ | times out; this is what breaks iPhone Mirroring pairing |
@@ -51,8 +49,9 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | AirDrop Mac → iPhone | ✅ | 0.1.11+ |
 | AirDrop iPhone → Mac, iOS 18 | ✅ | |
 | AirDrop iPhone → Mac, iOS 27 | ✅ | 0.1.13+: iOS 27 adds an 8-byte header to AWDL data frames; both framings are accepted |
-| iPhone Mirroring | ❌ | passes the Mac checks, then pairing for iPhone unlock fails (Mac → iPhone BLE connect timeout). Apple also requires Apple silicon or a T2 Mac. |
-| Handoff, Universal Clipboard, Auto Unlock, Sidecar, AirPlay to Mac, Instant Hotspot, Continuity Camera | — | |
+| Handoff, Universal Clipboard | ✅ | |
+| iPhone Mirroring | ❌ | passes the Mac checks, then pairing for iPhone unlock fails (Mac → iPhone BLE connect timeout). |
+| Auto Unlock, Sidecar, AirPlay to Mac, Instant Hotspot, Continuity Camera | — | |
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 
