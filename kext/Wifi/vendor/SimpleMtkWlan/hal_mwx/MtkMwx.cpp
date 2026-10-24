@@ -490,12 +490,10 @@ struct mwx_softc {
 	struct task		sc_setkey_task;
 	struct task		sc_scan_task;
 	struct task		sc_reset_task;
-#ifdef AIRPORT
 	struct task		sc_power_task;
 	volatile SInt32		sc_power_req;	/* bumped by every enable/disable */
 	volatile SInt32		sc_power_done;	/* last request the task served */
 	int			sc_power_result;
-#endif
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
@@ -759,9 +757,7 @@ int	mwx_activate(struct device *, int);
 void	mwx_reset(struct mwx_softc *);
 void	mwx_reset_timeo(void *);
 void	mwx_reset_task(void *);
-#ifdef AIRPORT
 void	mwx_power_task(void *);
-#endif
 int	mwx_txwi_alloc(struct mwx_softc *, int);
 void	mwx_txwi_free(struct mwx_softc *);
 struct mwx_txwi	*mwx_txwi_get(struct mwx_softc *);
@@ -1016,12 +1012,9 @@ mwx_init(struct ifnet *ifp)
 	struct ieee80211com *ic = &((struct mwx_softc *)ifp->if_softc)->sc_ic;
 	int rv;
 
-#ifdef AIRPORT_WCL
 	if (ic->ic_event_handler)
 		ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_RESET_BEGIN, NULL);
-#endif
 	rv = mwx_init_running(ifp);
-#ifdef AIRPORT_WCL
 	/* WCL marks the adapter available only once the HAL is running. */
 	if (rv != 0)
 		ic->ic_wcl_mac_reconfig = false;
@@ -1029,7 +1022,6 @@ mwx_init(struct ifnet *ifp)
 		ic->ic_event_handler(ic, rv == 0 ?
 		    IEEE80211_EVT_DRIVER_READY : IEEE80211_EVT_DRIVER_STOPPED,
 		    NULL);
-#endif
 	return rv;
 }
 
@@ -1048,11 +1040,9 @@ mwx_init_running(struct ifnet *ifp)
 			return rv;
 		}
 	}
-#ifdef AIRPORT
 	/* WCL assigns a private MAC through setHardwareAddress (ac_enaddr). */
 	IEEE80211_ADDR_COPY(ic->ic_myaddr, ((struct arpcom *)ifp)->ac_enaddr);
 	MWX_DEV_LOG(sc, "init mac address=%s\n", ether_sprintf(ic->ic_myaddr));
-#endif
 
 	MWX_DEV_LOG(sc, "init start opmode=%d flags=0x%x ic_state=%d\n",
 	    ic->ic_opmode, ifp->if_flags, ic->ic_state);
@@ -1242,7 +1232,6 @@ mwx_stop(struct ifnet *ifp)
 	sc->sc_sta_wcid = 0;
 	ifp->if_timer = 0;
 
-#ifdef AIRPORT_WCL
 	if (was_running) {
 		/* The firmware scan was cancelled above; no completion will
 		 * clear these. Clear them before advertising the stop. */
@@ -1254,7 +1243,6 @@ mwx_stop(struct ifnet *ifp)
 		if (ic->ic_event_handler)
 			ic->ic_event_handler(ic, IEEE80211_EVT_DRIVER_STOPPED, NULL);
 	}
-#endif
 	splx(s);
 }
 
@@ -2487,9 +2475,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task, sc, "mwx_bgscan");
 	task_set(&sc->sc_setkey_task, mwx_setkey_task, sc, "mwx_setkey");
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
-#ifdef AIRPORT
 	task_set(&sc->sc_power_task, mwx_power_task, sc, "mwx_power");
-#endif
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
@@ -2563,7 +2549,6 @@ mwx_reset_task(void *arg)
 	sc->sc_coredump_cnt = 0;
 }
 
-#ifdef AIRPORT
 /*
  * IO80211 calls enable/disable (power, MAC address changes) with the
  * workloop gate held. MCU replies are delivered by the interrupt event
@@ -2621,7 +2606,6 @@ mwx_power_task(void *arg)
 	OSSynchronizeIO();
 	sc->sc_power_done = req;
 }
-#endif
 
 int
 mwx_txwi_alloc(struct mwx_softc *sc, int count)
@@ -5238,10 +5222,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
     // failed every join (-3905) while AirDrop was open. Release the AWDL
     // ROC instead; awdlReserve waits for the scan.
     bool requestedScan=false;
-#ifdef AIRPORT_WCL
     requestedScan=ic->ic_wcl_scan_requested ||
         (ic->ic_wcl_join_requested && sc->sc_ns_state==IEEE80211_S_SCAN);
-#endif
     if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN && !requestedScan) {
         sc->sc_awdl_scan_suspended=true;
         return 0;
@@ -5260,9 +5242,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	memset(req, 0, sizeof(*req));
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
-#ifdef AIRPORT_WCL
 	ic->ic_wcl_scan_inflight = true;
-#endif
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
 
 	req->seq_num = sc->sc_scan_seq_num /* | sc->sc_band_idx << 7 */;
@@ -5281,7 +5261,6 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		n_ssids++;
 	}
 #endif
-#ifdef AIRPORT_WCL
 	/* A directed WCL scan probes for its SSID (hidden networks). */
 	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_active &&
 	    ic->ic_wcl_scan_ssid_length > 0 &&
@@ -5293,7 +5272,6 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		req->scan_type = 1;
 		req->probe_req_num = 2;
 	}
-#endif
 
 	req->ssid_type = n_ssids ? 0x4 : 0x1;
 	req->ssid_type_ext = n_ssids ? 1 : 0;
@@ -5307,7 +5285,6 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 
 		if (c->ic_flags == 0)
 			continue;
-#ifdef AIRPORT_WCL
 		/* Restrict to the channels WCL asked for, if any. */
 		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
 			unsigned int chn = ieee80211_chan2ieee(ic, c);
@@ -5315,7 +5292,6 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			    (1U << (chn % 8))))
 				continue;
 		}
-#endif
 
 		if (nchan < 32)
 			chan = &req->channels[nchan];
@@ -5358,10 +5334,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		dwell = sc->sc_bgscan_dwell;
 	else {
 		dwell = 0;
-#ifdef AIRPORT_WCL
 		if (ic->ic_wcl_scan_away_time_ms != 0)
 			dwell = MIN(MAX(ic->ic_wcl_scan_away_time_ms / 3, 20), 120);
-#endif
 	}
 	req->timeout_value = htole16(nchan * dwell);
 	req->channel_min_dwell_time = htole16(dwell);
@@ -5398,9 +5372,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
 	if (rv != 0) {
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-#ifdef AIRPORT_WCL
 		ic->ic_wcl_scan_inflight = false;
-#endif
 	}
 
 	return rv;
@@ -5422,9 +5394,7 @@ mt7921_mcu_hw_scan_cancel(struct mwx_softc *sc)
 	    sizeof(req), NULL);
 	if (rv == 0) {
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-#ifdef AIRPORT_WCL
 		sc->sc_ic.ic_wcl_scan_inflight = false;
-#endif
 	}
 	return rv;
 }
@@ -7743,17 +7713,10 @@ MtkMwx::enable(IONetworkInterface *interface)
 		return kIOReturnSuccess;
 	}
 	ifp->if_flags |= IFF_UP;
-#ifdef AIRPORT
 	OSIncrementAtomic(&com->sc_power_req);
 	task_add(com->sc_nswq, &com->sc_power_task);
 	MWX_DEV_LOG(com, "HAL enable queued flags=0x%x\n", ifp->if_flags);
 	return kIOReturnSuccess;
-#else
-	int rv = mwx_init(ifp);
-	MWX_DEV_LOG(com, "HAL enable done mwx_init=%d flags=0x%x\n",
-	    rv, ifp->if_flags);
-	return rv == 0 ? kIOReturnSuccess : kIOReturnError;
-#endif
 }
 
 IOReturn
@@ -7770,15 +7733,9 @@ MtkMwx::disable(IONetworkInterface *interface)
 		return kIOReturnSuccess;
 	}
 	ifp->if_flags &= ~IFF_UP;
-#ifdef AIRPORT
 	OSIncrementAtomic(&com->sc_power_req);
 	task_add(com->sc_nswq, &com->sc_power_task);
 	MWX_DEV_LOG(com, "HAL disable queued flags=0x%x\n", ifp->if_flags);
-#else
-	if (ifp->if_flags & IFF_RUNNING)
-		mwx_stop(ifp);
-	MWX_DEV_LOG(com, "HAL disable complete flags=0x%x\n", ifp->if_flags);
-#endif
 	return kIOReturnSuccess;
 }
 
@@ -7835,7 +7792,6 @@ MtkMwx::mwxWakeup(void *ident)
 IOReturn
 MtkMwx::waitPowerTransition()
 {
-#ifdef AIRPORT
 	if (!com || com->sc_detaching)
 		return kIOReturnNotAttached;
 	/* commandSleep drops a caller's gate so the task and its MCU replies
@@ -7852,9 +7808,6 @@ MtkMwx::waitPowerTransition()
 			return kIOReturnNotAttached;
 	}
 	return kIOReturnTimeout;
-#else
-	return kIOReturnSuccess;
-#endif
 }
 
 const char *
@@ -7920,9 +7873,7 @@ MtkMwx::clearScanningFlags()
 {
 	if (com) {
 		com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-#ifdef AIRPORT_WCL
 		com->sc_ic.ic_wcl_scan_inflight = false;
-#endif
 	}
 }
 

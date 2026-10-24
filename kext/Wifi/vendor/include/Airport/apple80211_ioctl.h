@@ -30,9 +30,6 @@
 #include <sys/ioctl.h>
 
 // This is necessary, because even the latest Xcode does not support properly targeting 11.0.
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
 
 #include "apple80211_var.h"
 
@@ -45,13 +42,8 @@ struct apple80211req
     void        *req_data;                // 4 bytes
 };
 
-#if __IO80211_TARGET >= __MAC_10_15
 #define SIOCSA80211 2150656456
 #define SIOCGA80211 3224398281
-#else
-#define SIOCSA80211 2150132168
-#define SIOCGA80211 3223873993
-#endif
 
 #define APPLE80211_AWDL_CAP_CCA_STATS   2
 #define APPLE80211_AWDL_CAP_SEC_PAYLOAD 0x100000000
@@ -430,35 +422,13 @@ struct apple80211_bssid_data
     struct ether_addr    bssid;
 };
 
-#ifdef AIRPORT_WCL
 struct apple80211_capability_data
 {
     u_int32_t    version;
-#if __IO80211_TARGET == __MAC_15_2
-    u_int8_t     capabilities[19];
-#else
     u_int8_t     capabilities[21];
-#endif
 };
-#if __IO80211_TARGET == __MAC_15_2
-static_assert(sizeof(apple80211_capability_data) == 0x18, "Sequoia capability ABI");
-#else
 static_assert(sizeof(apple80211_capability_data) == 0x1c, "WCL capability ABI");
-#endif
 static_assert(__offsetof(apple80211_capability_data, capabilities) == 4, "WCL capability offset");
-#elif __IO80211_TARGET >= __MAC_14_0
-struct apple80211_capability_data
-{
-    u_int32_t    version;
-    u_int8_t     capabilities[14];
-};
-#else
-struct apple80211_capability_data
-{
-    u_int32_t    version;
-    u_int8_t     capabilities[11];
-};
-#endif
 
 struct apple80211_state_data
 {
@@ -746,11 +716,7 @@ struct apple80211_ap_ie_data
 {
     u_int32_t    version;
     u_int32_t    len;
-#if __IO80211_TARGET < __MAC_13_0
-    u_int8_t     *ie_data;
-#else
     u_int8_t     ie_data[APPLE80211_NETWORK_DATA_MAX_IE_LEN];
-#endif
 };
 
 struct apple80211_stats_data
@@ -900,11 +866,7 @@ struct apple80211_nss_data
 struct apple80211_awdl_peer_traffic_registration
 {
     uint32_t    version;
-#if __IO80211_TARGET == __MAC_26_0
     uint8_t     addr[6], pad[2];
-#else
-    void        *addr;
-#endif
     uint32_t    name_len;
     char        name[152];
     uint32_t    active;
@@ -1004,9 +966,7 @@ struct apple80211_awdl_election_rssi_thresholds {
     uint32_t    unk1;
     uint32_t    unk2;
     uint32_t    unk3;
-#if __IO80211_TARGET == __MAC_26_0
     int32_t     peer_rssi_threshold;
-#endif
 } __attribute__((packed));
 
 struct apple80211_channel_sequence {
@@ -1022,23 +982,14 @@ struct apple80211_awdl_sync_channel_sequence {
     uint8_t     step_count;         // 7
     uint8_t     duplicate_count;    // 8
     uint8_t     fill_channel;       // 9
-#if __IO80211_TARGET == __MAC_26_0
     uint8_t     pad2[2];
     // Tahoe setChannelSequenceUnconditional writes descriptors at +0xc;
     // BCM buildAWDLChanSequence reads channel +0x10 and flags +0x14.
     struct apple80211_channel seqs[32];
     uint8_t     reserved_tail[4];
-#else
-    uint8_t     pad2[6];
-    struct apple80211_channel_sequence seqs[APPLE80211_MAX_CHANNELS];
-#endif
 } __attribute__((packed));
 
-#if __IO80211_TARGET == __MAC_26_0
 static_assert(__offsetof(apple80211_awdl_sync_channel_sequence, seqs) == 12, "Tahoe sequence descriptor offset");
-#else
-static_assert(__offsetof(apple80211_awdl_sync_channel_sequence, seqs) == 16, "seqs offset error");
-#endif
 
 static_assert(sizeof(struct apple80211_awdl_sync_channel_sequence) == 0x190, "apple80211_awdl_sync_channel_sequence struct corrupt");
 
@@ -1058,16 +1009,12 @@ struct apple80211_awdl_extension_state_machine_parameter {
 struct apple80211_awdl_sync_state {
     uint32_t    version;
     uint32_t    state;
-#if __IO80211_TARGET == __MAC_26_0
     uint8_t     master[6], reserved[2];
     uint32_t    flags;
     uint8_t     mode_flags, reserved2[3];
-#endif
 } __attribute__((packed));
-#if __IO80211_TARGET == __MAC_26_0
 static_assert(sizeof(apple80211_awdl_sync_state)==0x18, "Tahoe sync state ioctl size");
 static_assert(sizeof(apple80211_awdl_election_rssi_thresholds)==0x14, "Tahoe RSSI ioctl size");
-#endif
 
 struct apple80211_awdl_sync_params {
     uint32_t    version;
@@ -1075,11 +1022,8 @@ struct apple80211_awdl_sync_params {
     uint32_t    availability_window_period;
     uint32_t    extension_length;
     uint32_t    synchronization_frame_period;
-#if __IO80211_TARGET == __MAC_26_0
     uint32_t    non_election_master;
-#endif
 } __attribute__((packed));
-#if __IO80211_TARGET == __MAC_26_0
 static_assert(sizeof(apple80211_awdl_sync_params)==0x18, "Tahoe sync ioctl size");
 // Fields/size verified against Tahoe's AWDL ioctl dispatch and driver access.
 struct apple80211_awdl_device_capabilities {
@@ -1094,7 +1038,6 @@ struct apple80211_awdl_election_params {
     uint8_t reserved2[20];
 } __attribute__((packed));
 static_assert(sizeof(apple80211_awdl_election_params)==0x38, "Tahoe election ioctl size");
-#endif
 
 struct apple80211_awdl_cap {
     uint32_t    version;
@@ -1103,11 +1046,7 @@ struct apple80211_awdl_cap {
 
 struct apple80211_awdl_af_tx_mode {
     uint32_t    version;
-#if __IO80211_TARGET == __MAC_26_0
     uint32_t    mode;
-#else
-    uint64_t    mode;
-#endif
 } __attribute__((packed));
 
 #define AWDL_OOB_AF_PARAMS_SIZE 38
@@ -1127,11 +1066,7 @@ struct apple80211_awdl_oob_request {
     uint16_t    data_len;           // 40
     uint32_t    pad4;
     uint16_t    unk9;               // 44
-#if __IO80211_TARGET == __MAC_26_0
     uint8_t    *data;              // 48: borrowed payload, not inline storage
-#else
-    uint8_t     data[1782];         // 48
-#endif
 } __attribute__((packed));
 
 //Roam: <airport[565]> DISABLED, 2.4GHz on awdl0 => {

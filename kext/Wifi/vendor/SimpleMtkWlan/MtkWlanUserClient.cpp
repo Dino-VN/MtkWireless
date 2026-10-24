@@ -22,9 +22,7 @@
 
 #include "MtkWlanUserClient.hpp"
 #include <sys/_netstat.h>
-#ifdef AIRPORT
 #include "AirportMtkWlan.hpp"
-#endif
 
 #define super IOUserClient
 OSDefineMetaClassAndStructors( MtkWlanUserClient, IOUserClient );
@@ -64,13 +62,8 @@ bool MtkWlanUserClient::start(IOService *provider)
     if (fDriver == NULL || fDriver->fHalService == NULL) {
         return false;
     }
-#ifdef AIRPORT
     fIfp = &fDriver->fHalService->get80211Controller()->ic_ac.ac_if;
     fInf = fIfp->iface;
-#else
-    fInf = fDriver->getNetworkInterface();
-    fIfp = fDriver->getIfp();
-#endif
     fDriverInfo = fDriver->fHalService->getDriverInfo();
     fDriverController = fDriver->fHalService->getDriverController();
     return true;
@@ -252,16 +245,7 @@ sPOWER(OSObject* target, void* data, bool isSet)
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_power *ip = (struct ioctl_power *)data;
     if (isSet) {
-#ifdef AIRPORT
         return kIOReturnUnsupported;
-#else
-        if (ip->enabled) {
-            that->fDriver->enable(that->fInf);
-        } else {
-            net80211_ifstats(that->fDriver->fHalService->get80211Controller());
-            that->fDriver->disable(that->fInf);
-        }
-#endif
     } else {
         memset(ip, 0, sizeof(*ip));
         ip->version = IOCTL_VERSION;
@@ -378,11 +362,7 @@ sASSOCIATE(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_associate *as = (struct ioctl_associate *)data;
-#ifdef AIRPORT
     return kIOReturnUnsupported;
-#else
-    that->fDriver->associateSSID(as->nwid.nwid, as->wpa_key.key);
-#endif
     return kIOReturnSuccess;
 }
 
@@ -408,11 +388,7 @@ sJOIN(OSObject* target, void* data, bool isSet)
 {
     MtkWlanUserClient *that = OSDynamicCast(MtkWlanUserClient, target);
     struct ioctl_join *join = (struct ioctl_join *)data;
-#ifdef AIRPORT
     return kIOReturnUnsupported;
-#else
-    that->fDriver->joinSSID(join->nwid.nwid, join->wpa_key.key);
-#endif
     return kIOReturnSuccess;
 }
 

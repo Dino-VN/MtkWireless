@@ -2187,14 +2187,12 @@ struct ieee80211_wme_info {
     uint8_t        wme_info;    /* QoS info */
 } __packed;
 
-#ifdef AIRPORT
 static inline uint64_t airport_up_time()
 {
     struct timeval tv;
     microuptime(&tv);
     return tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
-#endif
 
 static inline uint16_t
 ieee80211_he_mcs_intersection(uint16_t a, uint16_t b)

@@ -13,10 +13,6 @@
 #include <Availability.h>
 #include "IOSkywalkEthernetInterface.h"
 
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
-
 class TxSubmissionDequeueStats;
 class TxCompletionEnqueueStats;
 class IO80211NetworkPacket;

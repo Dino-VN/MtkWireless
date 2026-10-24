@@ -13,10 +13,6 @@
 #include <Availability.h>
 #include <IOKit/IOWorkLoop.h>
 
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
-
 
 class IO80211Controller;
 class CCLogStream;

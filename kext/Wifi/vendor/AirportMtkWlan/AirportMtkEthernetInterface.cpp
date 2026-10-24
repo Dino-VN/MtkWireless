@@ -12,10 +12,8 @@
 #include <sys/sockio.h>
 #include <net80211/ieee80211_var.h>
 #include "AirportMtkAwdlInterface.hpp"
-#ifdef AIRPORT_WCL
 #include <IOKit/IOCommandGate.h>
 extern IOCommandGate *_fCommandGate;
-#endif
 #ifdef MTK_NATIVE_AWDL
 // Native Skywalk prepareBSDInterface borrows the compat bridge's ifnet.
 // The matching finalizer disables it and clears that borrowed native handle.
@@ -89,7 +87,6 @@ SInt32 AirportMtkEthernetInterface::performCommand(IONetworkController *controll
     return super::performCommand(controller,command,arg0,arg1);
 }
 
-#ifdef AIRPORT_WCL
 IOReturn AirportMtkEthernetInterface::prepareBSDGated(OSObject *, void *arg0, void *, void *, void *)
 {
     auto self = static_cast<AirportMtkEthernetInterface *>(arg0);
@@ -100,18 +97,15 @@ IOReturn AirportMtkEthernetInterface::prepareBSDGated(OSObject *, void *arg0, vo
     }
     return self->interface->prepareBSDInterface(self->getIfnet(), 0);
 }
-#endif
 
 IOReturn AirportMtkEthernetInterface::
 attachToDataLinkLayer( IOOptionBits options, void *parameter )
 {
     XYLog("%s\n", __FUNCTION__);
     char infName[IFNAMSIZ];
-#ifdef AIRPORT_WCL
     if (!setInterfaceSubType(3)) {
         return kIOReturnNotReady;
     }
-#endif
     IOReturn ret = super::attachToDataLinkLayer(options, parameter);
     if (ret == kIOReturnSuccess && interface) {
 #ifdef MTK_NATIVE_AWDL
@@ -141,7 +135,6 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
         if(addressStatus == kIOReturnSuccess)
             setProperty(kIOMACAddress,  (void *) &addr,
                         kIOEthernetAddressSize);
-#ifdef AIRPORT_WCL
         ret = _fCommandGate ? _fCommandGate->runAction(prepareBSDGated, this) : kIOReturnNotReady;
         if (ret != kIOReturnSuccess) {
 #ifdef MTK_NATIVE_AWDL
@@ -153,17 +146,9 @@ attachToDataLinkLayer( IOOptionBits options, void *parameter )
         }
         isAttach = true;
         interface->registerService();
-#else
-        interface->registerService();
-        interface->prepareBSDInterface(getIfnet(), 0);
-#endif
 //        ret = bpf_attach(getIfnet(), DLT_RAW, 0x48, &AirportMtkEthernetInterface::bpfOutputPacket, &AirportMtkEthernetInterface::bpfTap);
     }
-#ifdef AIRPORT_WCL
     isAttach = ret == kIOReturnSuccess;
-#else
-    isAttach = true;
-#endif
     return ret;
 }
 
@@ -215,7 +200,6 @@ setLinkState(IO80211LinkState state)
     return true;
 }
 
-#ifdef AIRPORT_WCL
 // Skywalk's compat input path expects one contiguous mbuf. A-MSDU subframes
 // from mbuf_split() can arrive as a chain, so copy those into a single buffer.
 static mbuf_t normalizeInputPacket(mbuf_t packet, UInt32 length)
@@ -247,12 +231,10 @@ static mbuf_t normalizeInputPacket(mbuf_t packet, UInt32 length)
     mbuf_freem(packet);
     return linear;
 }
-#endif
 
 UInt32 AirportMtkEthernetInterface::
 inputPacket(mbuf_t packet, UInt32 length, IOOptionBits options, void *param)
 {
-#ifdef AIRPORT_WCL
     if (!packet)
         return 0;
     if (!getIfnet()) {
@@ -270,6 +252,5 @@ inputPacket(mbuf_t packet, UInt32 length, IOOptionBits options, void *param)
     }
     if (directInput)
         param = packet;
-#endif
     return IOEthernetInterface::inputPacket(packet, length, options, param);
 }

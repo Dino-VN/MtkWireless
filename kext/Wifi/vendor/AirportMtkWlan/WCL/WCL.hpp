@@ -129,9 +129,7 @@ struct BeaconMetadata {
     int16_t snr;
     uint16_t interval;
     uint16_t capability;
-#if !defined(__IO80211_TARGET) || __IO80211_TARGET != __MAC_15_2
     uint32_t reserved2;
-#endif
     uint32_t flags;
 };
 
@@ -198,13 +196,8 @@ struct __attribute__((packed)) ChannelInfo {
     uint8_t supports6GHz;
 };
 
-#if defined(__IO80211_TARGET) && __IO80211_TARGET == __MAC_15_2
-static_assert(sizeof(BeaconMetadata) == 0x40, "Sequoia BeaconMetadata size");
-static_assert(offsetof(BeaconMetadata, flags) == 0x3c, "Sequoia BeaconMetadata flags");
-#else
 static_assert(sizeof(BeaconMetadata) == 0x44, "BeaconMetadata size");
 static_assert(offsetof(BeaconMetadata, flags) == 0x40, "BeaconMetadata flags");
-#endif
 static_assert(offsetof(BeaconMetadata, bssid) == 0x29, "BeaconMetadata BSSID");
 static_assert(offsetof(BeaconMetadata, rssi) == 0x30, "BeaconMetadata RSSI");
 static_assert(sizeof(AssociationEvent) == 0x1c, "AssociationEvent size");

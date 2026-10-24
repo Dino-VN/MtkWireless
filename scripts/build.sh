@@ -185,9 +185,9 @@ WIFI_LIB="$(rust_lib wifi)"
 WIFI_GEN="$ROOT/build/gen/wifi"
 TARGET=(-target x86_64-apple-macos15.2 -isysroot "$SDK")
 python3 scripts/embed_firmware.py mtkwifi "$WIFI_GEN" firmware/wifi/*
-# IO80211 ABI: Tahoe (__MAC_26_0) only for now. Sequoia would be
-# __MAC_15_2, as its own kext (the ABIs differ and a Sequoia build never
-# attaches on Tahoe).
+# IO80211 ABI: Tahoe (__MAC_26_0) only; the vendored code has no pre-Tahoe
+# branches. (The macos15.2 deployment target above is the Xcode target's and
+# only picks MacKernelSDK class layouts.)
 for variant in Tahoe:__MAC_26_0; do
     name="${variant%%:*}" target="${variant#*:}"
     WIFI_FLAGS=(-x c++ -std=gnu++14 -fapple-kext -fno-rtti -fno-exceptions -fno-sanitize=vptr -O1

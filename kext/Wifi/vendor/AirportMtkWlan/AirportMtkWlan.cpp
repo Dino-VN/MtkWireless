@@ -29,7 +29,6 @@ void AirportMtkWlan::releaseAll()
 #ifdef MTK_NATIVE_AWDL
     stopAwdlInterface();
 #endif
-#ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportMtkSkywalkInterface *>(fNetIf)->stopWCL();
     OSSafeReleaseNULL(driverFaultReporter);
@@ -49,13 +48,9 @@ void AirportMtkWlan::releaseAll()
         driverLogPipe->CCPipe::stopPipe();
         driverLogPipeStarted = false;
     }
-#endif
     OSSafeReleaseNULL(driverLogPipe);
     OSSafeReleaseNULL(driverDataPathPipe);
     OSSafeReleaseNULL(driverSnapshotsPipe);
-#ifndef AIRPORT_WCL
-    OSSafeReleaseNULL(driverFaultReporter);
-#endif
     if (fHalService) {
         fHalService->release();
         fHalService = NULL;
@@ -92,30 +87,12 @@ void AirportMtkWlan::
 eventHandler(struct ieee80211com *ic, int msgCode, void *data)
 {
     AirportMtkWlan *that = OSDynamicCast(AirportMtkWlan, ic->ic_ac.ac_if.controller);
-#ifdef AIRPORT_WCL
     if (!that)
         return;
-#endif
     IO80211SkywalkInterface *interface = that->fNetIf;
     if (!interface)
         return;
-#ifdef AIRPORT_WCL
     static_cast<AirportMtkSkywalkInterface *>(interface)->handleWCLEvent(msgCode, data);
-#else
-    switch (msgCode) {
-        case IEEE80211_EVT_COUNTRY_CODE_UPDATE:
-            interface->postMessage(APPLE80211_M_COUNTRY_CODE_CHANGED, NULL, 0, 0);
-            break;
-        case IEEE80211_EVT_STA_ASSOC_DONE:
-            interface->postMessage(APPLE80211_M_ASSOC_DONE, NULL, 0, 0);
-            break;
-        case IEEE80211_EVT_STA_DEAUTH:
-            interface->postMessage(APPLE80211_M_DEAUTH_RECEIVED, NULL, 0, 0);
-            break;
-        default:
-            break;
-    }
-#endif
 }
 
 void AirportMtkWlan::watchdogAction(IOTimerEventSource *timer)
@@ -128,16 +105,9 @@ void AirportMtkWlan::watchdogAction(IOTimerEventSource *timer)
 
 void AirportMtkWlan::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
 {
-#ifndef AIRPORT_WCL
-    UInt32 msg = 0;
-#endif
     AirportMtkWlan *that = (AirportMtkWlan *)owner;
-#ifdef AIRPORT_WCL
     if (that->fNetIf)
         static_cast<AirportMtkSkywalkInterface *>(that->fNetIf)->completeWCLScan();
-#else
-    that->fNetIf->postMessage(APPLE80211_M_SCAN_DONE, &msg, 4, 0);
-#endif
 }
 
 bool AirportMtkWlan::init(OSDictionary *properties)
@@ -202,7 +172,6 @@ initCCLogs()
     driverLogOptions.log_policy = 0;
     driverLogPipe = CCPipe::withOwnerNameCapacity(this, "com.eiyuumiru.AirportMtkWlan", "DriverLogs", &driverLogOptions);
     XYLog("%s driverLogPipeRet %d\n", __FUNCTION__, driverLogPipe != NULL);
-#ifdef AIRPORT_WCL
     if (!driverLogPipe || !getWorkLoop())
         return false;
     // The factory only initializes the pipe. startPipe creates its event sources.
@@ -217,7 +186,6 @@ initCCLogs()
         OSSafeReleaseNULL(logger);
         return false;
     }
-#endif
 
     memset(&driverLogOptions, 0, sizeof(driverLogOptions));
     driverLogOptions.pipe_type = 0;
@@ -233,13 +201,11 @@ initCCLogs()
     driverLogOptions.log_policy = 0;
     driverDataPathPipe = CCPipe::withOwnerNameCapacity(this, "com.eiyuumiru.AirportMtkWlan", "DatapathEvents", &driverLogOptions);
     XYLog("%s driverDataPathPipeRet %d\n", __FUNCTION__, driverDataPathPipe != NULL);
-#ifdef AIRPORT_WCL
     if (!driverDataPathPipe)
         return false;
     driverDataPathPipeStarted = driverDataPathPipe->CCPipe::startPipe();
     if (!driverDataPathPipeStarted)
         return false;
-#endif
 
     memset(&driverLogOptions, 0, sizeof(driverLogOptions));
     driverLogOptions.pipe_type = 0x200000001;
@@ -250,18 +216,15 @@ initCCLogs()
     driverLogOptions.pipe_size = 128;
     driverSnapshotsPipe = CCPipe::withOwnerNameCapacity(this, "com.eiyuumiru.AirportMtkWlan", "StateSnapshots", &driverLogOptions);
     XYLog("%s driverSnapshotsPipeRet %d\n", __FUNCTION__, driverSnapshotsPipe != NULL);
-#ifdef AIRPORT_WCL
     if (!driverSnapshotsPipe)
         return false;
     driverSnapshotsPipeStarted = driverSnapshotsPipe->CCPipe::startPipe();
     if (!driverSnapshotsPipeStarted)
         return false;
-#endif
 
     CCStreamOptions faultReportOptions = { 0 };
     faultReportOptions.stream_type = 1;
     faultReportOptions.console_level = 0xFFFFFFFFFFFFFFFF;
-#ifdef AIRPORT_WCL
     driverFaultStream = CCStream::withPipeAndName(driverSnapshotsPipe, "FaultReporter", &faultReportOptions);
     CCDataStream *dataStream = OSDynamicCast(CCDataStream, driverFaultStream);
     if (!dataStream || !_fWorkloop) {
@@ -275,22 +238,14 @@ initCCLogs()
     if (!OSDynamicCast(CommonFaultReporter, driverFaultReporter)) {
         return false;
     }
-#else
-    driverFaultReporter = CCStream::withPipeAndName(driverSnapshotsPipe, "FaultReporter", &faultReportOptions);
-#endif
     XYLog("%s driverFaultReporterRet %d\n", __FUNCTION__, driverFaultReporter != NULL);
     return driverLogPipe && driverDataPathPipe && driverSnapshotsPipe && driverFaultReporter;
 }
 
 bool AirportMtkWlan::start(IOService *provider)
 {
-#if __IO80211_TARGET == __MAC_15_2
-    if (version_major != 24 || version_minor < 2)
-        return false;
-#elif __IO80211_TARGET == __MAC_26_0
     if (version_major != 25)
         return false;
-#endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct IOSkywalkEthernetInterface::RegistrationInfo registInfo;
     int boot_value = 0;
@@ -298,16 +253,12 @@ bool AirportMtkWlan::start(IOService *provider)
     UInt8 builtIn = 0;
     setProperty("built-in", OSData::withBytes(&builtIn, sizeof(builtIn)));
     setProperty("DriverKitDriver", kOSBooleanFalse);
-#ifdef AIRPORT_WCL
     if (!initCCLogs()) {
         releaseAll();
         return false;
     }
-#endif
     if (!super::start(provider)) {
-#ifdef AIRPORT_WCL
         releaseAll();
-#endif
         return false;
     }
     pciNub->setBusMasterEnable(true);
@@ -352,11 +303,9 @@ bool AirportMtkWlan::start(IOService *provider)
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
-#ifdef AIRPORT_WCL
     int he_enabled = 0;
     if (PE_parse_boot_argn("amtk_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
-#endif
 
     if (!fHalService->attach(pciNub)) {
         XYLog("attach fail\n");
@@ -382,23 +331,15 @@ bool AirportMtkWlan::start(IOService *provider)
     }
     fWatchdogWorkLoop->addEventSource(watchdogTimer);
     scanSource = IOTimerEventSource::timerEventSource(this, &fakeScanDone);
-#ifdef AIRPORT_WCL
     if (!scanSource || _fWorkloop->addEventSource(scanSource) != kIOReturnSuccess) {
         super::stop(provider);
         releaseAll();
         return false;
     }
-#else
-    _fWorkloop->addEventSource(scanSource);
-#endif
     scanSource->enable();
 
     fNetIf = new AirportMtkSkywalkInterface;
-#ifdef AIRPORT_WCL
     if (!fNetIf || !static_cast<AirportMtkSkywalkInterface *>(fNetIf)->init(this)) {
-#else
-    if (!fNetIf->init(this)) {
-#endif
         XYLog("Skywalk interface init fail\n");
         super::stop(provider);
         releaseAll();
@@ -407,14 +348,6 @@ bool AirportMtkWlan::start(IOService *provider)
     fNetIf->setInterfaceRole(1);
     fNetIf->setInterfaceId(1);
 
-#ifndef AIRPORT_WCL
-    if (!initCCLogs()) {
-        XYLog("CCLog init fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
-    }
-#endif
     if (!fNetIf->attach(this)) {
         XYLog("attach to service fail\n");
         super::stop(provider);
@@ -428,11 +361,7 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
     if (!IONetworkController::attachInterface((IONetworkInterface **)&bsdInterface,
-#ifdef AIRPORT_WCL
                                              false
-#else
-                                             true
-#endif
                                              )) {
         XYLog("attach to IONetworkController interface fail\n");
         super::stop(provider);
@@ -446,7 +375,6 @@ bool AirportMtkWlan::start(IOService *provider)
         releaseAll();
         return false;
     }
-#ifdef AIRPORT_WCL
     fNetIf->mExpansionData->fRegistrationInfo = (struct IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkNetworkInterface::RegistrationInfo));
     fNetIf->mExpansionData2->fRegistrationInfo = (struct IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkEthernetInterface::RegistrationInfo));
     if (!fNetIf->mExpansionData->fRegistrationInfo || !fNetIf->mExpansionData2->fRegistrationInfo) {
@@ -464,28 +392,10 @@ bool AirportMtkWlan::start(IOService *provider)
         return false;
     }
 
-#else
-    if (!fNetIf->initRegistrationInfo(&registInfo, 1, sizeof(registInfo))) {
-        XYLog("initRegistrationInfo fail\n");
-        super::stop(provider);
-        releaseAll();
-        return false;
-    }
-    fNetIf->mExpansionData->fRegistrationInfo = (struct IOSkywalkNetworkInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkNetworkInterface::RegistrationInfo));
-    fNetIf->mExpansionData2->fRegistrationInfo = (struct IOSkywalkEthernetInterface::RegistrationInfo *)IOMalloc(sizeof(struct IOSkywalkEthernetInterface::RegistrationInfo));
-    memcpy(fNetIf->mExpansionData->fRegistrationInfo, &registInfo, sizeof(registInfo));
-    memcpy(fNetIf->mExpansionData2->fRegistrationInfo, &registInfo, sizeof(registInfo));
-    if (fNetIf->getInterfaceRole() == 1)
-        fNetIf->deferBSDAttach(true);
-    fNetIf->start(this);
-
-#endif
     setLinkStatus(kIONetworkLinkValid);
     if (TAILQ_EMPTY(&fHalService->get80211Controller()->ic_ess))
         fHalService->get80211Controller()->ic_flags |= IEEE80211_F_AUTO_JOIN;
-#ifdef AIRPORT_WCL
     bsdInterface->registerService();
-#endif
     registerService();
     // Do not create the native AWDL interface during controller start.
     // Tahoe may probe/start the controller while Bluetooth and the native
@@ -502,10 +412,8 @@ void AirportMtkWlan::stop(IOService *provider)
 #endif
     XYLog("%s\n", __PRETTY_FUNCTION__);
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
-#ifdef AIRPORT_WCL
     if (fNetIf)
         static_cast<AirportMtkSkywalkInterface *>(fNetIf)->stopWCL();
-#endif
     super::stop(provider);
     disableAdapter(bsdInterface);
     setLinkStatus(kIONetworkLinkValid);
@@ -546,18 +454,12 @@ bool AirportMtkWlan::createWorkQueue()
 }
 
 IO80211WorkQueue *AirportMtkWlan::getWorkQueue()
-#ifdef AIRPORT_WCL
 const
-#endif
 {
     return _fWorkloop;
 }
 
-#ifdef AIRPORT_WCL
 CommonFaultReporter *AirportMtkWlan::getFaultReporterFromDriver()
-#else
-void *AirportMtkWlan::getFaultReporterFromDriver()
-#endif
 {
     return driverFaultReporter;
 }
@@ -710,25 +612,10 @@ IOReturn AirportMtkWlan::
 setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3)
 {
     AirportMtkWlan *that = OSDynamicCast(AirportMtkWlan, target);
-#ifdef AIRPORT_WCL
     that->bsdInterface->setLinkState((IO80211LinkState)(uint64_t)arg0);
     static_cast<AirportMtkSkywalkInterface *>(that->fNetIf)->handleWCLLink(
         (IO80211LinkState)(uint64_t)arg0 == kIO80211NetworkLinkUp);
     return kIOReturnSuccess;
-#else
-    IOReturn ret = that->fNetIf->setLinkState((IO80211LinkState)(uint64_t)arg0, (unsigned int)(uint64_t)arg1);
-    that->fNetIf->setRunningState((IO80211LinkState)(uint64_t)arg0 == kIO80211NetworkLinkUp);
-    that->fNetIf->postMessage(APPLE80211_M_LINK_CHANGED, NULL, 0, false);
-    that->fNetIf->postMessage(APPLE80211_M_BSSID_CHANGED, NULL, 0, false);
-    that->fNetIf->postMessage(APPLE80211_M_SSID_CHANGED, NULL, 0, false);
-    if ((IO80211LinkState)(uint64_t)arg0 == kIO80211NetworkLinkUp) {
-        that->fNetIf->reportLinkStatus(3, 0x80);
-    } else {
-        that->fNetIf->reportLinkStatus(1, 0);
-    }
-    that->bsdInterface->setLinkState((IO80211LinkState)(uint64_t)arg0);
-    return ret;
-#endif
 }
 
 #ifdef __PRIVATE_SPI__
@@ -764,7 +651,6 @@ IOReturn AirportMtkWlan::networkInterfaceNotification(
 }
 #endif
 
-#ifdef AIRPORT_WCL
 UInt32 AirportMtkWlan::outputPacket(mbuf_t m, void *param)
 {
 //    XYLog("%s\n", __FUNCTION__);
@@ -792,42 +678,6 @@ UInt32 AirportMtkWlan::outputPacket(mbuf_t m, void *param)
     (*ifp->if_start)(ifp);
     return ret;
 }
-#else
-UInt32 AirportMtkWlan::outputPacket(mbuf_t m, void *param)
-{
-//    XYLog("%s\n", __FUNCTION__);
-    IOReturn ret = kIOReturnOutputSuccess;
-    struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
-    
-    if (fHalService->get80211Controller()->ic_state != IEEE80211_S_RUN || ifp->if_snd.queue == NULL) {
-        if (m && mbuf_type(m) != MBUF_TYPE_FREE)
-            freePacket(m);
-        return kIOReturnOutputDropped;
-    }
-    if (m == NULL) {
-        XYLog("%s m==NULL!!\n", __FUNCTION__);
-        ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
-    }
-    if (!(mbuf_flags(m) & MBUF_PKTHDR) ){
-        XYLog("%s pkthdr is NULL!!\n", __FUNCTION__);
-        ifp->netStat->outputErrors++;
-        freePacket(m);
-        ret = kIOReturnOutputDropped;
-    }
-    if (mbuf_type(m) == MBUF_TYPE_FREE) {
-        XYLog("%s mbuf is FREE!!\n", __FUNCTION__);
-        ifp->netStat->outputErrors++;
-        ret = kIOReturnOutputDropped;
-    }
-    if (!ifp->if_snd.queue->lockEnqueue(m)) {
-        freePacket(m);
-        ret = kIOReturnOutputDropped;
-    }
-    (*ifp->if_start)(ifp);
-    return ret;
-}
-#endif
 
 const OSString * AirportMtkWlan::newVendorString() const
 {
@@ -853,7 +703,6 @@ IOReturn AirportMtkWlan::setHardwareAddress(const void *addrP, UInt32 addrBytes)
 {
     if (!fNetIf || !addrP)
         return kIOReturnError;
-#ifdef AIRPORT_WCL
     const UInt8 *address = static_cast<const UInt8 *>(addrP);
     auto ic = fHalService->get80211Controller();
     bool initializing = (ic->ic_if.if_flags & IFF_UP) && !(ic->ic_if.if_flags & IFF_RUNNING);
@@ -881,14 +730,9 @@ IOReturn AirportMtkWlan::setHardwareAddress(const void *addrP, UInt32 addrBytes)
     if (update == AirportWCL::MacUpdate::Unchanged) {
         return kIOReturnSuccess;
     }
-#endif
     if_setlladdr(&fHalService->get80211Controller()->ic_ac.ac_if, (const UInt8 *)addrP);
-#ifdef AIRPORT_WCL
     if (ic->ic_if.if_flags & IFF_RUNNING) {
         ic->ic_wcl_mac_reconfig = true;
-#else
-    if (fHalService->get80211Controller()->ic_state > IEEE80211_S_INIT) {
-#endif
         fHalService->disable(bsdInterface);
         fHalService->enable(bsdInterface);
     }
@@ -991,7 +835,6 @@ getCARD_CAPABILITIES(OSObject *object,
     // WPA not enabled, like on Apple cards
 
     cd->version = APPLE80211_VERSION;
-#ifdef AIRPORT_WCL
     // WPA2 can use TKIP for group traffic even when unicast uses CCMP.
     // net80211 handles TKIP/MIC in software; hiding it makes Apple80211
     // reject these networks before it submits an association request.
@@ -1002,7 +845,6 @@ getCARD_CAPABILITIES(OSObject *object,
     cd->capabilities[2] = (1 << (APPLE80211_CAP_WME - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_40MHZ - 16)) |
         (1 << (APPLE80211_CAP_SHORT_GI_20MHZ - 16));
-#if __IO80211_TARGET == __MAC_26_0
     // BSD CARD_CAPABILITIES strips version and returns 21 capability bytes.
     // wifip2pd tests returned byte 4 bit 0 before requesting native AWDL.
 #ifdef MTK_NATIVE_AWDL
@@ -1012,54 +854,10 @@ getCARD_CAPABILITIES(OSObject *object,
     // Tahoe configureValidAWDLChannels reads capability bit 29 for dual band.
     // A single radio can support both bands; this does not advertise RSDB.
     if (fHalService->getDriverInfo()->is5GBandSupport()) cd->capabilities[3] |= 0x20;
-#endif
     // Tahoe WCLDeviceConfiguration::isHeSupported reads byte 17, bit 7.
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
-#else
-    cd->capabilities[2] = 0xFF; // BURST, WME, SHORT_GI_40MHZ, SHORT_GI_20MHZ, WOW, TSN, ?, ?
-    cd->capabilities[3] = 0x2B;
-    cd->capabilities[5] = 0x40;
-    cd->capabilities[6] = (
-//                           1 |    //MFP capable
-                           0x8 |
-                           0x4 |
-                           0x80
-                           );
-    *(uint16_t *)&cd->capabilities[8] = 0x201;
-//
-//    cd->capabilities[2] |= 0x10;
-//    cd->capabilities[5] |= 0x1;
-//
-//    cd->capabilities[2] |= 0x2;
-//
-//    cd->capabilities[3] |= 0x20;
-//
-//    cd->capabilities[0] |= 0x80;
-//
-//    cd->capabilities[3] |= 0x80;
-//    cd->capabilities[4] |= 0x4;
-//
-//    cd->capabilities[4] |= 0x1;
-//    cd->capabilities[3] |= 0x1;
-//    cd->capabilities[6] |= 0x8;
-//
-//    cd->capabilities[3] |= 3;
-//    cd->capabilities[4] |= 2;
-//    cd->capabilities[6] |= 0x10;
-//    cd->capabilities[5] |= 0x20;
-//    cd->capabilities[5] |= 0x80;
-//
-//    if (cd->capabilities[6] & 0x20) {
-//        cd->capabilities[2] |= 8;
-//    }
-//    cd->capabilities[5] |= 8;
-//    cd->capabilities[8] |= 2;
-//
-//    cd->capabilities[11] |= (2 | 4 | 8 | 0x10 | 0x20 | 0x40 | 0x80);
-
-#endif
     return kIOReturnSuccess;
 }
 
@@ -1107,7 +905,6 @@ getCOUNTRY_CODE(OSObject *object,
 IOReturn AirportMtkWlan::
 setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
 {
-#ifdef AIRPORT_WCL
     if (!data)
         return kIOReturnBadArgument;
     if (data->cc[0] != 'x' && data->cc[0] != 'X' &&
@@ -1117,13 +914,6 @@ setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
             static_cast<AirportMtkSkywalkInterface *>(fNetIf)->handleWCLEvent(
                 IEEE80211_EVT_COUNTRY_CODE_UPDATE, nullptr);
     }
-#else
-    XYLog("%s cc=%s\n", __FUNCTION__, data->cc);
-    if (data && data->cc[0] != 120 && data->cc[0] != 88) {
-        memcpy(geo_location_cc, data->cc, sizeof(geo_location_cc));
-        fNetIf->postMessage(APPLE80211_M_COUNTRY_CODE_CHANGED, NULL, 0, 0);
-    }
-#endif
     return kIOReturnSuccess;
 }
 
@@ -1146,7 +936,6 @@ IOReturn AirportMtkWlan::
 setPOWER(OSObject *object,
                          struct apple80211_power_data *pd)
 {
-#ifdef AIRPORT_WCL
     if (!pd)
         return kIOReturnError;
     IOLog("AirportMtkWlan: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
@@ -1168,39 +957,13 @@ setPOWER(OSObject *object,
     }
 
     return kIOReturnSuccess;
-#else
-    if (!pd)
-        return kIOReturnError;
-    IOLog("AirportMtkWlan: setPOWER: num_radios[%d]  power_state(0:%u  1:%u  2:%u  3:%u)\n", pd->num_radios, pd->power_state[0], pd->power_state[1], pd->power_state[2], pd->power_state[3]);
-    if (pd->num_radios > 0) {
-        bool isRunning = (fHalService->get80211Controller()->ic_ac.ac_if.if_flags & (IFF_UP | IFF_RUNNING)) != 0;
-        if (pd->power_state[0] == 0) {
-            changePowerStateToPriv(1);
-            if (isRunning) {
-                net80211_ifstats(fHalService->get80211Controller());
-                disableAdapter(bsdInterface);
-            }
-        } else {
-            changePowerStateToPriv(2);
-            if (!isRunning)
-                enableAdapter(bsdInterface);
-        }
-        power_state = (pd->power_state[0]);
-    }
-
-    return kIOReturnSuccess;
-#endif
 }
 
 SInt32 AirportMtkWlan::apple80211_ioctl(IO80211SkywalkInterface *interface,unsigned long cmd,void *data, bool b1, bool b2)
 {
     if (!ml_at_interrupt_context())
         XYLog("%s cmd: %s b1: %d b2: %d\n", __FUNCTION__, convertApple80211IOCTLToString((unsigned int)cmd), b1, b2);
-#ifdef AIRPORT_WCL
     return kIOReturnUnsupported;
-#else
-    return super::apple80211_ioctl(interface, cmd, data, b1, b2);
-#endif
 }
 
 SInt32 AirportMtkWlan::apple80211SkywalkRequest(UInt request,int cmd,IO80211SkywalkInterface *interface,void *data)
@@ -1219,13 +982,9 @@ SInt32 AirportMtkWlan::apple80211SkywalkRequest(UInt request,int cmd,IO80211Skyw
 
 IOReturn AirportMtkWlan::enableAdapter(IONetworkInterface *netif)
 {
-#ifdef AIRPORT_WCL
     IOReturn status = fHalService->enable(netif);
     if (status != kIOReturnSuccess)
         return status;
-#else
-    fHalService->enable(netif);
-#endif
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
     watchdogTimer->enable();
     return kIOReturnSuccess;

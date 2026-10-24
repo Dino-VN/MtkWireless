@@ -17,10 +17,6 @@
 
 class CommonFaultReporter;
 
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
-
 #if VERSION_MAJOR > 8
 #define _MODERN_BPF
 #endif

@@ -14,9 +14,6 @@
 #include <IOKit/IOWorkLoop.h>
 
 // This is necessary, because even the latest Xcode does not support properly targeting 11.0.
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
 
 class IO80211WorkLoop : public IOWorkLoop
 {

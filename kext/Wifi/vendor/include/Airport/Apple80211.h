@@ -12,7 +12,6 @@
 #include "apple_private_spi.h"
 #include "debug.h"
 #include "IO80211WorkLoop.h"
-#ifdef IO80211FAMILY_V2
 #include "IO80211WorkQueue.h"
 #include "IO80211ControllerV2.h"
 #include "IO80211InfraInterface.h"
@@ -20,11 +19,5 @@
 #include "IOSkywalkPacketBufferPool.h"
 #include "IOSkywalkLegacyEthernetInterface.h"
 #include "IO80211SkywalkInterface.h"
-#else
-#include "IO80211Controller.h"
-#include "IO80211Interface.h"
-#include "IO80211VirtualInterface.h"
-#include "IO80211P2PInterface.h"
-#endif /* IO80211FAMILY_V2 */
 
 #endif /* Apple80211_h */

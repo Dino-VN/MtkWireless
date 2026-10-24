@@ -29,9 +29,6 @@
 #include <sys/param.h>
 
 // This is necessary, because even the latest Xcode does not support properly targeting 11.0.
-#ifndef __IO80211_TARGET
-#error "Please define __IO80211_TARGET to the requested version"
-#endif
 
 // Sizes and limits
 #define APPLE80211_ADDR_LEN            6
@@ -488,12 +485,7 @@ struct apple80211_scan_result
 
     u_int16_t             unk3;             // 0x88
     int16_t               asr_ie_len;       // 0x8A
-#if __IO80211_TARGET < __MAC_12_0
-    uint32_t              asr_unk3;         // 0x8C
-    void*                 asr_ie_data;      // 90
-#else
     uint8_t               asr_ie_data[1024];    // 0x8C
-#endif
 } __attribute__((packed));
 
 struct apple80211_network_data
@@ -569,11 +561,7 @@ enum apple80211_card_capability
 
 enum apple80211_virtual_interface_type
 {
-#if __IO80211_TARGET < __MAC_13_0
-    APPLE80211_VIF_P2P_DEVICE   = 1,
-#else
     APPLE80211_VIF_P2P_DEVICE   = 3,
-#endif
     APPLE80211_VIF_P2P_CLIENT,
     APPLE80211_VIF_P2P_GO,
     APPLE80211_VIF_AWDL,

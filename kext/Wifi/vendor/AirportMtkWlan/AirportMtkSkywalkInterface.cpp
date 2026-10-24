@@ -14,9 +14,7 @@
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
 
-#ifdef AIRPORT_WCL
 extern IOCommandGate *_fCommandGate;
-#endif
 
 #define super IO80211InfraProtocol
 OSDefineMetaClassAndStructors(AirportMtkSkywalkInterface, IO80211InfraProtocol);
@@ -164,20 +162,6 @@ void AirportMtkSkywalkInterface::associateSSID(uint8_t *ssid, uint32_t ssid_len,
         ic->ic_flags &= ~IEEE80211_F_DESBSSID;
     }
 
-#ifndef AIRPORT_WCL
-    // AUTHTYPE_WPA3_SAE AUTHTYPE_WPA3_FT_SAE
-    // we don't really support WPA3, but we have announced we support WPA3 in card capability function. so we fake it as WPA2 to support some WPA2/WPA3 mix wifi connection.
-    if (authtype_upper == APPLE80211_AUTHTYPE_WPA3_SAE || authtype_upper == APPLE80211_AUTHTYPE_WPA3_FT_SAE) {
-        wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
-        authtype_upper |= APPLE80211_AUTHTYPE_WPA2_PSK;// hack
-    }
-    // AUTHTYPE_WPA3_ENTERPRISE AUTHTYPE_WPA3_FT_ENTERPRISE
-    if (authtype_upper == APPLE80211_AUTHTYPE_WPA3_ENTERPRISE || authtype_upper == APPLE80211_AUTHTYPE_WPA3_FT_ENTERPRISE) {
-        wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
-        authtype_upper |= APPLE80211_AUTHTYPE_WPA2;// hack
-    }
-    
-#endif
     if (authtype_upper & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2 | APPLE80211_AUTHTYPE_WPA2_PSK | APPLE80211_AUTHTYPE_SHA256_PSK | APPLE80211_AUTHTYPE_SHA256_8021X)) {
         XYLog("%s %d\n", __FUNCTION__, __LINE__);
         wpa.i_protos = IEEE80211_WPA_PROTO_WPA1 | IEEE80211_WPA_PROTO_WPA2;
@@ -322,7 +306,6 @@ init(IOService *provider)
         return false;
     this->fHalService = instance->fHalService;
     this->scanSource = instance->scanSource;
-#ifdef AIRPORT_WCL
     IOEthernetAddress address;
     if (instance->getHardwareAddress(&address) != kIOReturnSuccess)
         return false;
@@ -331,7 +314,6 @@ init(IOService *provider)
         return false;
     if (!initWCL())
         return false;
-#endif
     return ret;
 }
 
@@ -350,13 +332,8 @@ getSSID(struct apple80211_ssid_data *sd)
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(sd, 0, sizeof(*sd));
         sd->version = APPLE80211_VERSION;
-#ifdef AIRPORT_WCL
         sd->ssid_len = MIN(ic->ic_bss->ni_esslen, sizeof(sd->ssid_bytes));
         memcpy(sd->ssid_bytes, ic->ic_bss->ni_essid, sd->ssid_len);
-#else
-        memcpy(sd->ssid_bytes, ic->ic_des_essid, strlen((const char*)ic->ic_des_essid));
-        sd->ssid_len = (uint32_t)strlen((const char*)ic->ic_des_essid);
-#endif
         return kIOReturnSuccess;
     }
     return 6;
@@ -382,55 +359,7 @@ setAUTH_TYPE(struct apple80211_authtype_data *ad)
 IOReturn AirportMtkSkywalkInterface::
 setCIPHER_KEY(struct apple80211_key *key)
 {
-#ifdef AIRPORT_WCL
     return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(8), key);
-#else
-
-    XYLog("%s\n", __FUNCTION__);
-    static_assert(__offsetof(struct apple80211_key, key_ea) == 92, "struct corrupted");
-    static_assert(__offsetof(struct apple80211_key, key_rsc_len) == 80, "struct corrupted");
-    static_assert(__offsetof(struct apple80211_key, wowl_kck_len) == 100, "struct corrupted");
-    static_assert(__offsetof(struct apple80211_key, wowl_kek_len) == 120, "struct corrupted");
-    static_assert(__offsetof(struct apple80211_key, wowl_kck_key) == 104, "struct corrupted");
-    
-    switch (key->key_cipher_type) {
-        case APPLE80211_CIPHER_NONE:
-            // clear existing key
-//            XYLog("Setting NONE key is not supported\n");
-            break;
-        case APPLE80211_CIPHER_WEP_40:
-        case APPLE80211_CIPHER_WEP_104:
-            XYLog("Setting WEP key %d is not supported\n", key->key_index);
-            break;
-        case APPLE80211_CIPHER_TKIP:
-        case APPLE80211_CIPHER_AES_OCB:
-        case APPLE80211_CIPHER_AES_CCM:
-            switch (key->key_flags) {
-                case 4: // PTK
-                    setPTK(key->key, key->key_len);
-                    break;
-                case 0: // GTK
-                    setGTK(key->key, key->key_len, key->key_index, key->key_rsc);
-                    break;
-            }
-            break;
-        case APPLE80211_CIPHER_PMK:
-            XYLog("Setting WPA PMK is not supported\n");
-            break;
-        case APPLE80211_CIPHER_MSK:
-            XYLog("Setting MSK\n");
-            ieee80211_pmksa_add(fHalService->get80211Controller(), IEEE80211_AKM_8021X,
-                                fHalService->get80211Controller()->ic_bss->ni_macaddr, key->key, 0);
-            break;
-        case APPLE80211_CIPHER_PMKSA:
-            XYLog("Setting WPA PMKSA\n");
-            ieee80211_pmksa_add(fHalService->get80211Controller(), IEEE80211_AKM_8021X,
-                                fHalService->get80211Controller()->ic_bss->ni_macaddr, key->key, 0);
-            break;
-    }
-    //fInterface->postMessage(APPLE80211_M_CIPHER_KEY_CHANGED);
-    return kIOReturnSuccess;
-#endif
 }
 
 IOReturn AirportMtkSkywalkInterface::
@@ -575,11 +504,7 @@ getRATE_SET(struct apple80211_rate_set_data *ad)
         ad->num_rates = ic->ic_bss->ni_rates.rs_nrates;
         size_t size = min(ic->ic_bss->ni_rates.rs_nrates, ARRAY_SIZE(ad->rates));
         for (int i=0; i < size; i++) {
-#ifdef AIRPORT_WCL
             struct apple80211_rate &apple_rate = ad->rates[i];
-#else
-            struct apple80211_rate apple_rate = ad->rates[i];
-#endif
             apple_rate.version = APPLE80211_VERSION;
             apple_rate.rate = ic->ic_bss->ni_rates.rs_rates[i];
             apple_rate.flags = 0;
@@ -723,45 +648,13 @@ getRSSI(struct apple80211_rssi_data *rd)
 IOReturn AirportMtkSkywalkInterface::
 getRSN_IE(struct apple80211_rsn_ie_data *data)
 {
-#ifdef AIRPORT_WCL
     return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(10), data);
-#elif defined(USE_APPLE_SUPPLICANT)
-    struct ieee80211com *ic = fHalService->get80211Controller();
-    if (ic->ic_bss == NULL || ic->ic_bss->ni_rsnie == NULL) {
-        return kIOReturnError;
-    }
-    data->version = APPLE80211_VERSION;
-    if (ic->ic_rsn_ie_override[1] > 0) {
-        data->len = 2 + ic->ic_rsn_ie_override[1];
-        memcpy(data->ie, ic->ic_rsn_ie_override, data->len);
-    }
-    else {
-        data->len = 2 + ic->ic_bss->ni_rsnie[1];
-        memcpy(data->ie, ic->ic_bss->ni_rsnie, data->len);
-    }
-    return kIOReturnSuccess;
-#else
-    return kIOReturnUnsupported;
-#endif
 }
 
 IOReturn AirportMtkSkywalkInterface::
 setRSN_IE(struct apple80211_rsn_ie_data *data)
 {
-#ifdef AIRPORT_WCL
     return _fCommandGate->runAction(wclCommand, this, reinterpret_cast<void *>(9), data);
-#elif defined(USE_APPLE_SUPPLICANT)
-    struct ieee80211com *ic = fHalService->get80211Controller();
-    if (!data)
-        return kIOReturnError;
-    static_assert(sizeof(ic->ic_rsn_ie_override) == APPLE80211_MAX_RSN_IE_LEN, "Max RSN IE length mismatch");
-    memcpy(ic->ic_rsn_ie_override, data->ie, APPLE80211_MAX_RSN_IE_LEN);
-    if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss != nullptr)
-        ieee80211_save_ie(data->ie, &ic->ic_bss->ni_rsnie);
-    return kIOReturnSuccess;
-#else
-    return kIOReturnUnsupported;
-#endif
 }
 
 IOReturn AirportMtkSkywalkInterface::
@@ -1094,7 +987,6 @@ getSCAN_RESULT(struct apple80211_scan_result *sr)
     return kIOReturnSuccess;
 }
 
-#ifdef AIRPORT_WCL
 IOReturn AirportMtkSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *data)
 {
     if (!data) return kIOReturnBadArgument;
@@ -1104,23 +996,8 @@ IOReturn AirportMtkSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *data)
     return kIOReturnSuccess;
 }
 
-#if __IO80211_TARGET == __MAC_15_2
-IOReturn AirportMtkSkywalkInterface::setMacAddress(ether_addr &address)
-{
-    return instance->setHardwareAddress(&address, IEEE80211_ADDR_LEN);
-}
-#else
 IOReturn AirportMtkSkywalkInterface::setMacAddress(mloAddrArray &addresses)
 {
     return instance->setHardwareAddress(&addresses, IEEE80211_ADDR_LEN);
 }
-#endif
 
-#endif
-
-#ifndef AIRPORT_WCL
-IOReturn AirportMtkSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *)
-{
-    return kIOReturnUnsupported;
-}
-#endif

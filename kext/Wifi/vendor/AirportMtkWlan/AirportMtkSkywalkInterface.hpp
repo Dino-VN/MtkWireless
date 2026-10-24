@@ -9,37 +9,28 @@
 #ifndef AirportMtkSkywalkInterface_hpp
 #define AirportMtkSkywalkInterface_hpp
 
-#ifdef AIRPORT_WCL
 #include "WCL/WCL.hpp"
-#endif
 
 #include <Airport/Apple80211.h>
 
-#ifdef AIRPORT_WCL
 #define AIRPORT_SKYWALK_OVERRIDE
-#else
-#define AIRPORT_SKYWALK_OVERRIDE override
-#endif
 
 class AirportMtkSkywalkInterface : public IO80211InfraProtocol {
     OSDeclareDefaultStructors(AirportMtkSkywalkInterface)
     
 public:
-#ifdef AIRPORT_WCL
     IOReturn getBSS_BLACKLIST(bss_blacklist*) override { return kIOReturnUnsupported; }
     IOReturn getHE_COUNTERS(apple80211_he_counters_ctl*) override { return kIOReturnUnsupported; }
     IOReturn getWCL_WNM_OFFLOAD(apple80211_wcl_wnm_offload_t*) override { return kIOReturnUnsupported; }
     IOReturn getFW_CLOCK_INFO(apple80211_fw_clock_info*) override { return kIOReturnUnsupported; }
     IOReturn getTIMESYNC_STATS(apple80211_timesync_stats*) override { return kIOReturnUnsupported; }
     IOReturn getSYSTEM_SLEEP_CONFIG(apple80211_system_sleep_config*) override { return kIOReturnUnsupported; }
-#if __IO80211_TARGET != __MAC_15_2
     IOReturn getSMARTCCA_OPMODE(apple80211_smartcca_opmode*) override { return kIOReturnUnsupported; }
     IOReturn getLQM_STATISTICS(apple80211_lqm_statistics*) override { return kIOReturnUnsupported; }
     IOReturn getDEVICE_ORIENTATION(apple80211_device_orientation*) override { return kIOReturnUnsupported; }
     IOReturn getACCESSORY_STATE(apple80211_device_accessory_info*) override { return kIOReturnUnsupported; }
     IOReturn getP2P_DEVICE_CAPABILITY(apple80211_p2p_device_capability*) override { return kIOReturnUnsupported; }
     IOReturn getPOWERTABLE_VERSION(apple80211_powertable_version_data*) override { return kIOReturnUnsupported; }
-#endif
     IOReturn setCLEAR_PMKSA_CACHE(void*) override;
     IOReturn setDYNAMIC_RSSI_WINDOW_CONFIG(apple80211_dynamic_rssi_window_config*) override { return kIOReturnUnsupported; }
     IOReturn setBSS_BLACKLIST(bss_blacklist*) override { return kIOReturnUnsupported; }
@@ -90,7 +81,6 @@ public:
     IOReturn setNDD_REQ(apple80211_ndd_data*) override { return kIOReturnUnsupported; }
     IOReturn setDBRG_ENTROPY(apple80211_drbg_entropy*) override { return kIOReturnUnsupported; }
     IOReturn setSDB_ENABLE(apple80211_sdb_enable*) override { return kIOReturnUnsupported; }
-#if __IO80211_TARGET != __MAC_15_2
     IOReturn setBTCOEX_EXT_PROFILE(apple80211_btcoex_ext_profile*) override { return kIOReturnUnsupported; }
     IOReturn setDEVICE_ORIENTATION(apple80211_device_orientation*) override { return kIOReturnUnsupported; }
     IOReturn setACCESSORY_STATE(apple80211_device_accessory_info*) override { return kIOReturnUnsupported; }
@@ -98,19 +88,10 @@ public:
     IOReturn setTX_MODE_CONFIG(apple80211_tx_mode_config*) override { return kIOReturnUnsupported; }
     IOReturn setMITIGATE_INTERFERENCE(apple80211_mitigate_interference*) override { return kIOReturnUnsupported; }
     IOReturn setMacAddress(mloAddrArray &) override;
-#endif
     IOReturn getROAM_PROFILE(apple80211_roam_profile_all_bands *) override { return kIOReturnUnsupported; }
     IOReturn setROAM_PROFILE(apple80211_roam_profile_all_bands *) override { return kIOReturnUnsupported; }
-#if __IO80211_TARGET != __MAC_15_2
     IOReturn setWCL_JOIN_ABORT(apple80211_wcl_abort_join *) override;
-#endif
     IOReturn setWCL_ASSOCIATE(apple80211AssocCandidates *) override;
-#if __IO80211_TARGET == __MAC_15_2
-    IOReturn setMacAddress(ether_addr &) override;
-    IOReturn getWIFI_BT_5G_POLICY(apple80211_wifi_bt_5g_policy_t *) override { return kIOReturnUnsupported; }
-    IOReturn setWIFI_BT_5G_POLICY(apple80211_wifi_bt_5g_policy_t *) override { return kIOReturnUnsupported; }
-#endif
-#endif
 
     virtual bool init(IOService *) AIRPORT_SKYWALK_OVERRIDE;
 //    virtual ifnet_t getBSDInterface(void) AIRPORT_SKYWALK_OVERRIDE;
@@ -162,11 +143,7 @@ public:
     virtual IOReturn getVHT_MCS_INDEX_SET(apple80211_vht_mcs_index_set_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getMCS_VHT(apple80211_mcs_vht_data *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getGAS_RESULTS(apple80211_gas_result_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn getCHANNELS_INFO(apple80211_channels_info *) override;
-#else
-    virtual IOReturn getCHANNELS_INFO(apple80211_channels_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getVHT_CAPABILITY(apple80211_vht_capability *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn getBGSCAN_CACHE_RESULTS(apple80211_bgscan_cached_network_data_list *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getROAM_PROFILE(apple80211_roam_profile_band_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -180,11 +157,7 @@ public:
     virtual IOReturn getAWDL_RSDB_CAPS(apple80211_rsdb_capability *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTKO_PARAMS(apple80211_tko_params *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTKO_DUMP(apple80211_tko_dump *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     virtual IOReturn getHW_SUPPORTED_CHANNELS(apple80211_sup_channel_data *data) AIRPORT_SKYWALK_OVERRIDE { return getSUPPORTED_CHANNELS(data); }
-#else
-    virtual IOReturn getHW_SUPPORTED_CHANNELS(apple80211_sup_channel_data *data) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getBTCOEX_PROFILE(apple80211_btcoex_profile *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getBTCOEX_PROFILE_ACTIVE(apple80211_btcoex_profile_active_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTRAP_INFO(apple80211_trap_info_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -199,11 +172,7 @@ public:
     virtual IOReturn getLQM_CONFIG(apple80211_lqm_config_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getTRAP_CRASHTRACER_MINI_DUMP(apple80211_trap_mini_dump_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getHE_CAPABILITY(apple80211_he_capability *) AIRPORT_SKYWALK_OVERRIDE;
-#ifdef AIRPORT_WCL
     IOReturn getBEACON_INFO(apple80211_beacon_info_t *) override;
-#else
-    virtual IOReturn getBEACON_INFO(apple80211_beacon_info_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getSOFTAP_PARAMS(apple80211_softap_params *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getCHIP_POWER_RANGE(apple80211_chip_power_limit *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getSOFTAP_STATS(apple80211_softap_stats *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -230,40 +199,20 @@ public:
     virtual IOReturn getSENSING_DATA(apple80211_sensing_data_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getCOUNTRY_BAND_SUPPORT(apple80211_country_band_support *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getWCL_FW_HOT_CHANNELS(apple80211_fw_hot_channels *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     virtual IOReturn getWCL_LOW_LATENCY_INFO(apple80211_low_latency_info *) override;
-#else
-    virtual IOReturn getWCL_LOW_LATENCY_INFO(apple80211_low_latency_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
-#ifdef AIRPORT_WCL
     virtual IOReturn getWCL_BSS_INFO(apple80211_beacon_msg *) override;
-#else
-    virtual IOReturn getWCL_BSS_INFO(apple80211_beacon_msg *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getWCL_TRAFFIC_COUNTERS(apple80211_wcl_traffic_counters *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getWCL_GET_TX_BLANKING_STATUS(uint *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getSSID_TRANSITION_SUPPORT(apple80211_ssid_transition_feature_enabled *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn getWCL_VALID_CHANNEL_COUNT(unsigned long *);
-#else
-    virtual IOReturn getWCL_VALID_CHANNEL_COUNT(unsigned long *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getWCL_P2P_STATUS_FOR_SCAN(p2pStatusForScan *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn getWCL_CHANNELS_INFO(apple80211ChannelInfo *) override;
-#else
-    virtual IOReturn getWCL_CHANNELS_INFO(apple80211ChannelInfo *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getP2P_STEERING_METRIC(apple80211_p2p_steering_metrics *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getRSN_XE(apple80211_rsn_xe_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getSIB_COEX_STATUS(apple80211_sib_coex_status *) AIRPORT_SKYWALK_OVERRIDE;
-#ifdef AIRPORT_WCL
     virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) override;
     IOReturn copyWCLExtendedBss(void *);
     IOReturn copyWCLChannels(void *);
-#else
-    virtual IOReturn getWCL_EXTENDED_BSS_INFO(apple80211_extended_bss_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn getWCL_LOW_LATENCY_INFO_STATS(apple80211_wcl_low_latency_stats *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getWCL_BGSCAN_CACHE_RESULT(apple80211_bgscan_cached_network_data_list *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn getWIFI_NOISE_PER_ANT(apple80211_noise_per_ant_t *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -350,45 +299,25 @@ public:
     virtual IOReturn setNANPHS_ASSOCIATION(apple80211_nan_link_association_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setNANPHS_TERMINATED(apple80211_nan_link_association_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn set6G_MODE(apple80211_6G_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn setWCL_LEAVE_NETWORK(apple80211_leave_network *) override;
-#else
-    virtual IOReturn setWCL_LEAVE_NETWORK(apple80211_leave_network *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn setWCL_REASSOC(apple80211_reassoc *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_SET_ROAM_LOCK(apple80211_set_roam_lock *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIG(apple80211_roam_profile_config *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIGV1(apple80211_roam_profile_configV1 *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_USER_CACHE(apple80211_user_roam_cache *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_SET_MULTI_AP_ENV(apple80211_set_multi_ap_env *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn setWCL_SCAN_ABORT(void *) override;
-#else
-    virtual IOReturn setWCL_SCAN_ABORT(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn setWCL_REAL_TIME_MODE(apple80211_wcl_real_time_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_GARP_MODE(apple80211_wcl_garp_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#if defined(AIRPORT_WCL) && __IO80211_TARGET == __MAC_15_2
-    IOReturn setWCL_JOIN_ABORT(void *) override;
-#else
     virtual IOReturn setWCL_JOIN_ABORT(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn setWCL_TRIGGER_CC(triggerCC *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     IOReturn setWCL_SCAN_REQ(apple80211ScanRequest *) override;
-#else
-    virtual IOReturn setWCL_SCAN_REQ(apple80211ScanRequest *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn setWCL_ASSOCIATE(apple80211_assoc_candidates *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_PROTECT_IP(apple80211_wcl_protect_ip_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_LINK_UP_DONE(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_SET_SCAN_HOME_AWAY_TIME(scanHomeAndAwayTime *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setWCL_VOLUNTARY_NETWORK_DISCONNECT(apple80211_wcl_voluntary_network_disconnect *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#ifdef AIRPORT_WCL
     virtual IOReturn setWCL_LINK_STATE_UPDATE(apple80211_wcl_update_link_state *) override;
-#else
-    virtual IOReturn setWCL_LINK_STATE_UPDATE(apple80211_wcl_update_link_state *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
-#endif
     virtual IOReturn setSLOW_WIFI_RECOVERY(void *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setRSN_XE(apple80211_rsn_xe_data *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ULOFDMA_STATE(apple80211_wcl_ulofdma_state *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -406,7 +335,6 @@ public:
     virtual IOReturn setWCL_CONFIG_BG_PARAMS(apple80211_bg_params *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setBLOCKED_BANDS(apple80211_blocked_bands *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     
-#ifdef AIRPORT_WCL
     bool initWCL();
     void free() override;
     void stopWCL();
@@ -457,7 +385,6 @@ private:
     bool portAuthorized;
     uint8_t wclPermanentMAC[6] = {};
     bool wclStopping;
-#endif
 
 private:
     AirportMtkWlan *instance;

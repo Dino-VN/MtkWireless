@@ -13,8 +13,8 @@ AirportItlwm, AirportMtkWlan and any SSDT that disables the Wi-Fi PCI device.
 Supported PCI IDs: `14c3:7961` (MT7921), `14c3:0608` (MT7921K / RZ608),
 `14c3:7922` (MT7922), `14c3:0616` (MT7922 / RZ616).
 
-A Sequoia (macOS 15) build is not produced yet: the IO80211 ABI differs and a
-Tahoe build never attaches there.
+macOS 26 Tahoe only. Code for older macOS (Sequoia's IO80211 ABI) was removed;
+a Tahoe build never attaches on older systems.
 
 ## Install
 
