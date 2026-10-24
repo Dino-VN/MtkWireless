@@ -75,6 +75,21 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   (`missingEndpoint`). Boot-arg `amtk_awdl_offchan=0` restores the AP-channel
   only mode (`awdlOnlyChannel`, `planRadio`'s `onlyChannel`). Unverified on
   hardware; ioreg `MTKAWDLInfraPS*` counts the handshakes.
+- Unassociated, Wi-Fi scans and joins win over AWDL: `mt7921_mcu_hw_scan`
+  suspends scans for AWDL only while associated (RUN), otherwise it aborts
+  the AWDL ROC and scans; `awdlReserve` refuses ROC during a scan and while
+  `mwx_awdl_infra_joining` (AUTH/ASSOC, or RUN with the RSN port not yet
+  valid). Suspending every scan while AWDL was on made all joins fail with
+  -3905 while AirDrop was open (2026-10-24).
+- Firmware ROC grants take tens of ms (seen up to ~240 ms; the lead
+  estimator then plans ~140 ms ahead). While associated, `planRadio`'s
+  `homeChannel` (the AP channel) lets one grant span trailing idle slots up
+  to the next off-channel window instead of a ROC per window. ioreg
+  `MTKAWDLROCLatency{Unassoc,APChannel,OffChannel}` histograms grant latency
+  (<5/10/20/40/80/160/>=160 ms).
+- `sudo dmesg` is useless for driver printf: system IOMemoryDescriptor
+  backtrace spam overwrites the buffer within seconds. Publish diagnostics
+  to ioreg.
 - With AWDL on, the `other_bss` RX filter lets neighbor BSS traffic in; it
   shows up as `rx drop reason=amsdu-err` with wcid 0x3ff. That is noise.
 

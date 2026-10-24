@@ -1048,9 +1048,10 @@ void AirportMtkAwdlInterface::serviceInGate()
             // MtkWireless: with amtk_awdl_offchan=0, AWDL only uses the AP's
             // channel while associated. If no window is on it, back off
             // instead of polling every 2ms.
+            // A grant on the AP's channel also spans idle slots (planRadio).
             uint8_t onlyChannel=hal->awdlOnlyChannel();
             if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
-                                   onlyChannel)) { timer->setTimeoutMS(onlyChannel ? 50 : 2); return; }
+                                   onlyChannel,hal->awdlInfraChannel())) { timer->setTimeoutMS(onlyChannel ? 50 : 2); return; }
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelReachable(target.channel)) {
                 timer->setTimeoutMS(1); return;

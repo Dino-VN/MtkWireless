@@ -14,7 +14,8 @@ uint32_t mtk_awdl_roc_channel_lead(const mtkawdl::RocChannelTiming *c, uint8_t c
 void mtk_awdl_roc_channel_observe(mtkawdl::RocChannelTiming *c, uint8_t channel, uint32_t responseUs,
                                   uint64_t preparationUs);
 bool mtk_awdl_plan_radio(const mtkawdl::State *s, uint64_t now, mtkawdl::RadioPlan *out, uint32_t leadUs,
-                         bool skipCurrent, const mtkawdl::RocChannelTiming *timing, uint8_t onlyChannel);
+                         bool skipCurrent, const mtkawdl::RocChannelTiming *timing, uint8_t onlyChannel,
+                         uint8_t homeChannel);
 bool mtk_awdl_grant_covers_window(const mtkawdl::Window *w, const mtkawdl::Reservation *grant, uint64_t now);
 bool mtk_awdl_grant_covers_reserved_window(const mtkawdl::State *s, const mtkawdl::Window *reserved,
                                            uint8_t requestedChannel, const mtkawdl::Reservation *grant,
@@ -84,8 +85,8 @@ struct RadioPlan { Window window; uint64_t requestAt; uint32_t durationMs; };
 // associated to an AP on that channel).
 inline bool planRadio(const State &s,uint64_t now,RadioPlan &out,uint32_t leadUs=rocLeadUs,
                       bool skipCurrent=false,const RocChannelTiming *timing=nullptr,
-                      uint8_t onlyChannel=0) {
-    return mtk_awdl_plan_radio(&s,now,&out,leadUs,skipCurrent,timing,onlyChannel);
+                      uint8_t onlyChannel=0,uint8_t homeChannel=0) {
+    return mtk_awdl_plan_radio(&s,now,&out,leadUs,skipCurrent,timing,onlyChannel,homeChannel);
 }
 inline bool grantCoversWindow(const Window &w,const Reservation &grant,uint64_t now) {
     return mtk_awdl_grant_covers_window(&w,&grant,now);

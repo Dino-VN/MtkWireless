@@ -443,6 +443,12 @@ struct mwx_softc {
     uint8_t sc_awdl_address[6];
     bool sc_awdl_enabled, sc_awdl_configured, sc_awdl_filter_active;
     bool sc_awdl_scan_suspended;
+    // MtkWireless: scans that took the radio from AWDL while unassociated,
+    // and ROCs refused while the STA authenticates/associates/does 4-way.
+    uint64_t sc_awdl_scan_preempted, sc_awdl_roc_join_blocked;
+    // ROC grant latency, <5/10/20/40/80/160/>=160 ms; [0] unassociated,
+    // [1] associated with the ROC on the AP channel, [2] off it.
+    uint32_t sc_awdl_roc_latency[3][7];
     // MtkWireless: AP told we sleep (PM=1) for an off-channel AWDL ROC.
     bool sc_awdl_infra_ps;
     uint64_t sc_awdl_infra_ps_at, sc_awdl_infra_ps_sleeps, sc_awdl_infra_ps_wakes;
@@ -3913,6 +3919,15 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
     if(result==mtkawdl::RocResult::Accepted) {
         ++sc->sc_awdl_roc_grants;
         sc->sc_awdl_roc_grant_delay_us=sc->sc_awdl_roc.responseDelayUS;
+        {
+            uint32_t ms=sc->sc_awdl_roc.responseDelayUS/1000; unsigned b=0;
+            while(b<6 && ms>=(5u<<b)) ++b;
+            unsigned kind=0;
+            if(sc->sc_ic.ic_opmode==IEEE80211_M_STA && sc->sc_ic.ic_state==IEEE80211_S_RUN &&
+               sc->sc_ic.ic_bss && sc->sc_ic.ic_bss->ni_chan)
+                kind=ieee80211_chan2ieee(&sc->sc_ic,sc->sc_ic.ic_bss->ni_chan)==sc->sc_awdl_roc.channel ? 1 : 2;
+            ++sc->sc_awdl_roc_latency[kind][b];
+        }
         if(sc->sc_awdl_roc_grant_delay_us>sc->sc_awdl_roc_max_grant_delay_us)
             sc->sc_awdl_roc_max_grant_delay_us=sc->sc_awdl_roc_grant_delay_us;
     } else ++sc->sc_awdl_roc_rejected;
@@ -5213,11 +5228,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
     // One radio cannot scan while honoring an AWDL reservation. Keep the
     // logical scan pending and finish it when AWDL releases the radio. Do
     // not repeatedly cancel/end/restart a foreground scan each timer tick.
-    if(sc->sc_awdl_enabled) {
+    // MtkWireless: only while associated. Unassociated, the scan is how
+    // airportd finds the AP to join; suspending it until AWDL went idle
+    // failed every join (-3905) while AirDrop was open. Release the AWDL
+    // ROC instead; awdlReserve waits for the scan.
+    if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN) {
         sc->sc_awdl_scan_suspended=true;
         return 0;
     }
     sc->sc_awdl_scan_suspended=false;
+    if(sc->sc_awdl_enabled) {
+        mwx_awdl_abort(sc);
+        ++sc->sc_awdl_scan_preempted;
+    }
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -8843,6 +8866,19 @@ uint8_t MtkMwx::awdlInfraChannel()
     return channel <= 165 ? uint8_t(channel) : 0;
 }
 
+// MtkWireless: authenticating, associating, or associated with the RSN
+// 4-way handshake still running.
+static bool mwx_awdl_infra_joining(mwx_softc *sc)
+{
+    ieee80211com *ic = &sc->sc_ic;
+    if (ic->ic_opmode != IEEE80211_M_STA)
+        return false;
+    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+        return true;
+    return ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
+        (ic->ic_flags & IEEE80211_F_RSNON) && !ic->ic_bss->ni_port_valid;
+}
+
 // MtkWireless: longest off-channel ROC while associated (two AWs plus lead).
 static const uint32_t mwxAwdlOffChannelMaxMs = 40;
 
@@ -9214,6 +9250,14 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!awdlChannelAllowed(channel) || !durationMs || durationMs>mtkawdl::maxRocMs) return kIOReturnBadArgument;
     MwxAwdlOperation operation(com);
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
+    // MtkWireless: joining an AP owns the radio. AUTH/ASSOC frames and the
+    // 4-way handshake are lost if AWDL takes it elsewhere meanwhile.
+    if(mwx_awdl_infra_joining(com)) { ++com->sc_awdl_roc_join_blocked; return kIOReturnNotReady; }
+    // Unassociated scans (looking for the AP) win; see mt7921_mcu_hw_scan.
+    if((com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) &&
+       com->sc_ic.ic_state!=IEEE80211_S_RUN) {
+        ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady;
+    }
     if(com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
         // Cancel only an actual firmware scan. The logical SCAN/BGSCAN
         // state remains pending until disable; it must not block every ROC.
@@ -9422,6 +9466,21 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
     mwxController()->setProperty("MTKAWDLScanSuspended",com->sc_awdl_scan_suspended);
+    mwxController()->setProperty("MTKAWDLScanPreempted",com->sc_awdl_scan_preempted,64);
+    mwxController()->setProperty("MTKAWDLROCJoinBlocked",com->sc_awdl_roc_join_blocked,64);
+    {
+        static const char *names[3]={"MTKAWDLROCLatencyUnassoc","MTKAWDLROCLatencyAPChannel",
+                                     "MTKAWDLROCLatencyOffChannel"};
+        for(unsigned k=0;k<3;++k) {
+            OSArray *a=OSArray::withCapacity(7);
+            if(!a) continue;
+            for(unsigned b=0;b<7;++b) {
+                OSNumber *n=OSNumber::withNumber(com->sc_awdl_roc_latency[k][b],32);
+                if(n) { a->setObject(n); n->release(); }
+            }
+            mwxController()->setProperty(names[k],a); a->release();
+        }
+    }
     mwxController()->setProperty("MTKAWDLROCBusyBlocked",com->sc_awdl_roc_busy_blocked,64);
     mwxController()->setProperty("MTKAWDLTXSubmitted",com->sc_awdl_tx_submitted,64);
     mwxController()->setProperty("MTKAWDLTXBadFrame",com->sc_awdl_tx_bad_frame,64);

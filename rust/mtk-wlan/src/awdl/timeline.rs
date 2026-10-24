@@ -196,6 +196,12 @@ pub struct RadioPlan {
 /// `only_channel` (0 = any): while associated to an AP, windows on other
 /// channels are treated as idle. Leaving the AP's channel without telling it
 /// (no power-save handshake here) gets us disassociated.
+///
+/// `home_channel` (0 = none): the AP's channel while associated. The radio
+/// stays there anyway, so a grant on it also covers trailing idle slots up
+/// to the next window on another channel. Each new ROC costs a firmware
+/// response of tens of ms (up to ~240 ms seen), so fewer, longer grants
+/// miss fewer windows.
 pub fn plan_radio(
     s: &State,
     now: u64,
@@ -203,6 +209,7 @@ pub fn plan_radio(
     skip_current: bool,
     timing: Option<&RocChannelTiming>,
     only_channel: u8,
+    home_channel: u8,
 ) -> Option<RadioPlan> {
     let window = |at: u64| {
         current_window(s, at).map(|mut w| {
@@ -253,9 +260,11 @@ pub fn plan_radio(
             break;
         }
         // Idle slots may sit inside one grant, but never extend into
-        // trailing idle time.
+        // trailing idle time, except on the home channel.
         cursor = next.end;
-        if next.channel == target.channel {
+        if next.channel == target.channel
+            || (home_channel != 0 && target.channel == home_channel)
+        {
             end = next.end;
         }
         if cursor - at_ >= MAX_ROC_MS as u64 * 1000 {
@@ -489,8 +498,8 @@ mod plan_tests {
         let mut now = 10_000_000;
         let mut off_channel = 0;
         for _ in 0..64 {
-            let any = plan_radio(&s, now, ROC_LEAD_US, false, None, 0).unwrap();
-            let infra = plan_radio(&s, now, ROC_LEAD_US, false, None, 149).unwrap();
+            let any = plan_radio(&s, now, ROC_LEAD_US, false, None, 0, 0).unwrap();
+            let infra = plan_radio(&s, now, ROC_LEAD_US, false, None, 149, 0).unwrap();
             assert_eq!(
                 infra.window.channel, 149,
                 "never plans ROC off the AP channel"
@@ -504,8 +513,50 @@ mod plan_tests {
             "without the restriction channel 6 is planned"
         );
         assert!(
-            plan_radio(&s, now, ROC_LEAD_US, false, None, 44).is_none(),
+            plan_radio(&s, now, ROC_LEAD_US, false, None, 44, 0).is_none(),
             "channel not in the schedule"
         );
+    }
+
+    /// 149, idle, idle, 6: one AW per slot.
+    fn idle_state() -> State {
+        let mut s = State::default();
+        s.init(&[2, 1, 2, 3, 4, 5], 10_000_000);
+        let mut seq = Sequence {
+            count: 4,
+            step: 0,
+            ..Sequence::default()
+        };
+        seq.channels[0] = 149;
+        seq.channels[3] = 6;
+        assert!(s.set_sequence(&seq, 10_000_000));
+        s
+    }
+
+    #[test]
+    fn home_channel_grant_spans_trailing_idle() {
+        let s = idle_state();
+        let mut now = 10_000_000;
+        let mut checked = 0;
+        for _ in 0..64 {
+            let plain = plan_radio(&s, now, ROC_LEAD_US, false, None, 0, 0).unwrap();
+            let home = plan_radio(&s, now, ROC_LEAD_US, false, None, 0, 149).unwrap();
+            assert_eq!(plain.window, home.window, "same target window");
+            assert_eq!(plain.request_at, home.request_at);
+            if home.window.channel == 149 {
+                let to_six = (plain.window.end - plain.request_at) + 2 * AW_US as u64;
+                assert!(home.duration_ms > plain.duration_ms);
+                assert!(home.duration_ms as u64 * 1000 >= to_six, "covers both idle slots");
+                assert!(
+                    (home.duration_ms as u64 - 4) * 1000 <= to_six + 1000,
+                    "stops at the channel-6 window"
+                );
+                checked += 1;
+            } else {
+                assert_eq!(plain.duration_ms, home.duration_ms, "only the home channel");
+            }
+            now += AW_US as u64 / 3;
+        }
+        assert!(checked > 0);
     }
 }
