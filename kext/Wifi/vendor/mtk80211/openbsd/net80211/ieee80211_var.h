@@ -234,6 +234,8 @@ static void array_sprintf(char *output, uint8_t output_size, const uint8_t *arra
 #define IEEE80211_RSSI_THRES_5GHZ		(-70)	/* in dBm */
 #define IEEE80211_RSSI_THRES_RATIO_2GHZ		50	/* in percent */
 #define IEEE80211_RSSI_THRES_RATIO_5GHZ		40	/* in percent */
+#define IEEE80211_WCL_ROAM_DELTA		8	/* MtkWireless: in ni_rssi units */
+#define IEEE80211_WCL_ROAM_TRIGGER_RATIO	30	/* MtkWireless: in percent */
 
 #define IEEE80211_BGSCAN_FAIL_MAX		360	/* units of 500 msec */
 
@@ -469,6 +471,12 @@ struct ieee80211com {
     bool ic_wcl_scan_restricted;
     uint8_t ic_wcl_scan_channels[32];
     uint32_t ic_wcl_scan_away_time_ms; /* SET_SCAN_HOME_AWAY_TIME, 0 = unset */
+    /* MtkWireless: same-ESS roaming for the current WCL join. A background
+     * scan may then leave the joined BSSID (F_DESBSSID still names it);
+     * ic_wcl_roam_target restricts one roam scan to a WCL_REASSOC BSSID. */
+    bool ic_wcl_roam;
+    bool ic_wcl_roam_targeted;
+    uint8_t ic_wcl_roam_target[IEEE80211_ADDR_LEN];
 	CTimeout*		ic_bgscan_timeout;
 	uint32_t		ic_bgscan_fail;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
@@ -709,6 +717,14 @@ struct ieee80211_ess {
 #define IEEE80211_EVT_DRIVER_READY 6
 #define IEEE80211_EVT_DRIVER_STOPPED 7
 #define IEEE80211_EVT_DRIVER_RESET_BEGIN 8
+/* MtkWireless: a roam scan picked another BSS of the ESS (data:
+ * ieee80211_roam_event) or ended without leaving the current one (NULL). */
+#define IEEE80211_EVT_STA_ROAM_START 9
+#define IEEE80211_EVT_STA_ROAM_NONE 10
+struct ieee80211_roam_event {
+    const struct ieee80211_node *cur;
+    const struct ieee80211_node *sel;
+};
 struct ieee80211_beacon_event {
     const struct ieee80211_node *node;
     const uint8_t *ies;
@@ -753,6 +769,7 @@ void	ieee80211_set_ess(struct ieee80211com *, struct ieee80211_ess *,
 	    struct ieee80211_node *);
 void    ieee80211_deselect_ess(struct ieee80211com *);
 struct ieee80211_ess *ieee80211_get_ess(struct ieee80211com *, const char *, int);
+void ieee80211_begin_bgscan(struct _ifnet *);
 void ieee80211_begin_cache_bgscan(struct _ifnet *);
 
 /* MtkWireless: WPA3-SAE station side (ieee80211_sae.c). */

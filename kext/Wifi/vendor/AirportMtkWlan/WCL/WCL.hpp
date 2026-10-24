@@ -66,7 +66,13 @@ enum Message : uint32_t {
     JoinAbortComplete = 214,
     LinkStatus = 216,
     LqmUpdate = 39,
-    ScanDone = 237
+    ScanDone = 237,
+    // Roaming, as AppleBCMWLANCore posts them (IO80211Family 26.7.1
+    // gROAM_MANAGERCallBackArray). See docs/ROAMING.md.
+    Reassoc = 73,
+    RoamDone = 80,
+    RoamStart = 137,
+    RoamPrep = 139
 };
 
 struct SequoiaLqmUpdate {
@@ -517,5 +523,147 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     return true;
 }
 
+
+// apple80211 return codes the Broadcom driver puts in roam messages.
+enum RoamCode : uint32_t {
+    RoamStatusFail = 0xe0820401,        // 0xe0820400 | WLC_E_STATUS_FAIL
+    RoamReasonLowRssi = 0xe0820c01,     // 0xe0820c00 | WLC_E_REASON_LOW_RSSI
+    RoamReasonDirected = 0xe0820c06,    // 0xe0820c00 | WLC_E_REASON_DIRECTED_ROAM
+    RoamReasonTimeout = 0xe0820c09      // apple80211 roam reasons stop at 0x13
+};
+
+// ROAM_START (137) and ROAM_PREP (139): 12 bytes each.
+struct RoamStartEvent {
+    uint32_t status;
+    uint32_t reason;
+    int16_t rssi;
+    uint16_t reserved;
+};
+struct __attribute__((packed)) RoamPrepEvent {
+    uint32_t reason;
+    uint8_t bssid[6];
+    int16_t rssi;
+};
+// REASSOC (73): 8 bytes.
+struct ReassocEvent {
+    uint32_t status;
+    uint32_t reason;
+};
+static_assert(sizeof(RoamStartEvent) == 12, "ROAM_START size");
+static_assert(sizeof(RoamPrepEvent) == 12, "ROAM_PREP size");
+static_assert(sizeof(ReassocEvent) == 8, "REASSOC size");
+
+// apple80211_message_roam_status (ROAM_DONE, 80), laid out after
+// WCLRoamManager::printRoamStatus and AppleBCMWLANCore::buildRoamCompletionStatus.
+struct RoamPeer {
+    int32_t rssi;
+    uint32_t channel;
+    uint32_t channelFlags;
+    uint8_t bssid[6];
+    uint32_t authType;
+    uint32_t akms;
+    uint32_t phyMode;
+};
+struct RoamStatus {
+    uint32_t status;
+    uint32_t reason;
+    uint64_t startMs;
+    uint64_t endMs;
+    uint32_t flags;
+    uint32_t profile;
+    int32_t fromRssi, toRssi;
+    uint32_t fromChannel, toChannel;
+    uint32_t fromChannelFlags, toChannelFlags;
+    uint8_t fromOui[3], toOui[3];
+    uint8_t reserved0[2];
+    uint32_t fromAuthType, toAuthType;
+    uint32_t fromAkms, toAkms;
+    uint32_t fromPhyMode, toPhyMode;
+    uint8_t fromBssid[6], toBssid[6];
+    uint8_t reserved2[6];
+    uint16_t channelsScanned;
+    uint8_t reserved1[0xa8 - 0x6c];
+};
+static_assert(sizeof(RoamStatus) == 0xa8, "ROAM_DONE size");
+static_assert(offsetof(RoamStatus, flags) == 0x18, "ROAM_DONE flags");
+static_assert(offsetof(RoamStatus, fromRssi) == 0x20, "ROAM_DONE rssi");
+static_assert(offsetof(RoamStatus, fromChannel) == 0x28, "ROAM_DONE channel");
+static_assert(offsetof(RoamStatus, fromOui) == 0x38, "ROAM_DONE oui");
+static_assert(offsetof(RoamStatus, fromAuthType) == 0x40, "ROAM_DONE auth");
+static_assert(offsetof(RoamStatus, fromPhyMode) == 0x50, "ROAM_DONE phy mode");
+static_assert(offsetof(RoamStatus, fromBssid) == 0x58, "ROAM_DONE bssid");
+static_assert(offsetof(RoamStatus, channelsScanned) == 0x6a, "ROAM_DONE scanned");
+
+inline void makeRoamStatus(uint32_t status, uint32_t reason, uint64_t startMs,
+                           uint64_t endMs, const RoamPeer &from, const RoamPeer &to,
+                           RoamStatus &out) {
+    out = {};
+    out.status = status;
+    out.reason = reason;
+    out.startMs = startMs;
+    out.endMs = endMs < startMs ? startMs : endMs;
+    out.fromRssi = from.rssi;
+    out.toRssi = to.rssi;
+    out.fromChannel = from.channel;
+    out.toChannel = to.channel;
+    out.fromChannelFlags = from.channelFlags;
+    out.toChannelFlags = to.channelFlags;
+    out.fromAuthType = from.authType;
+    out.toAuthType = to.authType;
+    out.fromAkms = from.akms;
+    out.toAkms = to.akms;
+    out.fromPhyMode = from.phyMode;
+    out.toPhyMode = to.phyMode;
+    memcpy(out.fromBssid, from.bssid, 6);
+    memcpy(out.toBssid, to.bssid, 6);
+}
+
+// apple80211_reassoc (WCL_REASSOC, ioctl 426): 0xbc bytes, from
+// WCLNetManager::sendReassocCommand and AppleBCMWLANNetAdapter::sendReassocCommand*.
+struct ReassocRequest {
+    uint32_t bssidCount;
+    uint32_t channelCount;
+    uint8_t bssid[6];
+    uint8_t flags;
+    uint8_t ssidLength;
+    uint8_t ssid[32];
+    uint8_t channels[32];
+};
+
+inline bool validUnicastAddress(const uint8_t *address) {
+    uint8_t bits = 0;
+    for (unsigned i = 0; i < 6; ++i)
+        bits |= address[i];
+    return bits && !(address[0] & 1);
+}
+
+inline bool decodeReassoc(const void *buffer, size_t length, ReassocRequest &out) {
+    if (!buffer || length < 0xbc)
+        return false;
+    const uint8_t *p = static_cast<const uint8_t *>(buffer);
+    uint32_t bssids = read32(p + 0x90), count = read32(p + 0x94);
+    uint8_t ssidLength = p[0xbb];
+    // 50 chanspecs at 0, BSSID list from 0x64 to 0x90 (7 entries).
+    if (bssids > 7 || count > 50 || ssidLength > 32)
+        return false;
+    out = {};
+    out.bssidCount = bssids;
+    out.channelCount = count;
+    out.flags = p[0x98];
+    out.ssidLength = ssidLength;
+    memcpy(out.ssid, p + 0x9b, ssidLength);
+    if (bssids) {
+        memcpy(out.bssid, p + 0x64, 6);
+        if (!validUnicastAddress(out.bssid))
+            return false;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        // AppleChannelSpec_t: primary channel in the low byte.
+        unsigned channel = read16(p + 2 * i) & 0xff;
+        if (channel)
+            out.channels[channel / 8] |= 1U << (channel % 8);
+    }
+    return true;
+}
 }
 #endif

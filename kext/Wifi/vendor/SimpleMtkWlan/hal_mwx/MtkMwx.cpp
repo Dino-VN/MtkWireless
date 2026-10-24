@@ -1582,6 +1582,11 @@ mwx_newstate_task(void *ptr)
 			break;
 		break;
 	case IEEE80211_S_AUTH:
+		/*
+		 * MtkWireless: a new (or roamed-to) AP has not seen our PM=1;
+		 * the next off-channel AWDL ROC must send it again.
+		 */
+		sc->sc_awdl_infra_ps = false;
 		mwx_apply_phy_knobs(sc);
 		rv = mt7921_set_channel(sc);
 		if (rv)

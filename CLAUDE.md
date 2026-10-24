@@ -11,6 +11,7 @@ scripts/build.sh Release      # or Debug; ends with scripts/check.sh
 (cd rust && cargo test --workspace)
 (cd rust && cargo test -p mtk-ffi --features wifi && cargo test -p mtk-ffi --features bt)
 scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
+scripts/test-wifi-roam.py   # WCL roaming wire formats
 ```
 
 - Plain shell + clang, no Xcode project. Needs full Xcode; the scripts set
@@ -54,17 +55,17 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `mwx_intr` (all-ones status = device gone), NIC capability nss clamp,
   `awdlInfraChannel`/`awdlChannelReachable`/`awdlInfraSleep` (AWDL off the AP
   channel only with a PM handshake, see below), TXWI `SW_POWER_MGMT` for Null
-  data, PMF (`IEEE80211_C_MFP`, `amtk_pmf=0` off; IGTK as mt76 sends it in
-  `mt7921_mcu_sta_bip_update`, plus net80211 software BIP; `RXMGMTPROT` set
-  at port valid), net80211 WPA3-SAE (`ieee80211_sae.c`, AKM
-  `IEEE80211_AKM_SAE`, EAPOL descriptor version 0, HW-decrypted robust mgmt
-  frames accepted in `ieee80211_input`, STA-side SA Query moved out of
-  `IEEE80211_STA_ONLY`), WCL SAE joins (`LegacyAuth::Sae`, cipher 10
-  password, `selectWPA2TransitionMode` only without PMF), DFS channels
-  52-144 flagged `IEEE80211_CHAN_DFS | PASSIVE` in `mwx_preinit` and sent as
-  Linux `IEEE80211_CHAN_RADAR` in `mt7921_mcu_set_channel_domain`
-  (`mwx_chan_is_dfs`), HE offered by default (`AirportMtkWlan.cpp`,
-  `amtk_he=0` off), and
+  data, DFS channels 52-144 flagged `IEEE80211_CHAN_DFS | PASSIVE` in
+  `mwx_preinit` and sent as Linux `IEEE80211_CHAN_RADAR` in
+  `mt7921_mcu_set_channel_domain` (`mwx_chan_is_dfs`), HE offered by default
+  (`AirportMtkWlan.cpp`, `amtk_he=0` off), PMF (`IEEE80211_C_MFP`,
+  `amtk_pmf=0` off; IGTK as mt76 sends it in `mt7921_mcu_sta_bip_update`,
+  plus net80211 software BIP; `RXMGMTPROT` set at port valid), net80211
+  WPA3-SAE (`ieee80211_sae.c`, AKM `IEEE80211_AKM_SAE`, EAPOL descriptor
+  version 0, HW-decrypted robust mgmt frames accepted in
+  `ieee80211_input`, STA-side SA Query moved out of `IEEE80211_STA_ONLY`),
+  WCL SAE joins (`LegacyAuth::Sae`, cipher 10 password,
+  `selectWPA2TransitionMode` only without PMF), and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both
@@ -116,6 +117,19 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `data_view` accepts the envelope only on QoS non-aggregated frames with an
   exact length and keeps every AWDL/IPv6 check; it never scans for an inner
   SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
+
+## Wi-Fi roaming (docs/ROAMING.md, unverified on hardware)
+
+- WCL learns a BSS switch only from LinkStatus (216) up naming the new BSSID
+  while already linked: `WCLNetManager::linkUp` re-reads `WCL_BSS_INFO` and
+  leaves the network if that fails, so stage the new beacon first. Roam
+  messages 137/139/73/80 drive `WCLRoamManager` (IO80211Family 26.7.1).
+- net80211 roams by background scan (`ic_wcl_roam`, open/PSK joins only);
+  `holdWCLRoamLink` keeps `setLinkStatus` from dropping the BSD/WCL link
+  during the switch. Any new path that releases a held roam must call
+  `setLinkStatus(kIONetworkLinkValid)` itself: net80211 already lowered
+  `if_link_state`. Roam scans stay suspended while AWDL is on, and
+  `sc_awdl_infra_ps` is cleared on AUTH. `amtk_roam=0` turns it off.
 
 ## WPA3 / PMF (do not regress)
 

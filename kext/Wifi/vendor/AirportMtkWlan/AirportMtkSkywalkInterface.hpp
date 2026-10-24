@@ -15,6 +15,8 @@
 
 #define AIRPORT_SKYWALK_OVERRIDE
 
+struct ieee80211_roam_event;
+
 class AirportMtkSkywalkInterface : public IO80211InfraProtocol {
     OSDeclareDefaultStructors(AirportMtkSkywalkInterface)
     
@@ -300,7 +302,7 @@ public:
     virtual IOReturn setNANPHS_TERMINATED(apple80211_nan_link_association_info *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn set6G_MODE(apple80211_6G_mode *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     IOReturn setWCL_LEAVE_NETWORK(apple80211_leave_network *) override;
-    virtual IOReturn setWCL_REASSOC(apple80211_reassoc *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
+    virtual IOReturn setWCL_REASSOC(apple80211_reassoc *) AIRPORT_SKYWALK_OVERRIDE;
     virtual IOReturn setWCL_SET_ROAM_LOCK(apple80211_set_roam_lock *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIG(apple80211_roam_profile_config *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
     virtual IOReturn setWCL_ROAM_PROFILE_CONFIGV1(apple80211_roam_profile_configV1 *) AIRPORT_SKYWALK_OVERRIDE { return kIOReturnUnsupported; }
@@ -340,6 +342,7 @@ public:
     void stopWCL();
     void handleWCLEvent(int, void *);
     void handleWCLLink(bool);
+    bool holdWCLRoamLink(bool);
     void completeWCLScan();
 private:
     static IOReturn wclCommand(OSObject *, void *, void *, void *, void *);
@@ -363,6 +366,29 @@ private:
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    // Driver-driven roaming (docs/ROAMING.md).
+    static void wclRoamTimeout(OSObject *, IOTimerEventSource *);
+    static IOReturn wclRoamLinkUpGated(OSObject *, void *, void *, void *, void *);
+    IOReturn requestWCLReassoc(const void *);
+    void beginWCLRoam(const ieee80211_roam_event *);
+    void finishWCLRoam(bool, uint32_t);
+    void tryCompleteWCLRoam();
+    void clearWCLRoam();
+    void fillWCLRoamPeer(const ieee80211_node *, AirportWCL::RoamPeer &);
+    IOTimerEventSource *roamTimer = nullptr;
+    // Written on the gate; holdWCLRoamLink() reads it from net80211.
+    volatile bool roamPending = false;
+    bool wclRoamingEnabled = true; // boot-arg amtk_roam=0 turns it off
+    bool roamRequested = false;
+    bool roamAssocDone = false;
+    bool roamLinkUp = false;
+    bool wclRoamBssValid = false;
+    uint8_t roamTarget[6] = {};
+    uint64_t roamStartMs = 0;
+    AirportWCL::RoamPeer roamFrom = {};
+    uint32_t roamReason = 0;
+    uint32_t wclRoamCount = 0, wclRoamFailCount = 0;
+    uint8_t wclRoamBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;

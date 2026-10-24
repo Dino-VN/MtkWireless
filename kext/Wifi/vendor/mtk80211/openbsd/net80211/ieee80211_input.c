@@ -486,11 +486,18 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         
         if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bgscan_start) {
             /* Cancel or start background scan based on RSSI. */
-            if ((*ic->ic_node_checkrssi)(ic, ni))
+            int good = (*ic->ic_node_checkrssi)(ic, ni);
+            /* MtkWireless: WCL roaming scans off channel only below
+             * about -70 dBm, not at the 5/2.4 GHz join thresholds. */
+            if (ic->ic_wcl_roam && ic->ic_max_rssi)
+                good = ni->ni_rssi >= (IEEE80211_WCL_ROAM_TRIGGER_RATIO *
+                    ic->ic_max_rssi) / 100;
+            if (good)
                 timeout_del(&ic->ic_bgscan_timeout);
             else if (!timeout_pending(&ic->ic_bgscan_timeout) &&
                      (ic->ic_flags & IEEE80211_F_BGSCAN) == 0 &&
-                     (ic->ic_flags & IEEE80211_F_DESBSSID) == 0)
+                     ((ic->ic_flags & IEEE80211_F_DESBSSID) == 0 ||
+                      ic->ic_wcl_roam))
                 timeout_add_msec(&ic->ic_bgscan_timeout,
                                  500 * (ic->ic_bgscan_fail + 1));
         }
@@ -2965,7 +2972,9 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
-        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH, NULL);
+        /* MtkWireless: the frame tells a roam which AP sent it. */
+        (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_DEAUTH,
+            const_cast<struct ieee80211_frame *>(wh));
     }
     
     ic->ic_stats.is_rx_deauth++;

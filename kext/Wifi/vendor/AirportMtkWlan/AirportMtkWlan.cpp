@@ -585,6 +585,11 @@ bool AirportMtkWlan::
 setLinkStatus(UInt32 status, const IONetworkMedium * activeMedium, UInt64 speed, OSData * data)
 {
     struct _ifnet *ifq = &fHalService->get80211Controller()->ic_ac.ac_if;
+    // MtkWireless: a same-ESS roam keeps the BSD and WCL link up while
+    // net80211 re-associates (docs/ROAMING.md).
+    if (fNetIf && static_cast<AirportMtkSkywalkInterface *>(fNetIf)->holdWCLRoamLink(
+            status & kIONetworkLinkActive))
+        return true;
     if (status == currentStatus) {
         return true;
     }

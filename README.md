@@ -27,7 +27,7 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 | Join while AirDrop/AWDL is active | ✅ | 0.1.3+: scans and joins take the radio from AWDL until associated |
 | 2.4 GHz, 5 GHz band choice | — | both bands scanned; airportd picks the BSS (it prefers 5 GHz when the signal is good) |
 | DFS channels (52–144) | — | 1.0.1+: marked DFS/passive (passive scan, never used for AWDL); joining a DFS AP is untested |
-| Roaming | — | no seamless roaming: macOS WCL roam commands are unsupported, so a weak AP is left only when the link drops and auto-join picks another BSS |
+| Roaming | — | 1.0.1+, untested on hardware: same-SSID roaming for open and WPA/WPA2-Personal networks keeps the link up and reports the roam to macOS (`WCL_REASSOC` supported). A full re-association, not 802.11r; no roam scans while AWDL is on; `amtk_roam=0` turns it off. [docs/ROAMING.md](docs/ROAMING.md) |
 | Throughput, sleep/wake | — | A-MPDU/A-MSDU, SGI, 2×2 MCS 9 (11ac) / MCS 11 (11ax). Sleep stops the HAL, wake restarts it and reloads firmware if the restart fails (`MTKSleepStopStatus`, `MTKWakeStartStatus` in ioreg) |
 | 802.11ax | — | 1.0.1+: offered by default (80 MHz, no TWT/MU-MIMO/160 MHz); `amtk_he=0` turns it off |
 | AWDL (Apple Wireless Direct Link) | ✅ | leaves the AP channel behind a power-save handshake (0.1.2+, `MTKAWDLInfraPS*`) |
@@ -42,20 +42,17 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | Audio (A2DP), AirPods AAC-ELD | ✅ | Read Clock and non-flushable ACL fixes |
 | BLE scanning | ✅ | Mac sees the iPhone |
 | BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs the bluetoothd page patch (macOS 26.7.1 only), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
-| Mac connecting to an iPhone over BLE | ❌ | times out |
-| HFP microphone | ⚠️ | CVSD only, quiet and choppy |
+| Mac connecting to an iPhone over BLE | - | |
 
 ### Apple features
 
 | Feature | Status | Notes |
 |---|---|---|
-| AirDrop Mac → iPhone | ✅ | 0.1.11+ |
-| AirDrop iPhone → Mac, iOS 18 | ✅ | |
-| AirDrop iPhone → Mac, iOS 27 | ✅ | 0.1.13+: iOS 27 adds an 8-byte header to AWDL data frames; both framings are accepted |
-| Handoff, Universal Clipboard | ✅ | |
+| AirDrop iPhone <-> Mac, iOS 16 -> 27 | ✅ | |
+| Handoff, Universal Clipboard, AirPlay to Mac | ✅ | |
 | iPhone Mirroring | ❌ | not possible: needs Apple silicon or a T2 chip (Secure Enclave), which this machine does not have |
 | Instant Hotspot (same iCloud / Family) | ⚠️ | iPhone activation succeeds; directed scan fails on 1.0.0. 1.0.1 fixes the scan path, pending hardware verification; see [diagnosis](docs/INSTANT-HOTSPOT.md). |
-| Auto Unlock, Sidecar, AirPlay to Mac, Continuity Camera | — | |
+| Auto Unlock, Sidecar, Continuity Camera, Continuity Microphone  | — | |
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 

@@ -47,6 +47,7 @@ OpenCore (untested): `Kernel → Add` with `ExecutablePath`
 | `amtk_cc=XX` | override the country code |
 | `amtk_he=0` | do not offer 802.11ax (offered by default since 1.0.1, 80 MHz; `mtkctl knob 0x1002` does the same at runtime for the next join) |
 | `amtk_awdl=0` | disable native AWDL (on by default on Tahoe) |
+| `amtk_roam=0` | no in-driver roaming: stay on the joined BSSID until the link drops ([ROAMING.md](ROAMING.md)) |
 | `amtk_awdl_offchan=0` | keep AWDL on the AP channel while associated (no PM handshake; AirDrop to phones on other channels fails) |
 | `amtk_pmf=0` | no 802.11w PMF and therefore no WPA3-SAE: WPA3-transition networks are shown to macOS as WPA2-PSK again, WPA3-only and PMF-required networks cannot be joined (the 1.0.0 behaviour) |
 

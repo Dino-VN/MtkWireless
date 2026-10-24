@@ -91,7 +91,7 @@ unsigned starts=0,bssSelections=0;
 int requestScan(ieee80211com*ic,int,int){++starts;ic->ic_wcl_scan_inflight=true;return 0;}
 struct AirportMtkSkywalkInterface {
     Hal radio; Hal*fHalService=&radio; Timer timer; Timer*scanSource=&timer;
-    bool scanPending=false,joinPending=false,scanCompleted=false,scanSkipCompletion=false;
+    bool scanPending=false,joinPending=false,roamPending=false,scanCompleted=false,scanSkipCompletion=false;
     IOReturn beginWCLScan(apple80211ScanRequest*);
     void scanDone(){auto ic=&radio.ic;switch(IEEE80211_EVT_SCAN_DONE){
 ''' + completion + r'''

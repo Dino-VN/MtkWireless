@@ -1102,7 +1102,13 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
         (ni->ni_esslen != ic->ic_des_esslen ||
          memcmp(ni->ni_essid, ic->ic_des_essid, ic->ic_des_esslen) != 0))
         fail |= IEEE80211_NODE_ASSOCFAIL_ESSID;
-    if ((ic->ic_flags & IEEE80211_F_DESBSSID) &&
+    /* MtkWireless: a WCL join names one BSSID, but a roam scan may pick
+     * another BSS of the same ESS (or only the WCL_REASSOC target). */
+    if (bgscan && ic->ic_wcl_roam) {
+        if (ic->ic_wcl_roam_targeted &&
+            !IEEE80211_ADDR_EQ(ic->ic_wcl_roam_target, ni->ni_bssid))
+            fail |= IEEE80211_NODE_ASSOCFAIL_BSSID;
+    } else if ((ic->ic_flags & IEEE80211_F_DESBSSID) &&
         !IEEE80211_ADDR_EQ(ic->ic_des_bssid, ni->ni_bssid))
         fail |= IEEE80211_NODE_ASSOCFAIL_BSSID;
     
@@ -1507,10 +1513,14 @@ ieee80211_end_scan(struct _ifnet *ifp)
     selbs = ieee80211_node_choose_bss(ic, bgscan, &curbs);
     if (bgscan) {
         struct ieee80211_node_switch_bss_arg *arg;
+        int targeted = ic->ic_wcl_roam_targeted;
         
         ic->ic_flags &= ~IEEE80211_F_DISABLE_BG_AUTO_CONNECT;
+        ic->ic_wcl_roam_targeted = false;
         if (!roamscan) {
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+            if (targeted && ic->ic_event_handler)
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_NONE, NULL);
             return;
         }
         
@@ -1518,8 +1528,20 @@ ieee80211_end_scan(struct _ifnet *ifp)
         if (selbs == NULL || curbs == NULL) {
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
             XYLog("%s %d AP disappeared? Should not happen.\n", __FUNCTION__, __LINE__);
+            if (ic->ic_event_handler)
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_NONE, NULL);
             goto notfound;
         }
+        
+        /*
+         * MtkWireless: hysteresis for WCL roaming. Leave the current
+         * BSS only for a candidate that is good on its own or clearly
+         * stronger; a WCL_REASSOC target is taken as requested.
+         */
+        if (ic->ic_wcl_roam && !targeted && selbs != curbs &&
+            !(*ic->ic_node_checkrssi)(ic, selbs) &&
+            selbs->ni_rssi < curbs->ni_rssi + IEEE80211_WCL_ROAM_DELTA)
+            selbs = curbs;
         
         /*
          * After a background scan we might end up choosing the
@@ -1527,6 +1549,8 @@ ieee80211_end_scan(struct _ifnet *ifp)
          * and make background scans less frequent.
          */
         if (selbs == curbs) {
+            if (ic->ic_event_handler)
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_NONE, NULL);
             if (ic->ic_bgscan_fail < IEEE80211_BGSCAN_FAIL_MAX)
                 ic->ic_bgscan_fail++;
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
@@ -1552,6 +1576,8 @@ ieee80211_end_scan(struct _ifnet *ifp)
         arg = (struct ieee80211_node_switch_bss_arg *)malloc(sizeof(*arg), 0, 0);
         if (arg == NULL) {
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+            if (ic->ic_event_handler)
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_NONE, NULL);
             return;
         }
         
@@ -1568,7 +1594,15 @@ ieee80211_end_scan(struct _ifnet *ifp)
                                 IEEE80211_REASON_AUTH_LEAVE) != 0) {
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
             free(arg);
+            if (ic->ic_event_handler)
+                (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_NONE, NULL);
             return;
+        }
+        
+        /* MtkWireless: let WCL hold the link across the switch. */
+        if (ic->ic_event_handler) {
+            struct ieee80211_roam_event event = { curbs, selbs };
+            (*ic->ic_event_handler)(ic, IEEE80211_EVT_STA_ROAM_START, &event);
         }
         
         /* Prevent dispatch of additional data frames to hardware. */
