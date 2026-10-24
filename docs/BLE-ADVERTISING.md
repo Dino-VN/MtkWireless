@@ -7,16 +7,54 @@ symbols were checked on Tahoe 26.7.1 / 25G241; other versions are unverified.
 
 The logic is in `rust/mtk-bt/src/le_features.rs` (ported from
 SimpleMtkBtPatcher's `LeFeaturesShim.hpp`); `kext/BT/Patcher.cpp` moves the
-bytes in and out of the USB transfers. It does not modify bluetoothd, force an
-address policy, provision an IRK or implement Broadcom privacy commands.
+bytes in and out of the USB transfers. Separate bluetoothd page patches enable
+its standard advertising and per-set address paths. macOS owns the addresses;
+the shim does not provision an IRK or implement Broadcom privacy commands.
 
 ## Status
 
-The shim has not run on hardware yet. In the only capture so far
+0.1.9 has run on hardware on macOS 26.7.1 (25G241). All three page-patch
+counters are 1, `LeFeaturesCommands=1`, `LeFeaturesCompletions=1` and
+`LeFeaturesErrors=0`. bluetoothd reports `Started advertising successfully
+status=0`, and the user confirms the iPhone now sees the Mac. AirDrop file
+transfer still fails: endpoint resolution stalls and sharingd reports
+`missingEndpoint` before transferring data. Advertising is verified;
+end-to-end AirDrop is still unresolved.
+
+In the earlier capture
 (`airdrop-bt-20261023-212105`) `kexts.txt` lists SimpleMtkBtFw 1.0.0 but no
 SimpleMtkBtPatcher, so the patcher that carried the shim was not loaded and
 the trace shows the unpatched behavior. The collector now warns when
 MtkWirelessBT is not loaded.
+
+## 2026-10-24: bluetoothd disables its own advertiser
+
+With the shim loaded (`LeFeaturesCompletions=1`) the HCI trace shows every
+command succeeding and still no advertising command. bluetoothd logs
+`LE_InitMultipleAdvertising failed with status STATUS 152` and
+`LeBroadcaster.mm::stackDidStart() -- status = 0x0098`; every later start
+request ends in `Stack is not ready`, and the iPhone does not see the Mac.
+
+In the x86_64 bluetoothd of 26.7.1 (25G241), `initCoreStack` sets the
+multiple-advertising flag from two chip-object checks, extended advertising
+sets (vtable 0x918, `0x10033a6ec`) and BT-spec advertising sets (0x9c0,
+`0x10033b212`). Both compare only the chip ID at `[this+0x334]` (true for
+19-25, 2001-3999, 5000-5999, 6000), never the controller's LE features.
+`LE_InitMultipleAdvertising` (`0x1001f7352`) returns 0x98 when the flag is 0.
+`LE/SupportsMultipleAdvertising=true` is read ("Overriding Multiple
+Advertising support - enabled") but feeds a different flag and changes
+nothing; `AE/DisableExtAdvertising` and `AE/DisableSpecSets` can only
+clear the checks.
+
+MtkWirelessBT patches the extended-advertising check to return true (see
+`Patcher.cpp`). The controller advertises LE Extended Advertising, the
+standard path BlueZ uses. 0.1.5 registered the patch with Lilu's user patcher,
+which never ran: the DEBUG Lilu log says `disabling user patcher on request!`
+because Lilu sets `isUserDisabled` on Big Sur and later. 0.1.6 routes
+`_cs_validate_page` instead and patches bluetoothd's page as it is validated,
+like BlueToolFixup and RestrictEvents. Not yet run on hardware: check
+`BluetoothdExtAdvRouted`, `BluetoothdPages` and `BluetoothdExtAdvPatched` in
+ioreg, the absence of the 0x0098 log, and 0x2036-0x2039 in an HCI trace.
 
 ## Evidence and behavior
 
@@ -143,3 +181,81 @@ If advertising still fails with the shim active, the next candidate is the
 standard HCI privacy path (resolving list `0x2027`/`0x202D`, RPA via `0x2005`),
 which the controller advertises (see above); that needs the host IRK and is
 not implemented.
+
+## 0.1.8: preserve per-set address updates
+
+The 2026-10-24 12:55 capture shows repeated failures in
+`multipleAdvStartCb` (718) and `setMultipleAdvertisingDataCompleteCb` (766)
+after the extended-advertising patch was applied. Those are stack statuses;
+this capture does not contain a complete HCI command trace.
+
+Shell disassembly of the installed 25G241 x86_64 bluetoothd identifies another
+chip policy in `initCoreStack` at `0x100510e99`. For chip IDs 0..3 it calls
+the setter at `0x1001f79ec` with false, clearing the initially true byte at
+`0x100b1cd00`. The before-enable path at `0x1001fa22d` skips per-set address
+updates when that byte is false. `LE_UpdateMultiAdvertisingSetAddress` at
+`0x1001f713b` also returns without sending a command. With the gate true and
+extended advertising enabled, that function sends standard LE Set Advertising
+Set Random Address (`0x2035`). A global LE Set Random Address (`0x2005`)
+does not initialize each extended advertising set's random address.
+
+0.1.8 removes only the seven-byte false-setter call sequence. It preserves
+the chip lookup, branch and subsequent chip setup. macOS supplies its own
+per-set addresses and sequences command completion before enabling the set;
+the patch does not inject an address or synthesize an advertising success.
+The exact 21-byte signature is scoped to bluetoothd validation pages and
+disabled together with the advertising patch by `-mtkbtnoextadv`.
+`BluetoothdAdvAddressPatched` reports matches in ioreg.
+
+`python3 scripts/test-bt-page-patches.py` checks both signatures against the
+installed x86_64 slice, their uniqueness and page boundaries, the setter's
+target/default value, and the exact replacement instructions. Existing page
+patches can be visible when reading the live vnode cache, so the validator
+also recognizes the exact replacement signature. REA/Hopper analysis timed
+out on this run; these findings come from llvm-objdump and Mach-O bytes,
+not a successful REA decompilation.
+
+After loading 0.1.8, verify both page-patch counters, successful `0x2035`
+and `0x2039` completions, and actual iPhone discovery/transfers. The missing
+address path is established statically; whether it explains all observed
+718/766 failures remains a hardware question.
+
+## 0.1.9: retry random address after the advertising set exists
+
+The hardware capture `airdrop-bt-20261024-132612` confirms that 0.1.8 sends
+standard advertising commands, but in this order (PacketLogger record IDs):
+
+| Records | Command | Controller response |
+| --- | --- | --- |
+| 92–93 | `0x2035`, handle 0, before creation | `0x42`, Unknown Advertising Identifier |
+| 94–95 | `0x2035`, handle 2, before creation | `0x42` |
+| 106–107 | `0x2036`, handle 3 | success |
+| 114–115 | `0x2035`, handle 3 | success |
+| 118–119 | `0x2039` enable handle 3 | success |
+| 122–125 | parameters/data for handle 0, own-address type 1 | success |
+| 126–127 | enable handle 0, no successful per-set random address | `0x12`, Invalid HCI Command Parameters |
+
+All 7,865 failed enables in this capture target handle 0 without a successful
+per-set address initialization. Its early address call updates bluetoothd's
+cache before the controller rejects it. The before-enable callback sees the
+same cached address and skips reinitialization. The one handle with a
+successful address command enables successfully. The global `0x2005` command
+also succeeds, but does not initialize handle 0.
+
+0.1.9 changes the before-enable cached-address guard: random addresses are
+programmed again after parameters and data have been set, even if the cached
+address matches. Public addresses retain the changed-address test. The
+redundant address-support gate in this guard is replaced together with the
+0.1.8 patch that preserves its true value. This is an exact 64-byte signature
+at `0x1001fa20d` in 25G241 x86_64. The existing callback still waits for the
+real `0x2035` result before enabling; no command response is synthesized.
+`BluetoothdAdvAddressRetryPatched` counts matches; `-mtkbtnoextadv` disables
+all three policy patches together.
+
+The page-patch validator now executes the actual replacement guard machine
+instructions against cached/changed random and public addresses on the x86_64
+host. After booting 0.1.9, all three patches applied and bluetoothd reported
+successful advertising. The iPhone sees the Mac, confirming discovery on
+hardware. File transfer remains unresolved, with DNS resolution timeouts and
+`missingEndpoint`; the advertising fix does not establish a working AirDrop
+data connection.

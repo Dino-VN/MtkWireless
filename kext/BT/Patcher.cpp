@@ -12,6 +12,8 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLocks.h>
+#include <sys/syslimits.h>
+#include <sys/vnode.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
@@ -30,6 +32,8 @@ bool leShimEnabled;
 IOLock *leLock;
 volatile SInt32 readClockRewritten, aclPbRewritten;
 volatile SInt32 leCommands, leCompletions, leErrors;
+bool extAdvPatchRouted;
+volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 
 void publishCounters()
 {
@@ -56,6 +60,11 @@ void publishCounters()
     number("LeFeaturesCommands", (uint32_t)leCommands);
     number("LeFeaturesCompletions", (uint32_t)leCompletions);
     number("LeFeaturesErrors", (uint32_t)leErrors);
+    d->setObject("BluetoothdExtAdvRouted", extAdvPatchRouted ? kOSBooleanTrue : kOSBooleanFalse);
+    number("BluetoothdPages", (uint32_t)bluetoothdPages);
+    number("BluetoothdExtAdvPatched", (uint32_t)bluetoothdPatched);
+    number("BluetoothdAdvAddressPatched", (uint32_t)bluetoothdAddressPatched);
+    number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
     res->setProperty("MtkWirelessBT", d);
     d->release();
 }
@@ -450,6 +459,125 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
     publishCounters();
 }
 
+/*
+ * bluetoothd enables BLE multiple advertising only when its chip table says
+ * the controller has extended or BT-spec advertising sets. That table keys on
+ * an Apple chip ID ([this+0x334]: 19-25, 2001-3999, 5000-5999, 6000); a
+ * THIRD_PARTY_DONGLE gets neither, LE_InitMultipleAdvertising returns 0x98,
+ * LeBroadcaster never starts and nothing (AirDrop, Nearby) is advertised.
+ * The AE/DisableExtAdvertising preference can only turn it off.
+ *
+ * MediaTek reports LE Extended Advertising (LE feature bit 12) and takes the
+ * standard 0x2036-0x2039 commands, as BlueZ uses on Linux. Make the
+ * extended-advertising check return true; bluetoothd then forces BT-spec
+ * advertising sets on as well. x86_64 bluetoothd of macOS 26.7.1 (25G241):
+ * the whole 77-byte function, unique in the binary (its BT-spec-sets twin
+ * differs only in sete/setae) and inside one page (offset 0x6ec), so a
+ * per-page search finds it; other versions do not match. Boot-arg
+ * -mtkbtnoextadv disables it.
+ */
+const uint8_t extAdvFind[] {
+    0x55, 0x48, 0x89, 0xe5, 0x8b, 0x8f, 0x34, 0x03, 0x00, 0x00, 0x81, 0xf9, 0xd0, 0x07, 0x00, 0x00,
+    0x72, 0x14, 0x81, 0xf9, 0x9f, 0x0f, 0x00, 0x00, 0x77, 0x21, 0xb0, 0x01, 0x81, 0xf9, 0xd0, 0x07,
+    0x00, 0x00, 0x74, 0x0c, 0xeb, 0x13, 0x8d, 0x51, 0xed, 0xb0, 0x01, 0x83, 0xfa, 0x07, 0x72, 0x09,
+    0x81, 0xf9, 0x70, 0x17, 0x00, 0x00, 0x0f, 0x94, 0xc0, 0x5d, 0xc3, 0x8d, 0x91, 0x78, 0xec, 0xff,
+    0xff, 0xb0, 0x01, 0x81, 0xfa, 0xe8, 0x03, 0x00, 0x00, 0x73, 0xe5, 0xeb, 0xec};
+// push rbp; mov rbp, rsp; mov al, 1; pop rbp; ret; the rest is unreachable.
+const uint8_t extAdvReplace[] {
+    0x55, 0x48, 0x89, 0xe5, 0xb0, 0x01, 0x5d, 0xc3, 0x00, 0x00, 0x81, 0xf9, 0xd0, 0x07, 0x00, 0x00,
+    0x72, 0x14, 0x81, 0xf9, 0x9f, 0x0f, 0x00, 0x00, 0x77, 0x21, 0xb0, 0x01, 0x81, 0xf9, 0xd0, 0x07,
+    0x00, 0x00, 0x74, 0x0c, 0xeb, 0x13, 0x8d, 0x51, 0xed, 0xb0, 0x01, 0x83, 0xfa, 0x07, 0x72, 0x09,
+    0x81, 0xf9, 0x70, 0x17, 0x00, 0x00, 0x0f, 0x94, 0xc0, 0x5d, 0xc3, 0x8d, 0x91, 0x78, 0xec, 0xff,
+    0xff, 0xb0, 0x01, 0x81, 0xfa, 0xe8, 0x03, 0x00, 0x00, 0x73, 0xe5, 0xeb, 0xec};
+static_assert(sizeof(extAdvFind) == sizeof(extAdvReplace), "patch size");
+
+/* initCoreStack also disables per-set address updates for chip IDs 0..3.
+ * The gate at 0x100b1cd00 starts true, but this call sets it false for a
+ * THIRD_PARTY_DONGLE. LE_UpdateMultiAdvertisingSetAddress then returns
+ * without issuing any command, and the before-enable callback skips it.
+ * Extended advertising needs a random address on EACH set (0x2035), even
+ * if the global scanning address (0x2005) is already set. Preserve the
+ * default gate by removing only that disabling call, keeping the remaining
+ * chip-specific setup intact. macOS still owns the address and ordering.
+ * Exact 25G241 x86_64 sequence at 0x100510e99, inside one page.
+ */
+const uint8_t advAddressFind[] {
+    0xe8, 0xd4, 0x30, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
+    0x31, 0xff, 0xe8, 0x3e, 0x6b, 0xce, 0xff};
+const uint8_t advAddressReplace[] {
+    0xe8, 0xd4, 0x30, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+static_assert(sizeof(advAddressFind) == sizeof(advAddressReplace), "address patch size");
+
+/* 0.1.8 HCI capture: macOS sends 0x2035 for handles 0/2 before
+ * 0x2036 creates them. MediaTek returns Unknown Advertising Identifier (42),
+ * but LE_UpdateMultiAdvertisingSetAddress already cached the address. The
+ * unchanged-address fast path then skips 0x2035 after creation, and enable
+ * fails Invalid HCI Command Parameters (12). Handle 3, initialized in order,
+ * enables successfully. Always program a RANDOM address at this before-enable
+ * point, after parameters/data exist, even when the host cache matches.
+ * Public addresses keep the old changed-address test. The gate check replaced
+ * here is redundant with advAddress above (default true, sole false setter
+ * removed); these patches are enabled/disabled together. No HCI reply is
+ * synthesized; the existing callback waits for the real controller result.
+ * 25G241 x86_64 0x1001fa20d..0x1001fa24d, 64 bytes inside one page.
+ */
+const uint8_t advAddressRetryFind[] {
+    0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
+    0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0x44, 0x09, 0xc2, 0x0f, 0x84, 0x80, 0x00, 0x00, 0x00,
+    0x80, 0x3d, 0xcc, 0x2a, 0x92, 0x00, 0x00, 0x74, 0x77, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
+    0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
+const uint8_t advAddressRetryReplace[] {
+    0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
+    0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0xf6, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x01, 0x75,
+    0x08, 0x44, 0x09, 0xc2, 0x74, 0x7a, 0x90, 0x90, 0x90, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
+    0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
+static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace), "address retry patch size");
+
+mach_vm_address_t orgCsValidatePage;
+
+// Lilu's user patcher is off on Big Sur and later (kern_start.cpp), so
+// onProcLoad never fires there. Patch bluetoothd's pages as the kernel
+// validates them instead, as BlueToolFixup and RestrictEvents do.
+void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pageOffset, const void *data,
+                    int *validated, int *tainted, int *nx)
+{
+    FunctionCast(csValidatePage, orgCsValidatePage)(vp, pager, pageOffset, data, validated, tainted, nx);
+    static constexpr char bluetoothd[] = "/usr/sbin/bluetoothd";
+    char path[PATH_MAX];
+    int pathLength = PATH_MAX;
+    if (!data || vn_getpath(vp, path, &pathLength) != 0 || LIKELY(strcmp(path, bluetoothd) != 0))
+        return;
+    // Page-in path: count only; the next publishCounters() reports it.
+    OSIncrementAtomic(&bluetoothdPages);
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, extAdvFind, sizeof(extAdvFind),
+                                      extAdvReplace, sizeof(extAdvReplace))) {
+        OSIncrementAtomic(&bluetoothdPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd extended-advertising check");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind,
+                                      sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace))) {
+        OSIncrementAtomic(&bluetoothdAddressPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd per-set advertising address gate");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind,
+                                      sizeof(advAddressRetryFind), advAddressRetryReplace,
+                                      sizeof(advAddressRetryReplace))) {
+        OSIncrementAtomic(&bluetoothdAddressRetryPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd random address initialization before enable");
+    }
+}
+
+void processPatcher(void *, KernelPatcher &patcher)
+{
+    KernelPatcher::RouteRequest route {"_cs_validate_page", csValidatePage, orgCsValidatePage};
+    extAdvPatchRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
+    if (!extAdvPatchRouted)
+        patcher.clearError();
+    SYSLOG(DRV_NAME, "bluetoothd extended-advertising patch %s", extAdvPatchRouted ? "routed" : "failed to route");
+    publishCounters();
+}
+
 } // namespace
 
 void Patcher::init(uint32_t rustSelfTestFailed)
@@ -460,6 +588,8 @@ void Patcher::init(uint32_t rustSelfTestFailed)
     } else {
         leLock = IOLockAlloc();
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
+        if (!checkKernelArgument("-mtkbtnoextadv"))
+            lilu.onPatcherLoadForce(processPatcher);
     }
     publishCounters();
 }
