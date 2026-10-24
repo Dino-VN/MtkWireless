@@ -43,7 +43,7 @@ struct apple80211_awdl_peer_traffic_registration {
 };
 struct Timer { unsigned calls = 0; void setTimeoutMS(unsigned n) { assert(n==1); ++calls; } };
 struct AirportMtkAwdlInterface {
-    struct Hal { bool awdlChannelAllowed(unsigned c) { return c==6 || c==11 || c==44 || c==149; } uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);} } radio;
+    struct Hal { bool awdlChannelAllowed(unsigned c) { return c==6 || c==11 || c==44 || c==149; } uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}uint8_t awdlOnlyChannel(){return infraChannel;}void awdlInfraSleep(unsigned){}void awdlInfraWakeIfIdle(){}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);} } radio;
     Hal *hal = &radio;
     mtkawdl::DataPeers dataPeers;mtkawdl::State state;
     apple80211_awdl_sync_channel_sequence channelSequence{};

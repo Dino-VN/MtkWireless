@@ -41,7 +41,7 @@ struct IOTimerEventSource{
 };
 struct WorkLoop{unsigned addEventSource(IOTimerEventSource*){if(addFail)return 3;++added;return 0;}void removeEventSource(IOTimerEventSource*){++removed;}};
 struct AirportMtkWlan:OSObject{WorkLoop loop;const char*stage=nullptr;WorkLoop*getWorkLoop(){return &loop;}void recordAwdlCreation(const char*s,unsigned){stage=s;}};
-struct MtkMwx{bool awdlChannelAllowed(unsigned){return social;} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}void awdlSetReceiver(void*o,bool(*)(void*,const uint8_t*,size_t,uint8_t,int8_t)){if(o)++receiverSet;}
+struct MtkMwx{bool awdlChannelAllowed(unsigned){return social;} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}uint8_t awdlOnlyChannel(){return infraChannel;}void awdlInfraSleep(unsigned){}void awdlInfraWakeIfIdle(){}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}void awdlSetReceiver(void*o,bool(*)(void*,const uint8_t*,size_t,uint8_t,int8_t)){if(o)++receiverSet;}
  void awdlEnable(void*,bool){++transportStopped;}};
 struct apple80211_channel{uint32_t version,channel,flags;};
 struct AirportMtkAwdlInterface:Native{

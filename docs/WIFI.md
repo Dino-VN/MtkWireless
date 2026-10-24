@@ -47,6 +47,7 @@ OpenCore (untested): `Kernel → Add` with `ExecutablePath`
 | `amtk_cc=XX` | override the country code |
 | `amtk_he=1` | offer 802.11ax (experimental, 80 MHz) |
 | `amtk_awdl=0` | disable native AWDL (on by default on Tahoe) |
+| `amtk_awdl_offchan=0` | keep AWDL on the AP channel while associated (no PM handshake; AirDrop to phones on other channels fails) |
 
 ## Checking
 

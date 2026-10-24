@@ -49,6 +49,7 @@
 #include "if_mwxreg.h"
 #include <ClientKit/Common.h>
 #include <IOKit/IOLocks.h>
+#include <pexpert/pexpert.h>
 
 /*
  * TX rings are touched by the interrupt (workloop thread), the firmware
@@ -442,6 +443,10 @@ struct mwx_softc {
     uint8_t sc_awdl_address[6];
     bool sc_awdl_enabled, sc_awdl_configured, sc_awdl_filter_active;
     bool sc_awdl_scan_suspended;
+    // MtkWireless: AP told we sleep (PM=1) for an off-channel AWDL ROC.
+    bool sc_awdl_infra_ps;
+    uint64_t sc_awdl_infra_ps_at, sc_awdl_infra_ps_sleeps, sc_awdl_infra_ps_wakes;
+    uint64_t sc_awdl_infra_ps_failed;
     uint32_t sc_awdl_filter;
     IOLock *sc_awdl_lock;
     uint32_t sc_awdl_epoch;
@@ -6710,6 +6715,14 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	if (info->flags & IEEE80211_TX_CTL_NO_ACK)
 		val |= MT_TXD3_NO_ACK;
 #endif
+	/*
+	 * MtkWireless: keep the PM bit of the AWDL power-save null frames
+	 * (mwx_awdl_infra_pm); without SW_POWER_MGMT the MAC rewrites it.
+	 */
+	if (!awdl && (wh->i_fc[0] & (IEEE80211_FC0_TYPE_MASK |
+	    IEEE80211_FC0_SUBTYPE_MASK)) ==
+	    (IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_NODATA))
+		val |= MT_TXD3_SW_POWER_MGMT;
 	txp->txwi[3] = htole32(val);
 	txp->txwi[4] = 0;
 
@@ -8830,10 +8843,96 @@ uint8_t MtkMwx::awdlInfraChannel()
     return channel <= 165 ? uint8_t(channel) : 0;
 }
 
+// MtkWireless: longest off-channel ROC while associated (two AWs plus lead).
+static const uint32_t mwxAwdlOffChannelMaxMs = 40;
+
+// MtkWireless: boot-arg amtk_awdl_offchan=0 keeps AWDL on the AP channel
+// while associated (0.1.1 behaviour). Default: leave it with a PM handshake.
+static bool mwx_awdl_offchan_enabled()
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        int value = 1;
+        if (!PE_parse_boot_argn("amtk_awdl_offchan", &value, sizeof(value)))
+            value = 1;
+        enabled = value != 0;
+    }
+    return enabled;
+}
+
+uint8_t MtkMwx::awdlOnlyChannel()
+{
+    return mwx_awdl_offchan_enabled() ? 0 : awdlInfraChannel();
+}
+
 bool MtkMwx::awdlChannelReachable(uint8_t channel)
 {
+    uint8_t only = awdlOnlyChannel();
+    return awdlChannelAllowed(channel) && (!only || channel == only);
+}
+
+// MtkWireless: a Null data frame to the AP with PM set (sleep) or clear
+// (awake). The AP buffers for a sleeping station instead of dropping it,
+// which is what an unannounced channel switch got us. No payload, never
+// protected; mwx_tx consumes the mbuf.
+static int mwx_awdl_infra_pm(mwx_softc *sc, bool sleep)
+{
+    ieee80211com *ic = &sc->sc_ic;
+    ieee80211_node *ni = ic->ic_bss;
+    if (ic->ic_opmode != IEEE80211_M_STA || ic->ic_state != IEEE80211_S_RUN || !ni)
+        return ENXIO;
+    if (mwx_tx_full(sc))
+        return ENOBUFS;
+    mbuf_t m = m_gethdr(M_DONTWAIT, MT_DATA);
+    if (!m)
+        return ENOBUFS;
+    ieee80211_frame *wh = mtod(m, ieee80211_frame *);
+    memset(wh, 0, sizeof(*wh));
+    wh->i_fc[0] = IEEE80211_FC0_VERSION_0 | IEEE80211_FC0_TYPE_DATA |
+        IEEE80211_FC0_SUBTYPE_NODATA;
+    wh->i_fc[1] = IEEE80211_FC1_DIR_TODS | (sleep ? IEEE80211_FC1_PWR_MGT : 0);
+    IEEE80211_ADDR_COPY(wh->i_addr1, ni->ni_bssid);
+    IEEE80211_ADDR_COPY(wh->i_addr2, ic->ic_myaddr);
+    IEEE80211_ADDR_COPY(wh->i_addr3, ni->ni_bssid);
+    mbuf_setlen(m, sizeof(*wh));
+    mbuf_pkthdr_setlen(m, sizeof(*wh));
+    return mwx_tx(sc, m, ni);
+}
+
+void MtkMwx::awdlInfraSleep(uint8_t channel)
+{
+    MwxAwdlCall call(com);
+    if (!call.valid() || com->sc_resetting || com->sc_awdl_infra_ps)
+        return;
     uint8_t infra = awdlInfraChannel();
-    return awdlChannelAllowed(channel) && (!infra || channel == infra);
+    if (!infra || channel == infra)
+        return;
+    if (mwx_awdl_infra_pm(com, true)) { ++com->sc_awdl_infra_ps_failed; return; }
+    com->sc_awdl_infra_ps = true;
+    com->sc_awdl_infra_ps_at = mwx_awdl_now();
+    ++com->sc_awdl_infra_ps_sleeps;
+}
+
+void MtkMwx::awdlInfraWakeIfIdle()
+{
+    MwxAwdlCall call(com);
+    if (!call.valid() || com->sc_resetting || !com->sc_awdl_infra_ps)
+        return;
+    uint8_t infra = awdlInfraChannel();
+    if (!infra) { com->sc_awdl_infra_ps = false; return; }
+    uint64_t now = mwx_awdl_now();
+    IOLockLock(com->sc_awdl_lock);
+    const mtkawdl::Reservation &roc = com->sc_awdl_roc;
+    // Firmware returns to the BSS channel when the grant ends; give it 1ms.
+    // awdlReserve submits the ROC only 2ms after PM=1: do not wake before.
+    bool away = now - com->sc_awdl_infra_ps_at < 10000 || (roc.channel != infra &&
+        ((roc.pending && now < roc.deadline) || (roc.granted && now < roc.deadline + 1000)));
+    IOLockUnlock(com->sc_awdl_lock);
+    if (away)
+        return;
+    if (mwx_awdl_infra_pm(com, false)) { ++com->sc_awdl_infra_ps_failed; return; }
+    com->sc_awdl_infra_ps = false;
+    ++com->sc_awdl_infra_ps_wakes;
 }
 
 bool MtkMwx::awdlChannelAllowed(uint8_t channel)
@@ -9131,6 +9230,16 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     bool retryLater=com->sc_awdl_roc_abort_pending && mwx_awdl_now()<com->sc_awdl_roc_abort_retry_at;
     IOLockUnlock(com->sc_awdl_lock);
     if(retryLater) return kIOReturnNotReady;
+    // MtkWireless: away from the AP's channel only after it was told we
+    // sleep and that null frame had ~2ms to go out; keep the visit short.
+    uint8_t infra=awdlInfraChannel();
+    if(infra && channel!=infra) {
+        if(!mwx_awdl_offchan_enabled()) return kIOReturnBadArgument;
+        if(!com->sc_awdl_infra_ps) awdlInfraSleep(channel);
+        if(!com->sc_awdl_infra_ps || mwx_awdl_now()-com->sc_awdl_infra_ps_at<2000)
+            return kIOReturnNotReady;
+        if(durationMs>mwxAwdlOffChannelMaxMs) durationMs=mwxAwdlOffChannelMaxMs;
+    }
     int abortRv=mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
     if(abortRv) return kIOReturnIOError;
@@ -9259,6 +9368,10 @@ void MtkMwx::awdlPublishDiagnostics()
         radio.pending ? (observed<radio.deadline ? "waiting-grant" : "response-expired") :
         radio.granted ? (observed<radio.deadline ? "granted" : "grant-expired") : "idle";
     mwxController()->setProperty("MTKAWDLROCState",state);
+    mwxController()->setProperty("MTKAWDLInfraPowerSave",com->sc_awdl_infra_ps);
+    mwxController()->setProperty("MTKAWDLInfraPSSleeps",com->sc_awdl_infra_ps_sleeps,64);
+    mwxController()->setProperty("MTKAWDLInfraPSWakes",com->sc_awdl_infra_ps_wakes,64);
+    mwxController()->setProperty("MTKAWDLInfraPSFailed",com->sc_awdl_infra_ps_failed,64);
     mwxController()->setProperty("MTKAWDLFirmwareContext","p2p-discovery");
     mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);

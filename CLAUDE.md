@@ -48,8 +48,9 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   class), `mwx_mac_tx_free` (TX-free walk), `mwx_dma_rx_dequeue` /
   `mwx_dma_tx_cleanup_locked` (hardware ring index and RX length checks),
   `mwx_intr` (all-ones status = device gone), NIC capability nss clamp,
-  `awdlInfraChannel`/`awdlChannelReachable` (AWDL ROC stays on the AP channel
-  while associated, see below), and
+  `awdlInfraChannel`/`awdlChannelReachable`/`awdlInfraSleep` (AWDL off the AP
+  channel only with a PM handshake, see below), TXWI `SW_POWER_MGMT` for Null
+  data, and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both
@@ -64,11 +65,16 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 ## Wi-Fi + AWDL coexistence (do not regress)
 
-- While associated, AWDL must not take the radio to another channel: there is
-  no power-save handshake with the AP, which disassociates us within ~2 s
-  (seen 2026-10-24: ROC to channel 6 while on AP channel 149). `planRadio`'s
-  `onlyChannel` and `MtkMwx::awdlChannelReachable` enforce it; validation of
-  native sequences still uses `awdlChannelAllowed`.
+- While associated, AWDL may leave the AP's channel only behind a power-save
+  handshake: `MtkMwx::awdlInfraSleep` sends Null data PM=1 to the AP before an
+  off-channel ROC (awdlReserve waits 2 ms after it and caps the ROC at 40 ms),
+  `awdlInfraWakeIfIdle` sends PM=0 once no such ROC is pending/granted. An
+  unannounced switch got us disassociated within ~2 s (2026-10-24: ROC to
+  channel 6 on AP channel 149). Without leaving, AirDrop fails: the iPhone is
+  only heard on channel 6, peers flap and Bonjour resolve times out
+  (`missingEndpoint`). Boot-arg `amtk_awdl_offchan=0` restores the AP-channel
+  only mode (`awdlOnlyChannel`, `planRadio`'s `onlyChannel`). Unverified on
+  hardware; ioreg `MTKAWDLInfraPS*` counts the handshakes.
 - With AWDL on, the `other_bss` RX filter lets neighbor BSS traffic in; it
   shows up as `rx drop reason=amsdu-err` with wcid 0x3ff. That is noise.
 

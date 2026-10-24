@@ -41,7 +41,7 @@ struct Hal{
  bool homeChannel8=false;
  uint8_t requested=0,preparedChannel=0;unsigned prepares=0;
  uint32_t duration=0;std::function<void()> onReserve,onPrepare;std::function<void(bool)> onPeer;
- IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8);} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}
+ IOReturn awdlPrepareChannel(unsigned c){++prepares;preparedChannel=c;if(onPrepare)onPrepare();return 0;}bool awdlIsEnabled(){return on;}bool awdlChannelAllowed(unsigned c){return c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8);} uint8_t infraChannel=0;uint8_t awdlInfraChannel(){return infraChannel;}uint8_t awdlOnlyChannel(){return infraChannel;}void awdlInfraSleep(unsigned){}void awdlInfraWakeIfIdle(){}bool awdlChannelReachable(unsigned c){return awdlChannelAllowed(c)&&(!infraChannel||c==infraChannel);}
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){out=grant;return on;}
  bool awdlCanTransmit(unsigned c){return grant.canTransmit(c,clockUS);}
  void awdlAbort(){++aborts;grant.cancel();}

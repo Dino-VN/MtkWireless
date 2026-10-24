@@ -821,6 +821,8 @@ void AirportMtkAwdlInterface::serviceInGate()
     // control transaction before opening another AW with the old snapshot.
     if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     ++serviceTicks;
+    // MtkWireless: back on the AP's channel (or AWDL off), say we are awake.
+    hal->awdlInfraWakeIfIdle();
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
         state.holdClock(0);
@@ -1043,11 +1045,12 @@ void AirportMtkAwdlInterface::serviceInGate()
             // short presence still leaves us inside the start tolerance.
             // Reacquiring the closed EAW wastes the switching head start.
             bool skipCurrent=awTimeline.emitted && now<awTimeline.active.end;
-            // MtkWireless: while associated, AWDL only uses the AP's channel.
-            // If no window is on it, back off instead of polling every 2ms.
-            uint8_t infraChannel=hal->awdlInfraChannel();
+            // MtkWireless: with amtk_awdl_offchan=0, AWDL only uses the AP's
+            // channel while associated. If no window is on it, back off
+            // instead of polling every 2ms.
+            uint8_t onlyChannel=hal->awdlOnlyChannel();
             if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
-                                   infraChannel)) { timer->setTimeoutMS(infraChannel ? 50 : 2); return; }
+                                   onlyChannel)) { timer->setTimeoutMS(onlyChannel ? 50 : 2); return; }
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelReachable(target.channel)) {
                 timer->setTimeoutMS(1); return;
@@ -1069,6 +1072,9 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // must not delay the next reservation beyond its requestAt.
                 timer->setTimeoutMS(1); return;
             }
+            // MtkWireless: tell the AP we sleep before an off-channel ROC;
+            // awdlReserve waits ~2ms after it, so send it ahead of requestAt.
+            if(plan.requestAt<=now+3000) hal->awdlInfraSleep(target.channel);
             if(plan.requestAt>now) {
                 uint64_t delay=plan.requestAt-now;
                 timer->setTimeoutUS(static_cast<uint32_t>(delay>2000 ? 2000 : delay)); return;

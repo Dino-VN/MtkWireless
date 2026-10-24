@@ -79,12 +79,19 @@ public:
     // clear it after successful submission or permanent rejection.
     IOReturn awdlTryTransmit(mbuf_t *frame, uint8_t channel);
     bool awdlChannelAllowed(uint8_t channel);
-    // MtkWireless: the AP's channel while associated, else 0. AWDL may only
-    // take the radio there: an unannounced channel switch gets us
-    // disassociated.
+    // MtkWireless: the AP's channel while associated, else 0. Leaving it
+    // unannounced gets us disassociated; see awdlInfraSleep.
     uint8_t awdlInfraChannel();
-    // Allowed and, while associated, on the AP's channel.
+    // The only channel AWDL may use, or 0 for any: the AP's channel while
+    // associated if boot-arg amtk_awdl_offchan=0, else 0.
+    uint8_t awdlOnlyChannel();
+    // Allowed and, if awdlOnlyChannel() is set, equal to it.
     bool awdlChannelReachable(uint8_t channel);
+    // Power-save handshake with the AP around off-channel ROC: Sleep sends
+    // PM=1 before leaving for `channel` (no-op on the AP's channel), Wake
+    // sends PM=0 once no off-channel ROC is pending or granted. Idempotent.
+    void awdlInfraSleep(uint8_t channel);
+    void awdlInfraWakeIfIdle();
     IOReturn awdlPeer(const uint8_t *address, bool add);
     unsigned awdlPeerCapacity() const { return 3; }
 
