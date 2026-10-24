@@ -41,7 +41,10 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   target, MacKernelSDK before the SDK's PrivateHeaders, header-map dirs as
   `-iquote`. Changing any of these changes IOKit vtable layouts; diff
   `nm -u` against an Xcode build after touching the flags. Tahoe
-  (`__IO80211_TARGET=__MAC_26_0`) only for now. Local edits (search for
+  (`__IO80211_TARGET=__MAC_26_0`) only for now. Only files the build,
+  `tests/awdl`, `tools/mtkctl.c` or `scripts/test-*` use are kept (no
+  macOS15 headers, no standalone SimpleMtkWlan kext); take anything else
+  from upstream `dfca847`. Local edits (search for
   "MtkWireless:" / `mtk_wlan_`): `include/FwData.h` (embedded firmware
   lookup), `hal_mwx/MtkMwx.cpp`: `mwx_load_firmware` (image parsing in Rust),
   `mt7921_mac_fill_rx` (RX descriptor in Rust), `mwx_dma_rx_process` (packet
