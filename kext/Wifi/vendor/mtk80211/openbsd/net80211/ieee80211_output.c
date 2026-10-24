@@ -1078,6 +1078,11 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
         *frm++ = 6;
         count++;
     }
+    if (!wpa && (ni->ni_rsnakms & IEEE80211_AKM_SAE)) {
+        memcpy(frm, oui, 3); frm += 3;
+        *frm++ = 8;
+        count++;
+    }
     /* write AKM Suite List Count field */
     LE_WRITE_2(pcount, count);
 
@@ -1509,6 +1514,23 @@ ieee80211_get_auth(struct ieee80211com *ic, struct ieee80211_node *ni,
 {
 	mbuf_t m;
     u_int8_t *frm;
+
+    /* MtkWireless: SAE Commit/Confirm, body staged by ieee80211_sae.c */
+    if (ic->ic_sae_txlen != 0) {
+        size_t l = 2 * 3 + ic->ic_sae_txlen;
+
+        m = ieee80211_getmgmt(MBUF_DONTWAIT, MT_DATA, l);
+        if (m == NULL)
+            return NULL;
+        frm = mtod(m, u_int8_t *);
+        LE_WRITE_2(frm, IEEE80211_AUTH_ALG_SAE); frm += 2;
+        LE_WRITE_2(frm, seq); frm += 2;
+        LE_WRITE_2(frm, status); frm += 2;
+        memcpy(frm, ic->ic_sae_txbuf, ic->ic_sae_txlen);
+        mbuf_pkthdr_setlen(m, l);
+        mbuf_setlen(m, l);
+        return m;
+    }
     
     mbuf_gethdr(MBUF_DONTWAIT, MT_DATA, &m);
     if (m == NULL)

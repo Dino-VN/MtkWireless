@@ -23,6 +23,7 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 | Feature | Status | Notes |
 |---|---|---|
 | Wi-Fi menu, scan, join, DHCP | ✅ | WPA2 / WPA3-transition AP, 5 GHz channel 149, 80 MHz, 802.11ac |
+| WPA3-Personal (SAE), 802.11w PMF | — | 1.0.1+, untested on hardware: SAE group 19 (hunting-and-pecking) in the Rust core, PMF with IGTK/BIP and SA Query; WPA3-only and PMF-required networks join, transition networks prefer SAE. No H2E/SAE-PK (WPA3-only 6 GHz needs H2E). `amtk_pmf=0` returns to WPA2-PSK only. [docs/WIFI.md](docs/WIFI.md#wpa3-personal-and-pmf) |
 | Join while AirDrop/AWDL is active | ✅ | 0.1.3+: scans and joins take the radio from AWDL until associated |
 | 2.4 GHz, DFS channels, roaming | — | |
 | Throughput, sleep/wake | — | |

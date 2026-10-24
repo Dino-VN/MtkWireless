@@ -54,7 +54,13 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `mwx_intr` (all-ones status = device gone), NIC capability nss clamp,
   `awdlInfraChannel`/`awdlChannelReachable`/`awdlInfraSleep` (AWDL off the AP
   channel only with a PM handshake, see below), TXWI `SW_POWER_MGMT` for Null
-  data, and
+  data, PMF (`IEEE80211_C_MFP`, `amtk_pmf=0` off; IGTK as mt76 sends it in
+  `mt7921_mcu_sta_bip_update`, plus net80211 software BIP; `RXMGMTPROT` set
+  at port valid), net80211 WPA3-SAE (`ieee80211_sae.c`, AKM
+  `IEEE80211_AKM_SAE`, EAPOL descriptor version 0, HW-decrypted robust mgmt
+  frames accepted in `ieee80211_input`, STA-side SA Query moved out of
+  `IEEE80211_STA_ONLY`), WCL SAE joins (`LegacyAuth::Sae`, cipher 10
+  password, `selectWPA2TransitionMode` only without PMF), and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both
@@ -106,6 +112,18 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `data_view` accepts the envelope only on QoS non-aggregated frames with an
   exact length and keeps every AWDL/IPv6 check; it never scans for an inner
   SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
+
+## WPA3 / PMF (do not regress)
+
+- airportd offers WPA3-SAE only with `CARD_CAPABILITIES` byte 5 bit 3 and
+  PMF only with byte 2 `& 0x11` (IO80211.framework `Apple80211IsAuthSelAllowed`,
+  `_getMFPCaps`, Tahoe 25G x86_64); the join then carries the SAE password
+  as `apple80211_key` cipher 10 (`APPLE80211_CIPHER_PWD`), not a PMK.
+- SAE math lives in Rust (`mtk_wlan::sae`, Annex J.10 vector in tests and
+  in the kext self-test); C keeps frames, state and the PMKSA entry.
+  `mtk_wlan_sae` is an opaque 512-byte C buffer (size asserted in Rust).
+- Turning on `IEEE80211_C_MFP` changes WPA2 joins too: APs with MFPC now
+  negotiate PMF. `amtk_pmf=0` is the escape hatch. Unverified on hardware.
 
 ## How macOS uses the Bluetooth controller (do not regress)
 

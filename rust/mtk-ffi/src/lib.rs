@@ -15,6 +15,8 @@ extern crate mtk_kernel;
 mod awdl;
 #[cfg(feature = "bt")]
 mod bt;
+#[cfg(feature = "wifi")]
+mod sae;
 mod selftest;
 #[cfg(feature = "wifi")]
 mod wifi;

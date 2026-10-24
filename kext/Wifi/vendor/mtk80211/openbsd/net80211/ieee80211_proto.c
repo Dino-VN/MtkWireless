@@ -539,6 +539,9 @@ ieee80211_gtk_rekey_timeout(void *arg)
 	timeout_add_sec(&ic->ic_rsn_timeout, 3600);
 }
 
+#endif	/* IEEE80211_STA_ONLY */
+
+/* MtkWireless: SA Query is also used by a PMF station (ieee80211_input). */
 void
 ieee80211_sa_query_timeout(void *arg)
 {
@@ -550,6 +553,22 @@ ieee80211_sa_query_timeout(void *arg)
 	if (++ni->ni_sa_query_count >= 3) {
 		ni->ni_flags &= ~IEEE80211_NODE_SA_QUERY;
 		ni->ni_flags |= IEEE80211_NODE_SA_QUERY_FAILED;
+		/*
+		 * MtkWireless: STA mode starts SA Query after an unprotected
+		 * Deauth/Disassoc from its AP (ieee80211_input). No answer
+		 * means the AP no longer has our association: leave it.
+		 */
+		if (ic->ic_opmode == IEEE80211_M_STA &&
+		    ic->ic_state == IEEE80211_S_RUN && ni == ic->ic_bss) {
+			XYLog("%s: SA Query to %s timed out, leaving BSS\n",
+			    __FUNCTION__, ether_sprintf(ni->ni_macaddr));
+			ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
+			if (ic->ic_event_handler)
+				(*ic->ic_event_handler)(ic,
+				    IEEE80211_EVT_STA_DEAUTH, NULL);
+			ieee80211_new_state(ic, IEEE80211_S_AUTH,
+			    IEEE80211_FC0_SUBTYPE_DEAUTH);
+		}
 	} else	/* retry SA Query Request */
 		ieee80211_sa_query_request(ic, ni);
 	splx(s);
@@ -575,9 +594,13 @@ ieee80211_sa_query_request(struct ieee80211com *ic, struct ieee80211_node *ni)
 	/* send SA Query Request */
 	IEEE80211_SEND_ACTION(ic, ni, IEEE80211_CATEG_SA_QUERY,
 	    IEEE80211_ACTION_SA_QUERY_REQ, 0);
-	timeout_add_msec(&ni->ni_sa_query_to, 10);
+	/* MtkWireless: a STA waits dot11AssociationSAQueryRetryTimeout
+	 * (201 TU) per try, as wpa_supplicant does; 10 ms is too short
+	 * for an AP in power save or across a channel switch. */
+	timeout_add_msec(&ni->ni_sa_query_to,
+	    ic->ic_opmode == IEEE80211_M_STA ? 201 : 10);
 }
-#endif	/* IEEE80211_STA_ONLY */
+
 
 void
 ieee80211_ht_negotiate_chw(struct ieee80211com *ic, struct ieee80211_node *ni)
@@ -1433,6 +1456,9 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		    ieee80211_state_name[ostate], ieee80211_state_name[nstate]);
 	ic->ic_state = nstate;			/* state transition */
 	ni = ic->ic_bss;			/* NB: no reference held */
+	/* MtkWireless: an SAE exchange only lives in AUTH state. */
+	if (nstate != IEEE80211_S_AUTH)
+		ieee80211_sae_clear(ic);
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
 	switch (nstate) {
@@ -1578,6 +1604,14 @@ justcleanup:
 		if (ostate == IEEE80211_S_RUN)
 			ieee80211_check_wpa_supplicant_failure(ic, ni);
 		ni->ni_rsn_supp_state = RSNA_SUPP_INITIALIZE;
+		/* MtkWireless: management frame protection restarts with the
+		 * next 4-way handshake; a pending SA Query is moot. */
+		if (ic->ic_opmode == IEEE80211_M_STA) {
+			ni->ni_flags &= ~(IEEE80211_NODE_TXMGMTPROT |
+			    IEEE80211_NODE_RXMGMTPROT | IEEE80211_NODE_SA_QUERY |
+			    IEEE80211_NODE_SA_QUERY_FAILED);
+			timeout_del(&ni->ni_sa_query_to);
+		}
 		if (ic->ic_flags & IEEE80211_F_RSNON)
 			ieee80211_crypto_clear_groupkeys(ic);
 		switch (ostate) {
@@ -1588,18 +1622,15 @@ justcleanup:
 				    ieee80211_state_name[nstate]);
 			break;
 		case IEEE80211_S_SCAN:
-			IEEE80211_SEND_MGMT(ic, ni,
-			    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+			/* MtkWireless: open, or SAE Commit for WPA3 */
+			ieee80211_send_auth_request(ic, ni);
 			break;
 		case IEEE80211_S_AUTH:
 		case IEEE80211_S_ASSOC:
 			switch (mgt) {
 			case IEEE80211_FC0_SUBTYPE_AUTH:
-				if (ic->ic_opmode == IEEE80211_M_STA) {
-					IEEE80211_SEND_MGMT(ic, ni,
-					    IEEE80211_FC0_SUBTYPE_AUTH,
-					    IEEE80211_AUTH_OPEN_REQUEST);
-				}
+				if (ic->ic_opmode == IEEE80211_M_STA)
+					ieee80211_send_auth_request(ic, ni);
 				break;
 			case IEEE80211_FC0_SUBTYPE_DEAUTH:
 				/* ignore and retry scan on timeout */
@@ -1619,8 +1650,7 @@ justcleanup:
 				break;
 			case IEEE80211_FC0_SUBTYPE_DEAUTH:
 				/* try to reauth */
-				IEEE80211_SEND_MGMT(ic, ni,
-				    IEEE80211_FC0_SUBTYPE_AUTH, 1);
+				ieee80211_send_auth_request(ic, ni);
 				break;
 			}
 			break;

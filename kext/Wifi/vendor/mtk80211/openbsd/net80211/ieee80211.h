@@ -971,6 +971,7 @@ enum ieee80211_edca_ac {
  */
 #define IEEE80211_AUTH_ALG_OPEN			0x0000
 #define IEEE80211_AUTH_ALG_SHARED		0x0001
+#define IEEE80211_AUTH_ALG_SAE			0x0003	/* MtkWireless */
 #define IEEE80211_AUTH_ALG_LEAP			0x0080
 
 /*
@@ -1207,6 +1208,7 @@ struct ieee80211_eapol_key {
 
 	u_int8_t	info[2];
 #define EAPOL_KEY_VERSION_MASK	0x7
+#define EAPOL_KEY_DESC_V0	0		/* AKM defined (SAE) */
 #define EAPOL_KEY_DESC_V1	1
 #define EAPOL_KEY_DESC_V2	2
 #define EAPOL_KEY_DESC_V3	3		/* 11r */

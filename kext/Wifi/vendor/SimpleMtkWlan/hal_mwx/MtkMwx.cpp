@@ -551,6 +551,8 @@ struct mwx_softc {
 	struct mwx_setkey_task_arg	sc_setkey_arg[8];
 	int			sc_setkey_cur;
 	int			sc_setkey_tail;
+	/* MtkWireless: last group CCMP key sent, for the BIP key pair. */
+	int			sc_gtk_kid;
 
 #if NBPFILTER > 0
 	caddr_t			sc_drvbpf;
@@ -1750,6 +1752,22 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    sc->sc_setkey_tail)
 		return ENOSPC;
 
+	/*
+	 * MtkWireless: net80211 verifies the MMIE of broadcast robust
+	 * management frames itself (ieee80211_bip_decap), so the IGTK
+	 * needs its software context too. The firmware copy follows.
+	 */
+	if (k->k_cipher == IEEE80211_CIPHER_BIP) {
+		int err;
+
+		if (k->k_flags & IEEE80211_KEY_SWCRYPTO)
+			ieee80211_bip_delete_key(ic, k);
+		err = ieee80211_bip_set_key(ic, k);
+		if (err != 0)
+			return err;
+		k->k_flags |= IEEE80211_KEY_SWCRYPTO;
+	}
+
 	a = &sc->sc_setkey_arg[sc->sc_setkey_cur];
 	a->ni = ni;
 	a->k = k;
@@ -1768,6 +1786,12 @@ mwx_delete_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
 
 	mt7921_mcu_sta_key_delete(sc, ni, k);
+	/* MtkWireless: free net80211's BIP context of the IGTK. */
+	if (k->k_cipher == IEEE80211_CIPHER_BIP &&
+	    (k->k_flags & IEEE80211_KEY_SWCRYPTO)) {
+		ieee80211_bip_delete_key(ic, k);
+		k->k_flags &= ~IEEE80211_KEY_SWCRYPTO;
+	}
 }
 
 void
@@ -2401,6 +2425,21 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 #endif
 	    IEEE80211_C_SHSLOT |	/* short slot time supported */
 	    IEEE80211_C_SHPREAMBLE;	/* short preamble supported */
+
+	/*
+	 * MtkWireless: 802.11w PMF, required by WPA3-SAE. The MAC encrypts
+	 * and decrypts unicast robust management frames with the pairwise
+	 * key; the IGTK goes to the firmware as mt76 sends it and to
+	 * net80211's software BIP, which checks broadcast Deauth/Disassoc.
+	 * Boot-arg amtk_pmf=0 turns PMF (and with it SAE) off.
+	 */
+	{
+		int pmf = 1;
+
+		PE_parse_boot_argn("amtk_pmf", &pmf, sizeof(pmf));
+		if (pmf != 0)
+			ic->ic_caps |= IEEE80211_C_MFP;
+	}
 
 	/*
 	 * HT/VHT receive capabilities. A-MSDU stays at the 3839/3895 byte
@@ -7503,6 +7542,64 @@ mt7921_mcu_add_key_tlv(struct mbuf *m, uint16_t *tlvnum,
 	}
 }
 
+/*
+ * MtkWireless: the IGTK goes to the firmware the way
+ * mt76_connac_mcu_sta_key_tlv() sends it: one STA_REC_KEY with two
+ * ciphers, the group CCMP key first and the BIP-CMAC-128 key second, on
+ * the WCID of the group keys. Without a group CCMP key the IGTK stays
+ * software only; net80211 still checks the MMIE (ieee80211_bip_decap).
+ */
+static int
+mt7921_mcu_sta_bip_update(struct mwx_softc *sc, struct ieee80211_key *k)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct mwx_vif *mvif = &sc->sc_vif;
+	struct ieee80211_key *gtk = NULL;
+	struct sta_rec_sec *sec;
+	struct sta_rec_sec_key *key;
+	struct mbuf *m;
+	uint16_t tlvnum = 0;
+
+	if (sc->sc_gtk_kid >= 1 && sc->sc_gtk_kid <= 3)
+		gtk = &ic->ic_nw_keys[sc->sc_gtk_kid];
+	if (gtk == NULL || gtk->k_cipher != IEEE80211_CIPHER_CCMP ||
+	    !(gtk->k_flags & IEEE80211_KEY_GROUP) || gtk->k_len != 16 ||
+	    k->k_len != 16) {
+		MWX_DEV_LOG(sc, "IGTK id=%d kept in software: no group CCMP key\n",
+		    k->k_id);
+		return 0;
+	}
+
+	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
+	if (m == NULL)
+		return ENOBUFS;
+	sec = (struct sta_rec_sec *)mwx_append_tlv(m, &tlvnum, STA_REC_KEY,
+	    sizeof(*sec));
+	sec->add = 0;	/* connac2 has inverted logic */
+	sec->n_cipher = 2;
+	sec->len = htole16(sizeof(*sec) + 2 * sizeof(*key));
+
+	key = (struct sta_rec_sec_key *)mwx_append_len(m, sizeof(*key));
+	key->cipher_id = MCU_CIPHER_AES_CCMP;
+	key->cipher_len = sizeof(*key);
+	key->key_id = gtk->k_id;
+	key->key_len = 16;
+	memcpy(key->key, gtk->k_key, 16);
+
+	key = (struct sta_rec_sec_key *)mwx_append_len(m, sizeof(*key));
+	key->cipher_id = MCU_CIPHER_BIP_CMAC_128;
+	key->cipher_len = sizeof(*key);
+	key->key_len = 16;
+	memcpy(key->key, k->k_key, 16);
+
+	m = mwx_fill_sta_req_hdr(m, mvif, 0x0e, mvif->vif_mn.wcid, tlvnum);
+	if (m == NULL)
+		return ENOBUFS;
+	MWX_DEV_LOG(sc, "IGTK id=%d add with GTK id=%d wcid=%u\n", k->k_id,
+	    gtk->k_id, mvif->vif_mn.wcid);
+	return mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+}
+
 int
 mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
     struct ieee80211_key *k)
@@ -7523,9 +7620,14 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (ni == NULL)
 		return ENXIO;
 
+	if (k->k_cipher == IEEE80211_CIPHER_BIP)
+		return mt7921_mcu_sta_bip_update(sc, k);
+
 	if ((k->k_flags & IEEE80211_KEY_GROUP) != 0) {
 		wcid = mvif->vif_mn.wcid;
 		muar_idx = 0x0e;
+		if (k->k_cipher == IEEE80211_CIPHER_CCMP)
+			sc->sc_gtk_kid = k->k_id;
 	} else {
 		wcid = mn->wcid;
 	}
@@ -7563,8 +7665,12 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 		MWX_DEV_LOG(sc,
 		    "key add complete port valid mac=%s node_flags=0x%x\n",
 		    ether_sprintf(ni->ni_macaddr), mn->flags);
+		/* MtkWireless: with PMF, robust management frames are
+		 * protected both ways from here on (net80211 never sets
+		 * RXMGMTPROT itself). */
 		if (ni->ni_flags & IEEE80211_NODE_MFP)
-			ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT;
+			ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT |
+			    IEEE80211_NODE_RXMGMTPROT;
 		ni->ni_port_valid = 1;
 		ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_UP);
 	}
@@ -7589,10 +7695,20 @@ mt7921_mcu_sta_key_delete(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (ni == NULL)
 		return;
 
+	/*
+	 * MtkWireless: a STA_REC_KEY delete carries no cipher entry, so on
+	 * the group WCID it would take the GTK along with the IGTK. The
+	 * IGTK goes with the group key's delete instead.
+	 */
+	if (k->k_cipher == IEEE80211_CIPHER_BIP)
+		return;
+
 	if ((k->k_flags & IEEE80211_KEY_GROUP) != 0) {
 		wcid = mvif->vif_mn.wcid;
 		muar_idx = 0x0e;
 		mn->flags &= ~MWX_NODE_FLAG_HAVE_GROUP_KEY;
+		if (k->k_id == sc->sc_gtk_kid)
+			sc->sc_gtk_kid = 0;
 	} else {
 		wcid = mn->wcid;
 		mn->flags &= ~MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
@@ -9410,6 +9526,12 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKWiFiRxWrongBSS",com->sc_ic.ic_stats.is_rx_wrongbss,32);
     mwxController()->setProperty("MTKWiFiRxDeauth",com->sc_ic.ic_stats.is_rx_deauth,32);
     mwxController()->setProperty("MTKWiFiRxDisassoc",com->sc_ic.ic_stats.is_rx_disassoc,32);
+    // MtkWireless: WPA3-SAE outcomes and whether the BSS uses 802.11w PMF.
+    mwxController()->setProperty("MTKWiFiSAEAccepted",com->sc_ic.ic_sae_ok,32);
+    mwxController()->setProperty("MTKWiFiSAEFailed",com->sc_ic.ic_sae_fail,32);
+    mwxController()->setProperty("MTKWiFiSAELastStatus",com->sc_ic.ic_sae_last_status,16);
+    mwxController()->setProperty("MTKWiFiPMF",com->sc_ic.ic_bss != NULL &&
+        (com->sc_ic.ic_bss->ni_flags & IEEE80211_NODE_MFP) != 0);
     mwxController()->setProperty("MTKAWDLFirmwareContext","p2p-discovery");
     mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);

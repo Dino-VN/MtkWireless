@@ -10,4 +10,5 @@
 pub mod awdl;
 pub mod chip;
 pub mod connac2;
+pub mod sae;
 pub mod scan;

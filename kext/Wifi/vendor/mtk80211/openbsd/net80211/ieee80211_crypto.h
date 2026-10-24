@@ -67,7 +67,8 @@ enum ieee80211_akm {
 	IEEE80211_AKM_8021X		= 0x00000001,
 	IEEE80211_AKM_PSK		= 0x00000002,
 	IEEE80211_AKM_SHA256_8021X	= 0x00000004,	/* 11w */
-	IEEE80211_AKM_SHA256_PSK	= 0x00000008	/* 11w */
+	IEEE80211_AKM_SHA256_PSK	= 0x00000008,	/* 11w */
+	IEEE80211_AKM_SAE		= 0x00000010	/* MtkWireless: WPA3 */
 };
 
 #define IEEE80211_TKIP_HDRLEN	8
@@ -89,6 +90,7 @@ enum ieee80211_akm {
 #define IEEE80211_GCMP_PNLEN        6
 
 #define IEEE80211_PMK_LEN	32
+#define IEEE80211_SAE_PASSWORD_MAX	64	/* apple80211_key buffer */
 
 #ifdef _KERNEL 
 
@@ -99,11 +101,23 @@ ieee80211_is_8021x_akm(enum ieee80211_akm akm)
 	    akm == IEEE80211_AKM_SHA256_8021X;
 }
 
+/* KDF-SHA-256 for the PTK (SAE uses it too, see ieee80211_is_sae_akm). */
 static __inline int
 ieee80211_is_sha256_akm(enum ieee80211_akm akm)
 {
 	return akm == IEEE80211_AKM_SHA256_8021X ||
-	    akm == IEEE80211_AKM_SHA256_PSK;
+	    akm == IEEE80211_AKM_SHA256_PSK || akm == IEEE80211_AKM_SAE;
+}
+
+/*
+ * MtkWireless: AKM 00-0F-AC:8 uses EAPOL-Key descriptor version 0
+ * ("AKM defined") with the AES-128-CMAC MIC and AES key wrap of version
+ * 3, and its PMKID comes from SAE, not from HMAC("PMK Name").
+ */
+static __inline int
+ieee80211_is_sae_akm(enum ieee80211_akm akm)
+{
+	return akm == IEEE80211_AKM_SAE;
 }
 
 struct ieee80211_key {

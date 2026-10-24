@@ -286,6 +286,8 @@ inline bool scanUsesProbes(bool requested, bool activeRequest) {
 // This operates on the scan-message copy, never the received beacon or the
 // net80211 RSN IE used to validate the four-way handshake. SAE-only, mandatory
 // PMF and other AKM combinations must not be converted into WPA2 networks.
+// MtkWireless: only used without PMF (boot-arg amtk_pmf=0); with PMF the
+// driver does SAE and WCL sees the AP's real AKM list.
 inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
     if (!validIEs(ies, length))
         return length;
@@ -408,7 +410,9 @@ struct JoinRequest {
     uint32_t keyLength;
     uint32_t keyCipher;
     uint16_t keyIndex;
-    uint8_t key[32];
+    // PMK/MSK (32 bytes) or, with cipher Password, an SAE password of up to
+    // 64 bytes: apple80211_key's key[32] + pad[30] + alignment.
+    uint8_t key[64];
     uint8_t bssid[6];
     uint16_t channelSpec;
     uint16_t rsnLength;
@@ -432,7 +436,23 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
         ie[4] == 0xf2 && ie[5] == 1 && ie[6] == 1 && ie[7] == 0;
 }
 
-enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise };
+// APPLE80211_CIPHER_PWD: IO80211.framework's Apple80211Associate2 passes
+// the SAE password itself (key_len 1..63) with this cipher type, because
+// SAE cannot start from a PMK (Tahoe 25G, x86_64).
+constexpr uint32_t CipherPassword = 10;
+constexpr uint32_t AuthSAE = 1u << 12; // APPLE80211_AUTHTYPE_WPA3_SAE
+
+enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise, Sae };
+inline bool passwordKey(const JoinRequest &j) {
+    return j.keyCipher == CipherPassword && j.keyLength >= 1 && j.keyLength <= 64;
+}
+// A WPA passphrase (8..63 printable ASCII) that PBKDF2 can turn into a PMK.
+inline bool passphraseKey(const JoinRequest &j) {
+    if (!passwordKey(j) || j.keyLength < 8 || j.keyLength > 63) return false;
+    for (uint32_t i = 0; i < j.keyLength; ++i)
+        if (j.key[i] < 32 || j.key[i] > 126) return false;
+    return true;
+}
 inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     // Values from apple80211_authtype/cipher_type, used by the WCL association request.
     if (!validRSNOverride(j.rsn, j.rsnLength)) return LegacyAuth::Invalid;
@@ -446,8 +466,15 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     }
     const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
     const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
-    if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
-    if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
+    if (j.upperAuth & ~(personal | AuthSAE | enterprise)) return LegacyAuth::Invalid;
+    if ((j.upperAuth & (personal | AuthSAE)) && (j.upperAuth & enterprise))
+        return LegacyAuth::Invalid;
+    // MtkWireless: WPA3-Personal (SAE, alone or with WPA2-PSK in transition
+    // mode) needs the password; a PMK only allows the PSK side.
+    if ((j.upperAuth & AuthSAE) && passwordKey(j))
+        return LegacyAuth::Sae;
+    if ((j.upperAuth & personal) && passphraseKey(j))
+        return LegacyAuth::Personal;
     if (j.upperAuth & personal)
         return j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7) ?
             LegacyAuth::Personal : LegacyAuth::Invalid;
@@ -465,7 +492,7 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     uint32_t keyLength = read32(p + 0x44);
     uint16_t rsnLength = read16(p + 0xd4);
     if (!count || count > 10 || !ssidLength || ssidLength > 32 ||
-        keyLength > 32 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
+        keyLength > 64 || rsnLength > 257 || length < 0x218 + size_t(count) * 18)
         return false;
     if (p[0x21c] & 1)
         return false;

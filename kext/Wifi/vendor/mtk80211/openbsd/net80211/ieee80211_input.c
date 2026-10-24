@@ -136,10 +136,8 @@ void    ieee80211_recv_delba(struct ieee80211com *, mbuf_t,
                              struct ieee80211_node *);
 void    ieee80211_recv_sa_query_req(struct ieee80211com *, mbuf_t,
                                     struct ieee80211_node *);
-#ifndef IEEE80211_STA_ONLY
 void    ieee80211_recv_sa_query_resp(struct ieee80211com *, mbuf_t,
                                      struct ieee80211_node *);
-#endif
 void    ieee80211_recv_action(struct ieee80211com *, mbuf_t,
                               struct ieee80211_node *);
 #ifndef IEEE80211_STA_ONLY
@@ -699,9 +697,33 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
                 if (subtype == IEEE80211_FC0_SUBTYPE_DISASSOC ||
                     subtype == IEEE80211_FC0_SUBTYPE_DEAUTH ||
                     subtype == IEEE80211_FC0_SUBTYPE_ACTION) {
+                    /*
+                     * MtkWireless: the MAC decrypts unicast robust
+                     * frames with the pairwise key and strips the
+                     * CCMP header and MIC (mt7921_mac_fill_rx), as
+                     * mt76 relies on.
+                     */
+                    if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
+                        (*ic->ic_recv_mgmt)(ic, m, ni, rxi, subtype);
+                        mbuf_freem(m);
+                        return;
+                    }
                     if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
                         !(wh->i_fc[1] & IEEE80211_FC1_PROTECTED)) {
-                        /* unicast mgmt not encrypted */
+                        /*
+                         * unicast mgmt not encrypted. MtkWireless: an
+                         * unprotected Deauth/Disassoc from our AP may
+                         * mean it lost our state; check with SA Query
+                         * (IEEE 802.11-2020 11.13) instead of ignoring
+                         * it until the AP stops sending beacons.
+                         */
+                        if (ic->ic_opmode == IEEE80211_M_STA &&
+                            ic->ic_state == IEEE80211_S_RUN &&
+                            ni == ic->ic_bss &&
+                            subtype != IEEE80211_FC0_SUBTYPE_ACTION &&
+                            IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_bssid) &&
+                            !(ni->ni_flags & IEEE80211_NODE_SA_QUERY))
+                            ieee80211_sa_query_request(ic, ni);
                         goto out;
                     }
                     /* do software decryption */
@@ -1517,6 +1539,8 @@ ieee80211_parse_rsn_akm(const u_int8_t selector[4])
                 return IEEE80211_AKM_SHA256_8021X;
             case 6:    /* PSK with SHA256 KDF */
                 return IEEE80211_AKM_SHA256_PSK;
+            case 8:    /* MtkWireless: SAE */
+                return IEEE80211_AKM_SAE;
         }
     }
     return IEEE80211_AKM_NONE;    /* ignore unknown AKMs */
@@ -2319,6 +2343,14 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     status = LE_READ_2(frm); frm += 2;
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
+
+    /* MtkWireless: WPA3-SAE, station side only */
+    if (algo == IEEE80211_AUTH_ALG_SAE &&
+        ic->ic_opmode == IEEE80211_M_STA) {
+        ieee80211_sae_recv_auth(ic, wh, frm,
+            mbuf_len(m) - sizeof(*wh) - 6, seq, status);
+        return;
+    }
     
     /* only "open" auth mode is supported */
     if (algo != IEEE80211_AUTH_ALG_OPEN) {
@@ -3436,7 +3468,6 @@ ieee80211_recv_sa_query_req(struct ieee80211com *ic, mbuf_t m,
                           IEEE80211_ACTION_SA_QUERY_RESP, 0);
 }
 
-#ifndef IEEE80211_STA_ONLY
 /*-
  * SA Query Response frame format:
  * [1] Category
@@ -3472,7 +3503,6 @@ ieee80211_recv_sa_query_resp(struct ieee80211com *ic, mbuf_t m,
     timeout_del(&ni->ni_sa_query_to);
     ni->ni_flags &= ~IEEE80211_NODE_SA_QUERY;
 }
-#endif
 
 /*-
  * Action frame format:
@@ -3512,11 +3542,9 @@ ieee80211_recv_action(struct ieee80211com *ic, mbuf_t m,
                 case IEEE80211_ACTION_SA_QUERY_REQ:
                     ieee80211_recv_sa_query_req(ic, m, ni);
                     break;
-#ifndef IEEE80211_STA_ONLY
                 case IEEE80211_ACTION_SA_QUERY_RESP:
                     ieee80211_recv_sa_query_resp(ic, m, ni);
                     break;
-#endif
             }
             break;
         default:

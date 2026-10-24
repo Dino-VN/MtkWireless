@@ -99,6 +99,8 @@ fn component() -> bool {
     use mtk_wlan::chip::{PCI_VENDOR_MEDIATEK, lookup_pci};
     let desc = lookup_pci(PCI_VENDOR_MEDIATEK, black_box(0x0616));
     desc.is_some_and(|d| d.chip.firmware().ram == "mwx-mt7922_ram_code_1")
+        // P-256/SHA-256 on the soft-float kext target (WPA3 SAE).
+        && mtk_wlan::sae::self_test()
 }
 
 #[cfg(feature = "bt")]

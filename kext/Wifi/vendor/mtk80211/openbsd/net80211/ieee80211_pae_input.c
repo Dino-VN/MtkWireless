@@ -148,10 +148,13 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     
     /* discard EAPOL-Key frames with an unknown descriptor version */
     desc = info & EAPOL_KEY_VERSION_MASK;
-    if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
+    if (ieee80211_is_sae_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
+        /* MtkWireless: SAE uses the AKM-defined version 0. */
+        if (desc != EAPOL_KEY_DESC_V0)
+            goto done;
+    } else if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
         goto done;
-    
-    if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
+    else if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
         if (desc != EAPOL_KEY_DESC_V3)
             goto done;
     } else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
@@ -263,8 +266,10 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     if (pmkid != NULL && pmkid[1] != 4 + 16)
         return;
     
-    if (ieee80211_is_8021x_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
-        /* retrieve the PMK for this (AP,PMKID) */
+    if (ieee80211_is_8021x_akm((enum ieee80211_akm)ni->ni_rsnakms) ||
+        ieee80211_is_sae_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
+        /* retrieve the PMK for this (AP,PMKID); MtkWireless: SAE
+         * added it to the PMKSA cache (ieee80211_sae.c) */
         pmk = ieee80211_pmksa_find(ic, ni,
                                    (pmkid != NULL) ? &pmkid[6] : NULL);
         if (pmk == NULL) {
@@ -663,6 +668,10 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         /* map IGTK to 802.11 key */
         k = &ic->ic_nw_keys[kid];
         if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
+            /* MtkWireless: free the old IGTK's software BIP context. */
+            if (k->k_cipher == IEEE80211_CIPHER_BIP &&
+                (k->k_flags & IEEE80211_KEY_SWCRYPTO))
+                ieee80211_bip_delete_key(ic, k);
             memset(k, 0, sizeof(*k));
             k->k_id = kid;    /* either 4 or 5 */
             k->k_cipher = ni->ni_rsngroupmgmtcipher;
@@ -954,6 +963,10 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
         /* map IGTK to 802.11 key */
         k = &ic->ic_nw_keys[kid];
         if (ieee80211_must_update_group_key(k, &igtk[14], 16)) {
+            /* MtkWireless: free the old IGTK's software BIP context. */
+            if (k->k_cipher == IEEE80211_CIPHER_BIP &&
+                (k->k_flags & IEEE80211_KEY_SWCRYPTO))
+                ieee80211_bip_delete_key(ic, k);
             memset(k, 0, sizeof(*k));
             k->k_id = kid;    /* either 4 or 5 */
             k->k_cipher = ni->ni_rsngroupmgmtcipher;

@@ -413,6 +413,8 @@ struct ieee80211_defrag {
 
 #define IEEE80211_GROUP_NKID	6
 
+struct mtk_wlan_sae;	/* kext/Wifi/mtk_wlan.h */
+
 struct ieee80211com {
 	struct arpcom		ic_ac;
 	LIST_ENTRY(ieee80211com) ic_list;	/* chain of all ieee80211com */
@@ -546,6 +548,17 @@ struct ieee80211com {
 	u_int8_t		ic_globalcnt[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_nonce[EAPOL_KEY_NONCE_LEN];
 	u_int8_t		ic_psk[IEEE80211_PMK_LEN];
+	/* MtkWireless: WPA3-SAE, see ieee80211_sae.c */
+	u_int8_t		ic_sae_password[IEEE80211_SAE_PASSWORD_MAX];
+	u_int			ic_sae_password_len;
+	struct mtk_wlan_sae	*ic_sae;	/* context while authenticating */
+	int			ic_sae_state;
+	u_int16_t		ic_sae_send_confirm;
+	const u_int8_t		*ic_sae_txbuf;	/* body for ieee80211_get_auth */
+	size_t			ic_sae_txlen;
+	u_int32_t		ic_sae_ok;	/* statistics for ioreg */
+	u_int32_t		ic_sae_fail;
+	u_int16_t		ic_sae_last_status;
 	CTimeout*		ic_rsn_timeout;
 	int			ic_tkip_micfail;
 	u_int64_t		ic_tkip_micfail_last_tsc;
@@ -741,6 +754,20 @@ void	ieee80211_set_ess(struct ieee80211com *, struct ieee80211_ess *,
 void    ieee80211_deselect_ess(struct ieee80211com *);
 struct ieee80211_ess *ieee80211_get_ess(struct ieee80211com *, const char *, int);
 void ieee80211_begin_cache_bgscan(struct _ifnet *);
+
+/* MtkWireless: WPA3-SAE station side (ieee80211_sae.c). */
+int	ieee80211_sae_set_password(struct ieee80211com *, const u_int8_t *,
+	    size_t);
+void	ieee80211_sae_forget(struct ieee80211com *);
+int	ieee80211_sae_usable(struct ieee80211com *,
+	    const struct ieee80211_node *);
+void	ieee80211_send_auth_request(struct ieee80211com *,
+	    struct ieee80211_node *);
+void	ieee80211_sae_recv_auth(struct ieee80211com *,
+	    const struct ieee80211_frame *, const u_int8_t *, size_t,
+	    u_int16_t, u_int16_t);
+void	ieee80211_sae_clear(struct ieee80211com *);
+void	ieee80211_try_another_bss(struct ieee80211com *);	/* proto.c */
 
 extern	int ieee80211_cache_size;
 

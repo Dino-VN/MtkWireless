@@ -30,6 +30,7 @@ code = r'''
 #define IEEE80211_C_SHSLOT 4
 #define IEEE80211_C_SHPREAMBLE 8
 #define IEEE80211_C_HE 16
+#define IEEE80211_C_MFP 32
 using IOReturn = int;
 constexpr int kIOReturnSuccess = 0;
 struct OSObject {};
@@ -60,7 +61,7 @@ int main(){
     // Apple80211Scan tests CARD_CAPABILITIES byte 9 bit 1 to encode
     // SCAN_SSID_LIST / SCAN_BSSID_LIST in the modern WCL SCAN_REQ.
     // Instant Hotspot supplies a list even when it contains only one SSID.
-    for(unsigned flags=0;flags<32;++flags){
+    for(unsigned flags=0;flags<64;++flags){
         driver.hal.radio.ic_caps=flags;
         driver.hal.radio.band5=flags&1;
         driver.awdlExperimental=flags&2;
@@ -69,8 +70,11 @@ int main(){
         assert(driver.getCARD_CAPABILITIES(nullptr,&caps)==0);
         assert(caps.version==1);
         assert(caps.capabilities[9]==0x02); // modern SSID/BSSID lists
-        assert(caps.capabilities[2]==0x0e); // WME, SGI20/40; no legacy IOC 86
-        assert(caps.capabilities[5]==0x40); // scan-done notifications
+        bool mfp=flags&IEEE80211_C_MFP;
+        // WME, SGI20/40; no legacy IOC 86. PMF: _getMFPCaps tests 0x11.
+        assert(caps.capabilities[2]==(0x0e|(mfp?0x01:0)));
+        // scan-done notifications; SAE (Apple80211IsAuthSelAllowed bit 3)
+        assert(caps.capabilities[5]==(0x40|(mfp?0x08:0)));
         assert(bool(caps.capabilities[3]&0x20)==driver.hal.radio.band5);
         assert(bool(caps.capabilities[4]&1)==driver.awdlExperimental);
         assert(bool(caps.capabilities[17]&0x80)==bool(flags&IEEE80211_C_HE));
@@ -117,7 +121,49 @@ int main(){
     mtk_wlan_scan_ssids invalid{};invalid.count=7;
     assert(mtk_wlan_scan_ssids_parse(nullptr,1,&invalid)==22 && invalid.count==0);
     assert(mtk_wlan_scan_ssids_parse(modern,sizeof(modern),nullptr)==22);
-    puts("PASS: Instant Hotspot capability, WCL SSID lists, firmware primary/extended targets, passive scans, FFI validation");
+    // WPA3: WCL join with the SAE password (cipher 10), transition mode,
+    // and the PMK-only and SAE-only cases.
+    uint8_t join[0x2cc]{};
+    auto j32=[&](unsigned at,uint32_t n){memcpy(join+at,&n,4);};
+    j32(0x10,1);j32(0x1c,4);memcpy(join+0x20,"home",4);
+    const char *pw="correct horse battery staple, 40+ chars long";
+    size_t pwlen=strlen(pw);
+    j32(0x44,uint32_t(pwlen));j32(0x48,10);memcpy(join+0x50,pw,pwlen);
+    j32(0x214,1);join[0x21c]=2;join[0x221]=1;
+    AirportWCL::JoinRequest jr;
+    j32(0x14,AirportWCL::AuthSAE);
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(jr.keyLength==pwlen && memcmp(jr.key,pw,pwlen)==0);
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Sae);
+    j32(0x14,AirportWCL::AuthSAE|(1u<<3));   // transition: SAE + WPA2-PSK
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Sae);
+    assert(AirportWCL::passphraseKey(jr));
+    j32(0x14,1u<<3);                          // WPA2-PSK given a password
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Personal);
+    j32(0x44,64);memset(join+0x50,'a',64);j32(0x14,AirportWCL::AuthSAE);
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr) && jr.keyLength==64);
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Sae);
+    assert(!AirportWCL::passphraseKey(jr));
+    j32(0x44,65);assert(!AirportWCL::decodeJoin(join,sizeof(join),jr));
+    j32(0x44,32);j32(0x48,6);                // a PMK cannot start SAE
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Invalid);
+    j32(0x14,AirportWCL::AuthSAE|(1u<<3));   // ...but joins the PSK side
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Personal);
+    j32(0x14,AirportWCL::AuthSAE|(1u<<2));   // SAE with 802.1X: refused
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Invalid);
+    // Without PMF the scan copy of a PSK/SAE transition RSN IE is still
+    // narrowed to PSK; SAE-only stays as it is.
+    uint8_t rsn[]={48,24,1,0, 0,0x0f,0xac,4, 1,0,0,0x0f,0xac,4, 2,0,0,0x0f,0xac,2,0,0x0f,0xac,8, 0x80,0};
+    size_t rl=AirportWCL::selectWPA2TransitionMode(rsn,sizeof(rsn));
+    assert(rl==sizeof(rsn)-4 && rsn[1]==20 && rsn[14]==1 && rsn[19]==2 && rsn[20]==0x80);
+    uint8_t only[]={48,20,1,0, 0,0x0f,0xac,4, 1,0,0,0x0f,0xac,4, 1,0,0,0x0f,0xac,8, 0xc0,0};
+    assert(AirportWCL::selectWPA2TransitionMode(only,sizeof(only))==sizeof(only));
+    puts("PASS: Instant Hotspot capability, WCL SSID lists, firmware primary/extended targets, passive scans, FFI validation, PMF/SAE capability, WPA3 join classification");
 }
 '''
 cargo = shutil.which('cargo') or str(Path.home() / '.cargo/bin/cargo')

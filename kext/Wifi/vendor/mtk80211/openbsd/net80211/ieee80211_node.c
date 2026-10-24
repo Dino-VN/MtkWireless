@@ -314,6 +314,8 @@ ieee80211_ess_setwpaparms(struct ieee80211_ess *ess,
         ess->rsnakms |= IEEE80211_AKM_8021X;
     if (wpa->i_akms & IEEE80211_WPA_AKM_SHA256_8021X)
         ess->rsnakms |= IEEE80211_AKM_SHA256_8021X;
+    if (wpa->i_akms & IEEE80211_WPA_AKM_SAE)
+        ess->rsnakms |= IEEE80211_AKM_SAE;
     if (ess->rsnakms == 0)	/* set to default (PSK) */
         ess->rsnakms = IEEE80211_AKM_PSK;
     
@@ -1115,9 +1117,14 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
         if ((ni->ni_rsnakms & ic->ic_rsnakms) == 0)
             fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
         if ((ni->ni_rsnakms & ic->ic_rsnakms &
-             ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK)) == 0) {
-            /* AP only supports PSK AKMPs */
-            if (!(ic->ic_flags & IEEE80211_F_PSK))
+             ~(IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK |
+               IEEE80211_AKM_SAE)) == 0) {
+            /* AP only supports PSK AKMPs. MtkWireless: or SAE, which
+             * needs a password and PMF on both sides. */
+            int psk = (ic->ic_flags & IEEE80211_F_PSK) &&
+                (ni->ni_rsnakms & ic->ic_rsnakms &
+                 (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK));
+            if (!psk && !ieee80211_sae_usable(ic, ni))
                 fail |= IEEE80211_NODE_ASSOCFAIL_WPA_PROTO;
         }
         if (ni->ni_rsngroupcipher != IEEE80211_CIPHER_WEP40 &&
@@ -1606,10 +1613,16 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
     else
         ni->ni_rsnprotos = IEEE80211_PROTO_WPA;
     
+    /* MtkWireless: prefer SAE when a password was given (WPA3 and
+     * WPA3 transition networks); it implies PMF. */
+    int sae = ieee80211_sae_usable(ic, ni);
     /* filter out unsupported AKMPs */
     ni->ni_rsnakms &= ic->ic_rsnakms;
+    ni->ni_flags &= ~IEEE80211_NODE_PMKID;
+    if (sae) {
+        ni->ni_rsnakms = IEEE80211_AKM_SAE;
     /* prefer SHA-256 based AKMPs */
-    if ((ic->ic_flags & IEEE80211_F_PSK) && (ni->ni_rsnakms &
+    } else if ((ic->ic_flags & IEEE80211_F_PSK) && (ni->ni_rsnakms &
                                              (IEEE80211_AKM_PSK | IEEE80211_AKM_SHA256_PSK))) {
         /* AP supports PSK AKMP and a PSK is configured */
         if (ni->ni_rsnakms & IEEE80211_AKM_SHA256_PSK)
@@ -1761,8 +1774,9 @@ ieee80211_node_set_timeouts(struct ieee80211_node *ni)
     memset(ni->ni_addba_req_to, 0, sizeof(ni->ni_addba_req_to) * nitems(ni->ni_addba_req_to));
 #ifndef IEEE80211_STA_ONLY
     timeout_set(&ni->ni_eapol_to, ieee80211_eapol_timeout, ni);
-    timeout_set(&ni->ni_sa_query_to, ieee80211_sa_query_timeout, ni);
 #endif
+    /* MtkWireless: a PMF station queries its AP too (ieee80211_input) */
+    timeout_set(&ni->ni_sa_query_to, ieee80211_sa_query_timeout, ni);
     timeout_set(&ni->ni_addba_req_to[EDCA_AC_BE],
                 ieee80211_node_addba_request_ac_be_to, ni);
     timeout_set(&ni->ni_addba_req_to[EDCA_AC_BK],
@@ -2102,10 +2116,10 @@ ieee80211_free_node(struct ieee80211com *ic, struct ieee80211_node *ni)
 #ifndef IEEE80211_STA_ONLY
     timeout_del(&ni->ni_eapol_to);
     timeout_free(&ni->ni_eapol_to);
-    timeout_del(&ni->ni_sa_query_to);
-    timeout_free(&ni->ni_sa_query_to);
     IEEE80211_AID_CLR(ni->ni_associd, ic->ic_aid_bitmap);
 #endif
+    timeout_del(&ni->ni_sa_query_to);
+    timeout_free(&ni->ni_sa_query_to);
     ieee80211_ba_del(ni);
     ieee80211_ba_free(ni);
     RB_REMOVE(ieee80211_tree, &ic->ic_tree, ni);

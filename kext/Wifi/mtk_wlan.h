@@ -127,6 +127,35 @@ bool mtk_wlan_tx_free_next(mtk_wlan_tx_free_iter *it, mtk_wlan_tx_freed *out);
 bool mtk_wlan_dma_hw_index(uint32_t raw, uint32_t count, uint32_t *out);
 bool mtk_wlan_dma_rx_segment(uint32_t ctrl, uint32_t capacity, uint32_t *len, bool *last);
 
+/* WPA3-Personal SAE, group 19 with hunting-and-pecking
+ * (rust/mtk-ffi/src/sae.rs, rust/mtk-wlan/src/sae). Zero the context before
+ * mtk_wlan_sae_init and clear it when done. Bodies are the Authentication
+ * frame after algorithm, sequence and status. */
+#define MTK_WLAN_SAE_AUTH_ALG 3
+#define MTK_WLAN_SAE_GROUP 19
+#define MTK_WLAN_SAE_COMMIT_MAX (2 + 128 + 32 + 64)
+#define MTK_WLAN_SAE_CONFIRM_LEN (2 + 32)
+#define MTK_WLAN_SAE_STATUS_ANTI_CLOGGING 76
+#define MTK_WLAN_SAE_STATUS_UNSUPPORTED_GROUP 77
+#define MTK_WLAN_SAE_STATUS_H2E 126
+typedef struct mtk_wlan_sae {
+    uint64_t opaque[512 / 8];
+} mtk_wlan_sae;
+int32_t mtk_wlan_sae_init(mtk_wlan_sae *ctx, const uint8_t own[6], const uint8_t peer[6],
+                          const uint8_t *password, size_t password_len);
+/* 35 (EAGAIN): draw new random bytes and call again. */
+int32_t mtk_wlan_sae_commit(mtk_wlan_sae *ctx, const uint8_t rand[32], const uint8_t mask[32]);
+int32_t mtk_wlan_sae_write_commit(mtk_wlan_sae *ctx, uint8_t *out, size_t out_len,
+                                  size_t *written);
+int32_t mtk_wlan_sae_set_token(mtk_wlan_sae *ctx, const uint8_t *body, size_t len);
+int32_t mtk_wlan_sae_process_commit(mtk_wlan_sae *ctx, const uint8_t *body, size_t len);
+int32_t mtk_wlan_sae_write_confirm(mtk_wlan_sae *ctx, uint16_t send_confirm, uint8_t *out,
+                                   size_t out_len, size_t *written);
+/* 80 (EAUTH): confirm mismatch, i.e. wrong password. */
+int32_t mtk_wlan_sae_check_confirm(mtk_wlan_sae *ctx, const uint8_t *body, size_t len);
+int32_t mtk_wlan_sae_keys(mtk_wlan_sae *ctx, uint8_t pmk[32], uint8_t pmkid[16]);
+void mtk_wlan_sae_clear(mtk_wlan_sae *ctx);
+
 #ifdef __cplusplus
 }
 #endif

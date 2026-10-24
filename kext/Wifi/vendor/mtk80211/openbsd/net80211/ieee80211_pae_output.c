@@ -106,8 +106,11 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
     EAPOL_KEY_DESC_IEEE80211 : EAPOL_KEY_DESC_WPA;
     
     info = BE_READ_2(key->info);
+    /* MtkWireless: SAE uses the AKM-defined descriptor version 0 */
+    if (ieee80211_is_sae_akm((enum ieee80211_akm)ni->ni_rsnakms))
+        info |= EAPOL_KEY_DESC_V0;
     /* use V3 descriptor if KDF is SHA256-based */
-    if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms))
+    else if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms))
         info |= EAPOL_KEY_DESC_V3;
     /* use V2 descriptor if pairwise or group cipher is CCMP */
     else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||

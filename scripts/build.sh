@@ -157,6 +157,7 @@ WIFI_VENDOR_SOURCES=(
     $V/mtk80211/openbsd/net80211/CTimeout.cpp $V/mtk80211/openbsd/net80211/ieee80211_crypto.c
     $V/mtk80211/openbsd/net80211/ieee80211_amrr.c $V/mtk80211/openbsd/net80211/ieee80211_regdomain.c
     $V/mtk80211/openbsd/net80211/ieee80211_crypto_bip.c $V/mtk80211/openbsd/net80211/timeout.c
+    $V/mtk80211/openbsd/net80211/ieee80211_sae.c
     $V/mtk80211/openbsd/crypto/sha1-pbkdf2.c $V/mtk80211/openbsd/sys/_ifq.cpp $V/include/HAL/MtkHalService.cpp
     $V/mtk80211/openbsd/net80211/ieee80211_node.c $V/mtk80211/openbsd/crypto/cast.c $V/mtk80211/openbsd/net80211/_string.c
     $V/mtk80211/openbsd/crypto/aes.c $V/mtk80211/openbsd/net80211/ieee80211_proto.c

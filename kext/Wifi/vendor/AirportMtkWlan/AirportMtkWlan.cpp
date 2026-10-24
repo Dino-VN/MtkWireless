@@ -865,6 +865,15 @@ getCARD_CAPABILITIES(OSObject *object,
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)
         cd->capabilities[17] |= 0x80;
+    // MtkWireless: IO80211.framework (Tahoe 25G) _getMFPCaps offers PMF only
+    // when byte 2 has 0x11 set (bit 0 used here; bit 4 sits with WoW), and
+    // Apple80211IsAuthSelAllowed / Apple80211Associate2 allow WPA3-SAE only
+    // with byte 5 bit 3 ("SAE is not supported" otherwise). The driver does
+    // SAE itself from the password WCL passes (cipher APPLE80211_CIPHER_PWD).
+    if (caps & IEEE80211_C_MFP) {
+        cd->capabilities[2] |= 0x01;
+        cd->capabilities[5] |= 0x08;
+    }
     return kIOReturnSuccess;
 }
 

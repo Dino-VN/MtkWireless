@@ -12,6 +12,7 @@
 #include <net80211/ieee80211_node.h>
 #include <net80211/ieee80211_ioctl.h>
 #include <net80211/ieee80211_priv.h>
+#include <crypto/sha1.h>
 
 extern IOCommandGate *_fCommandGate;
 
@@ -107,6 +108,7 @@ void AirportMtkSkywalkInterface::stopWCL()
         ic->ic_wcl_join_requested = false;
         ic->ic_wcl_scan_requested = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+        ieee80211_sae_forget(ic);
     }
 }
 
@@ -350,8 +352,11 @@ void AirportMtkSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, co
     metadata->capability = node->ni_capinfo;
     metadata->flags = AirportWCL::SSIDPresent | AirportWCL::RSSIValid;
     memcpy(metadata + 1, ies, length);
-    metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
-        reinterpret_cast<uint8_t *>(metadata + 1), length));
+    // MtkWireless: with PMF the driver does SAE, so WCL sees PSK/SAE
+    // transition networks as they are; without it they stay WPA2-PSK.
+    if (!(ic->ic_caps & IEEE80211_C_MFP))
+        metadata->ieLength = uint32_t(AirportWCL::selectWPA2TransitionMode(
+            reinterpret_cast<uint8_t *>(metadata + 1), length));
     size_t messageSize = sizeof(*metadata) + metadata->ieLength;
     if (assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID)) {
         wclBssValid = messageSize <= sizeof(wclBssInfo);
@@ -446,8 +451,17 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     auto auth = AirportWCL::classifyLegacyAuth(join);
     bool personal = auth == AirportWCL::LegacyAuth::Personal;
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
-    bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
+    // MtkWireless: WPA3-Personal. SAE needs PMF (amtk_pmf=0 turns it off);
+    // a transition network then still joins with the PSK side.
+    const uint32_t pskAuth = APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK |
+        APPLE80211_AUTHTYPE_SHA256_PSK;
+    bool sae = auth == AirportWCL::LegacyAuth::Sae && (ic->ic_caps & IEEE80211_C_MFP);
+    bool pskSide = personal || (auth == AirportWCL::LegacyAuth::Sae &&
+        (join.upperAuth & pskAuth) && AirportWCL::passphraseKey(join));
+    if (auth == AirportWCL::LegacyAuth::Sae && !sae && !pskSide)
+        auth = AirportWCL::LegacyAuth::Invalid;
+    bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     WCL_LOG("join ssid_len=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x chspec=0x%04x auth=%d "
             "lower=0x%x upper=0x%x key_len=%u cipher=%u rsn_len=%u state=%d if_flags=0x%x "
             "join_pending=%d scan_pending=%d mac_reconfig=%d bgscan=%d\n",
@@ -487,11 +501,12 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+    ieee80211_sae_forget(ic);
     clearWCLPMKSA();
     ic->ic_flags &= ~(IEEE80211_F_AUTO_JOIN | IEEE80211_F_PSK);
     ic->ic_wcl_enterprise = enterprise;
 
-    if (personal || enterprise) {
+    if (personal || enterprise || sae || pskSide) {
         ieee80211_wpaparams wpa = {};
         wpa.i_enabled = 1;
         if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA_PSK))
@@ -507,6 +522,10 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_PSK;
         if (join.upperAuth & APPLE80211_AUTHTYPE_SHA256_8021X)
             wpa.i_akms |= IEEE80211_WPA_AKM_SHA256_8021X;
+        if (sae) {
+            wpa.i_protos |= IEEE80211_WPA_PROTO_WPA2;
+            wpa.i_akms |= IEEE80211_WPA_AKM_SAE;
+        }
         wpa.i_ciphers = IEEE80211_WPA_CIPHER_CCMP | IEEE80211_WPA_CIPHER_TKIP;
         if (join.rsnLength >= 8 && join.rsn[0] == IEEE80211_ELEMID_RSN &&
             join.rsn[4] == 0 && join.rsn[5] == 0x0f && join.rsn[6] == 0xac) {
@@ -520,10 +539,24 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
                     error, wpa.i_protos, wpa.i_akms);
             return kIOReturnBadArgument;
         }
-        if (personal) {
+        if (sae && ieee80211_sae_set_password(ic, join.key, join.keyLength)) {
+            explicit_bzero(&join, sizeof(join));
+            WCL_LOG("join rejected: SAE password\n");
+            return kIOReturnBadArgument;
+        }
+        if (pskSide && join.keyCipher == AirportWCL::CipherPassword) {
+            // PSK = PBKDF2-SHA1(passphrase, SSID, 4096, 256): the PSK side
+            // of a transition network, or a password for WPA2-PSK.
+            char passphrase[64] = {};
+            memcpy(passphrase, join.key, join.keyLength);
+            pbkdf2_sha1(passphrase, join.ssid, join.ssidLength, 4096,
+                        ic->ic_psk, sizeof(ic->ic_psk));
+            explicit_bzero(passphrase, sizeof(passphrase));
+            ic->ic_flags |= IEEE80211_F_PSK;
+        } else if (pskSide) {
             memcpy(ic->ic_psk, join.key, sizeof(ic->ic_psk));
             ic->ic_flags |= IEEE80211_F_PSK;
-        } else if (join.keyLength == IEEE80211_PMK_LEN) {
+        } else if (enterprise && join.keyLength == IEEE80211_PMK_LEN) {
             bool cached = true;
             if (join.upperAuth & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA2))
                 cached = ieee80211_pmksa_add(ic, IEEE80211_AKM_8021X, join.bssid, join.key, 0) != nullptr;
@@ -572,6 +605,7 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
         clearWCLPMKSA();
         ic->ic_wcl_enterprise = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+        ieee80211_sae_forget(ic);
         return kIOReturnError;
     }
     return kIOReturnSuccess;
@@ -616,6 +650,7 @@ void AirportMtkSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason,
         clearWCLPMKSA();
         ic->ic_wcl_enterprise = false;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+        ieee80211_sae_forget(ic);
     }
 }
 
@@ -648,6 +683,7 @@ IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+    ieee80211_sae_forget(ic);
     clearWCLPMKSA();
     ic->ic_wcl_enterprise = false;
     ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
@@ -725,6 +761,7 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
                 clearWCLPMKSA();
                 ic->ic_wcl_enterprise = false;
                 explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+                ieee80211_sae_forget(ic);
             }
             // An address application is requested by WCL itself, not a new
             // adapter reset. Replaying firmware-load events here rotates the
