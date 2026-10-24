@@ -19,12 +19,22 @@
 #include <IOKit/usb/IOUSBHostPipe.h>
 
 #include "mtk_bt.h"
+#include "msbc/UsbMsbcBridge.hpp"
+#include "msbc/UsbMsbcScope.hpp"
 
 #define DRV_NAME "mtkbt"
 
 namespace {
 
 mach_vm_address_t orgFindQueuedRequest, orgDeviceRequest, orgPipeIo, orgPipeIoSync, orgCopyPipe;
+mach_vm_address_t orgIsoIo, orgSelectAlternateSetting, orgInterfaceClose, orgGetPipeProperties;
+UsbMsbcBridge *msbcBridge;
+bool msbcReady;
+
+bool isMsbcReady()
+{
+    return __atomic_load_n(&msbcReady, __ATOMIC_ACQUIRE);
+}
 
 uint32_t rustFailed;
 bool randomAddressHack;
@@ -32,8 +42,9 @@ bool leShimEnabled;
 IOLock *leLock;
 volatile SInt32 readClockRewritten, aclPbRewritten;
 volatile SInt32 leCommands, leCompletions, leErrors;
-bool extAdvPatchRouted;
+bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
+volatile SInt32 bluetoothdWbsPatched, bluetoothdHfpFillPatched;
 
 void publishCounters()
 {
@@ -60,11 +71,13 @@ void publishCounters()
     number("LeFeaturesCommands", (uint32_t)leCommands);
     number("LeFeaturesCompletions", (uint32_t)leCompletions);
     number("LeFeaturesErrors", (uint32_t)leErrors);
-    d->setObject("BluetoothdExtAdvRouted", extAdvPatchRouted ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdExtAdvRouted", extAdvPatchEnabled && extAdvPatchRouted ? kOSBooleanTrue : kOSBooleanFalse);
     number("BluetoothdPages", (uint32_t)bluetoothdPages);
     number("BluetoothdExtAdvPatched", (uint32_t)bluetoothdPatched);
     number("BluetoothdAdvAddressPatched", (uint32_t)bluetoothdAddressPatched);
     number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
+    number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);
+    number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);
     res->setProperty("MtkWirelessBT", d);
     d->release();
 }
@@ -386,11 +399,64 @@ IOReturn pipeIoSync(void *that, IOMemoryDescriptor *buffer, uint32_t length, uin
     return status;
 }
 
-/* Remember which interrupt IN pipe carries HCI events of a loaded MediaTek
- * controller. Pipe addresses are lookup keys only. */
+IOReturn isoIo(IOUSBHostPipe *pipe, IOMemoryDescriptor *data, IOUSBHostIsochronousFrame *frames,
+               uint32_t count, uint64_t firstFrame, IOUSBHostIsochronousCompletion *completion)
+{
+    auto original = reinterpret_cast<UsbMsbcBridge::IsoIo>(orgIsoIo);
+    if (isMsbcReady() && msbcBridge && msbcBridge->handlesPipe(pipe))
+        return msbcBridge->io(pipe, data, frames, count, firstFrame, completion, original);
+    return original(pipe, data, frames, count, firstFrame, completion);
+}
+
+IOReturn selectAlternateSetting(IOUSBHostInterface *interface, uint8_t alternate)
+{
+    const bool cached = isMsbcReady() && msbcBridge && msbcCachedScoInterface(interface);
+    const bool scoped = cached || (isMsbcReady() && msbcBridge && msbcBridge->ownsInterface(interface));
+    const bool mapped = cached && alternate == 4;
+    const uint64_t generation = scoped ? msbcBridge->beginInterfaceChange() : 0;
+    IOReturn result = FunctionCast(selectAlternateSetting, orgSelectAlternateSetting)(interface, mapped ? 6 : alternate);
+    if (scoped && result == kIOReturnSuccess) {
+        msbcBridge->detach(generation);
+        if (mapped && !msbcBridge->bindPhysicalInterface(interface, generation))
+            return kIOReturnAborted;
+    }
+    return result;
+}
+
+void interfaceClose(IOUSBHostInterface *interface, IOService *client, IOOptionBits options)
+{
+    const bool scoped = isMsbcReady() && msbcBridge &&
+        (msbcBridge->ownsInterface(interface) || msbcCachedScoInterface(interface));
+    const uint64_t generation = scoped ? msbcBridge->beginInterfaceChange() : 0;
+    FunctionCast(interfaceClose, orgInterfaceClose)(interface, client, options);
+    if (scoped)
+        msbcBridge->detach(generation);
+}
+
+IOReturn getPipeProperties(IOService *client, uint8_t pipeRef, uint64_t *direction,
+                          uint64_t *number, uint64_t *type, uint64_t *maxPacket, uint64_t *interval)
+{
+    IOReturn result = FunctionCast(getPipeProperties, orgGetPipeProperties)(client, pipeRef, direction,
+        number, type, maxPacket, interval);
+    if (result != kIOReturnSuccess || !isMsbcReady() || !msbcBridge || !client)
+        return result;
+    auto *interface = OSDynamicCast(IOUSBHostInterface, client->getProvider());
+    // Keep native PCM at 33 bytes; only the MTK wire pipe uses 63-byte mSBC packets.
+    if (msbcCachedScoInterface(interface) && msbcBridge->mapsPhysicalInterface(interface) &&
+        direction && number && type && maxPacket && interval && *direction <= 1 &&
+        *number == 3 && *type == 1 && *maxPacket == MtkMsbcStream::kWirePacket && *interval == 4)
+        *maxPacket = 33;
+    return result;
+}
+
+/* Keep SCO observation independent of the LE event shim. Pipe addresses are
+ * lookup keys only; the bridge rejects foreign cached USB identities first. */
 IOUSBHostPipe *copyPipe(IOUSBHostInterface *interface, uint8_t address)
 {
     IOUSBHostPipe *pipe = FunctionCast(copyPipe, orgCopyPipe)(interface, address);
+    if ((address == 0x03 || address == 0x83) && isMsbcReady() && msbcBridge &&
+        msbcBridge->observePipe(interface, pipe))
+        msbcBridge->publishStatus();
     if (!leShimEnabled || !pipe)
         return pipe;
     const auto *ep = pipe->getEndpointDescriptor();
@@ -432,6 +498,61 @@ bool route(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size
     return true;
 }
 
+void installMsbcBridge(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
+                       bool copyPipeRouted)
+{
+    if (getKernelVersion() != KernelVersion::Tahoe || !checkKernelArgument("-mtkbtmsbc") ||
+        !copyPipeRouted || !orgCopyPipe)
+        return;
+    KernelPatcher::RouteRequest routes[] {
+        {"__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorP25IOUSBHostIsochronousFramejyP30IOUSBHostIsochronousCompletion",
+         reinterpret_cast<void *>(isoIo), orgIsoIo},
+        {"__ZN18IOUSBHostInterface22selectAlternateSettingEh",
+         reinterpret_cast<void *>(selectAlternateSetting), orgSelectAlternateSetting},
+        {"__ZN18IOUSBHostInterface5closeEP9IOServicej", reinterpret_cast<void *>(interfaceClose), orgInterfaceClose},
+        {"__ZN31AppleUSBHostInterfaceUserClient17GetPipePropertiesEhPyS0_S0_S0_S0_",
+         reinterpret_cast<void *>(getPipeProperties), orgGetPipeProperties}
+    };
+    // Resolve every ABI before routing; partial routes stay inert without readiness.
+    for (auto &request : routes) {
+        request.from = patcher.solveSymbol(index, request.symbol, address, size);
+        if (!request.from || patcher.getError() != KernelPatcher::Error::NoError) {
+            SYSLOG(DRV_NAME, "mSBC bridge symbol unavailable: %s", request.symbol);
+            patcher.clearError();
+            return;
+        }
+    }
+    auto *bridge = UsbMsbcBridge::create();
+    if (!bridge) {
+        SYSLOG(DRV_NAME, "mSBC bridge allocation failed");
+        return;
+    }
+    msbcBridge = bridge;
+    const bool routed = patcher.routeMultiple(index, routes, arrsize(routes), address, size);
+    if (!routed || patcher.getError() != KernelPatcher::Error::NoError ||
+        !orgIsoIo || !orgSelectAlternateSetting || !orgInterfaceClose || !orgGetPipeProperties) {
+        SYSLOG(DRV_NAME, "mSBC bridge routes incomplete; native WBS remains disabled");
+        patcher.clearError();
+        msbcBridge = nullptr;
+        bridge->release();
+        return;
+    }
+    auto *resource = IOService::getResourceService();
+    if (!resource) {
+        msbcBridge = nullptr;
+        bridge->release();
+        return;
+    }
+    if (!resource->setProperty("MtkBtMsbcBridgeReady", kOSBooleanTrue)) {
+        msbcBridge = nullptr;
+        bridge->release();
+        return;
+    }
+    __atomic_store_n(&msbcReady, true, __ATOMIC_RELEASE);
+    bridge->publishStatus();
+    SYSLOG(DRV_NAME, "opt-in MT7922 USB mSBC bridge ready");
+}
+
 void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size)
 {
     if (index == kextIOBluetoothFamily.loadIndex) {
@@ -454,6 +575,7 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
                               reinterpret_cast<void *>(pipeIoSync), orgPipeIoSync);
     const bool pipes = route(patcher, index, address, size, "__ZN18IOUSBHostInterface8copyPipeEh",
                              reinterpret_cast<void *>(copyPipe), orgCopyPipe);
+    installMsbcBridge(patcher, index, address, size, pipes);
     leShimEnabled = leLock && io && request && ioSync && pipes && !checkKernelArgument("-mtkbtnolefix");
     SYSLOG(DRV_NAME, "MediaTek LE feature-mask USB shim %s", leShimEnabled ? "enabled" : "unavailable");
     publishCounters();
@@ -534,6 +656,57 @@ const uint8_t advAddressRetryReplace[] {
     0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
 static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace), "address retry patch size");
 
+// Enable chipset 0 only alongside the MT7922 USB software-codec bridge.
+// shortcut: exact Tahoe signature; re-audit the gate before supporting another build.
+static const uint8_t kMtkWbsOriginal[] =
+{
+    0x55, 0x48, 0x89, 0xE5, 0xE8, 0x31, 0xFD, 0x01,
+    0x00, 0x8B, 0x88, 0x34, 0x03, 0x00, 0x00, 0x8D,
+    0x41, 0xFF, 0x3D, 0xCE, 0x07, 0x00, 0x00, 0x77,
+    0x10, 0xB0, 0x01, 0x83, 0xF9, 0x0A, 0x73, 0x28,
+    0xB8, 0xF3, 0x01, 0x00, 0x00, 0xD3, 0xE8, 0xEB,
+    0x1F, 0x8D, 0x91, 0x30, 0xF8, 0xFF, 0xFF, 0xB0,
+    0x01, 0x81, 0xFA, 0xD0, 0x07, 0x00, 0x00, 0x72,
+    0x0F, 0x81, 0xC1, 0x60, 0xF0, 0xFF, 0xFF, 0x81,
+    0xF9, 0xD0, 0x07, 0x00, 0x00, 0x0F, 0x92, 0xC0,
+    0x24, 0x01, 0x5D, 0xC3
+};
+
+static const uint8_t kMtkWbsPatched[] =
+{
+    0x55, 0x48, 0x89, 0xE5, 0xE8, 0x31, 0xFD, 0x01,
+    0x00, 0x8B, 0x88, 0x34, 0x03, 0x00, 0x00, 0x8D,
+    0x41, 0x00, 0x3D, 0xCF, 0x07, 0x00, 0x00, 0x77,
+    0x10, 0xB0, 0x01, 0x83, 0xF9, 0x0A, 0x73, 0x28,
+    0xB8, 0xF3, 0x01, 0x00, 0x00, 0xD3, 0xE8, 0xEB,
+    0x1F, 0x8D, 0x91, 0x30, 0xF8, 0xFF, 0xFF, 0xB0,
+    0x01, 0x81, 0xFA, 0xD0, 0x07, 0x00, 0x00, 0x72,
+    0x0F, 0x81, 0xC1, 0x60, 0xF0, 0xFF, 0xFF, 0x81,
+    0xF9, 0xD0, 0x07, 0x00, 0x00, 0x0F, 0x92, 0xC0,
+    0x24, 0x01, 0x5D, 0xC3
+};
+
+// Fill one complete PCM chunk per timer send: no oversized burst or partial
+// tail can overflow or wrap the native outstanding-byte counter.
+static const uint8_t kMtkHfpFillOriginal[] =
+{
+    0x48, 0x0F, 0xAF, 0xD0, 0x4C, 0x89, 0xF6, 0xE8,
+    0x3B, 0x2F, 0xFD, 0xFF, 0x48, 0x85, 0xC0, 0x0F,
+    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xC4,
+    0x48, 0x89, 0x83, 0xD0, 0x00, 0x00, 0x00
+};
+
+static const uint8_t kMtkHfpFillPatched[] =
+{
+    0x0F, 0x1F, 0x40, 0x00, 0x4C, 0x89, 0xF6, 0xE8,
+    0x3B, 0x2F, 0xFD, 0xFF, 0x48, 0x85, 0xC0, 0x0F,
+    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xC4,
+    0x48, 0x89, 0x83, 0xD0, 0x00, 0x00, 0x00
+};
+
+static_assert(sizeof(kMtkWbsOriginal) == sizeof(kMtkWbsPatched), "wideband patch size");
+static_assert(sizeof(kMtkHfpFillOriginal) == sizeof(kMtkHfpFillPatched), "HFP fill patch size");
+
 mach_vm_address_t orgCsValidatePage;
 
 // Lilu's user patcher is off on Big Sur and later (kern_start.cpp), so
@@ -550,21 +723,35 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
         return;
     // Page-in path: count only; the next publishCounters() reports it.
     OSIncrementAtomic(&bluetoothdPages);
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, extAdvFind, sizeof(extAdvFind),
-                                      extAdvReplace, sizeof(extAdvReplace))) {
-        OSIncrementAtomic(&bluetoothdPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd extended-advertising check");
+    if (msbcPatchEnabled && isMsbcReady()) {
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                kMtkWbsOriginal, sizeof(kMtkWbsOriginal), kMtkWbsPatched, sizeof(kMtkWbsPatched))) {
+            OSIncrementAtomic(&bluetoothdWbsPatched);
+            SYSLOG(DRV_NAME, "enabled MediaTek HFP wideband with USB mSBC bridge ready");
+        }
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                kMtkHfpFillOriginal, sizeof(kMtkHfpFillOriginal), kMtkHfpFillPatched, sizeof(kMtkHfpFillPatched))) {
+            OSIncrementAtomic(&bluetoothdHfpFillPatched);
+            SYSLOG(DRV_NAME, "limited MediaTek HFP sender to complete PCM chunks");
+        }
     }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind,
-                                      sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace))) {
-        OSIncrementAtomic(&bluetoothdAddressPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd per-set advertising address gate");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind,
-                                      sizeof(advAddressRetryFind), advAddressRetryReplace,
-                                      sizeof(advAddressRetryReplace))) {
-        OSIncrementAtomic(&bluetoothdAddressRetryPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd random address initialization before enable");
+    if (extAdvPatchEnabled) {
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, extAdvFind, sizeof(extAdvFind),
+                                          extAdvReplace, sizeof(extAdvReplace))) {
+            OSIncrementAtomic(&bluetoothdPatched);
+            SYSLOG(DRV_NAME, "patched bluetoothd extended-advertising check");
+        }
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind,
+                                          sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace))) {
+            OSIncrementAtomic(&bluetoothdAddressPatched);
+            SYSLOG(DRV_NAME, "patched bluetoothd per-set advertising address gate");
+        }
+        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind,
+                                          sizeof(advAddressRetryFind), advAddressRetryReplace,
+                                          sizeof(advAddressRetryReplace))) {
+            OSIncrementAtomic(&bluetoothdAddressRetryPatched);
+            SYSLOG(DRV_NAME, "patched bluetoothd random address initialization before enable");
+        }
     }
 }
 
@@ -574,7 +761,7 @@ void processPatcher(void *, KernelPatcher &patcher)
     extAdvPatchRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
     if (!extAdvPatchRouted)
         patcher.clearError();
-    SYSLOG(DRV_NAME, "bluetoothd extended-advertising patch %s", extAdvPatchRouted ? "routed" : "failed to route");
+    SYSLOG(DRV_NAME, "bluetoothd page patches %s", extAdvPatchRouted ? "routed" : "failed to route");
     publishCounters();
 }
 
@@ -587,8 +774,10 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         lilu.onKextLoadForce(&kextIOBluetoothFamily, 1, processKext);
     } else {
         leLock = IOLockAlloc();
+        extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
+        msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && checkKernelArgument("-mtkbtmsbc");
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
-        if (!checkKernelArgument("-mtkbtnoextadv"))
+        if (extAdvPatchEnabled || msbcPatchEnabled)
             lilu.onPatcherLoadForce(processPatcher);
     }
     publishCounters();

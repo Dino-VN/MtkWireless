@@ -137,13 +137,27 @@ link_kext() {
 # --- MtkWirelessBT ---------------------------------------------------------
 BT_LIB="$(rust_lib bt)"
 BT_GEN="$ROOT/build/gen/bt"
+BT_MSBC="$ROOT/kext/BT/msbc"
+BT_MSBC_SCALAR=(-mno-sse -mno-sse2 -mno-mmx -fno-vectorize -fno-slp-vectorize)
 python3 scripts/embed_firmware.py mtkbt "$BT_GEN" firmware/bt/*.bin
 compile "$OBJ/bt" "${CXXFLAGS[@]}" -DPRODUCT_NAME=MtkWirelessBT -isystem "$LILU" "${BT_INCLUDES[@]}" \
-    -I "$ROOT/kext/BT" -I "$ROOT/kext/common" -I "$BT_GEN" \
+    -I "$ROOT/kext/BT" -I "$ROOT/kext/common" -I "$BT_GEN" -I "$BT_MSBC" \
     -- kext/BT/MtkWirelessBT.cpp kext/BT/BtLoader.cpp kext/BT/USBDeviceController.cpp kext/BT/Patcher.cpp \
        kext/common/EmbeddedFirmware.cpp "$LILU/Library/plugin_start.cpp" "$BT_GEN/firmware.s"
+compile "$OBJ/bt-msbc" "${CXXFLAGS[@]}" "${BT_INCLUDES[@]}" "${BT_MSBC_SCALAR[@]}" \
+    -- "$BT_MSBC/UsbMsbcBridge.cpp" "$BT_MSBC/MtkMsbcStream.cpp" "$BT_MSBC/MtkMsbcCodec.cpp"
+for source in sbc bits; do
+    object="$OBJ/bt-msbc/$source.o"
+    "$CC" "${TARGET[@]}" "${CFLAGS[@]}" "${BT_INCLUDES[@]}" "${BT_MSBC_SCALAR[@]}" -std=c11 \
+        -I "$BT_MSBC/vendor/google-libsbc/include" -I "$BT_MSBC/vendor/google-libsbc/src" \
+        -c "$BT_MSBC/vendor/google-libsbc/src/$source.c" -o "$object"
+    OBJS+=("$object")
+done
 link_kext MtkWirelessBT com.dinovn.MtkWirelessBT "$OUT" kext/BT/Info.plist "$BT_LIB" \
     MtkWirelessBT_kern_start MtkWirelessBT_kern_stop
+mkdir -p "$OUT/MtkWirelessBT.kext/Contents/Resources"
+cp "$BT_MSBC/vendor/google-libsbc/LICENSE" "$OUT/MtkWirelessBT.kext/Contents/Resources/google-libsbc-LICENSE.txt"
+cp "$BT_MSBC/vendor/google-libsbc/UPSTREAM.md" "$OUT/MtkWirelessBT.kext/Contents/Resources/google-libsbc-NOTICE.txt"
 
 # --- MtkWirelessWifi (macOS 26 Tahoe) ---------------------------------------
 # Sources and flags of SimpleMtkWlan's AirportMtkWlan target (vendored at
@@ -206,4 +220,4 @@ for variant in Tahoe:__MAC_26_0; do
     link_kext MtkWirelessWifi com.dinovn.MtkWirelessWifi "$OUT" kext/Wifi/Info.plist "$WIFI_LIB" 0 0
 done
 
-scripts/check.sh "$CONF"
+bash scripts/check.sh "$CONF"
