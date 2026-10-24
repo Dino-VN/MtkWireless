@@ -746,6 +746,12 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataRxWrongDestination",dataRxWrongDestination,64);
     setProperty("MTKAWDLDataRxReplay",dataRxReplay,64);
     setProperty("MTKAWDLDataRxDecoded",dataRxDecoded,64);
+    setProperty("MTKAWDLDataRxDuplicate",dataRxDuplicate,64);
+    setProperty("MTKAWDLDataRxTooOld",dataRxTooOld,64);
+    setProperty("MTKAWDLDataRxTraceVersion",static_cast<uint64_t>(1),32);
+    setProperty("MTKAWDLDataRxTraceCount",dataRxTraceCount,64);
+    setProperty("MTKAWDLDataRxTrace",dataRxTrace,sizeof(dataRxTrace));
+    setProperty("MTKAWDLDataRxLastRejected",&dataRxLastRejected,sizeof(dataRxLastRejected));
     setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     setProperty("MTKAWDLServiceTicks",serviceTicks,64);
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
@@ -1267,6 +1273,28 @@ void AirportMtkAwdlInterface::serviceInGate()
     timer->setTimeoutUS(static_cast<uint32_t>(delay));
 }
 
+void AirportMtkAwdlInterface::recordDataRx(const uint8_t *f,const mtkawdl::DataView &view,
+    uint64_t now,uint8_t channel,int8_t rssi,uint16_t previous,uint64_t bitmap,bool accepted)
+{
+    auto &sample=dataRxTrace[dataRxTraceCount++%64];
+    memset(&sample,0,sizeof(sample));
+    sample.timeUS=now; sample.previousBitmap=bitmap;
+    sample.sequence=view.sequence; sample.previousSequence=previous;
+    sample.mpduSequence=mtkawdl::le16(f+22)>>4;
+    sample.payloadLength=view.length;
+    sample.result=1; sample.channel=channel; sample.rssi=rssi;
+    if(!accepted) {
+        uint16_t back=previous-view.sequence;
+        sample.result=back<64 ? 2 : 3;
+        if(back<64) ++dataRxDuplicate; else ++dataRxTooOld;
+    }
+    memcpy(sample.source,view.source,6); memcpy(sample.destination,view.destination,6);
+    memcpy(sample.header,f,sizeof(sample.header));
+    size_t length=view.length<sizeof(sample.prefix) ? view.length : sizeof(sample.prefix);
+    sample.prefixLength=length; memcpy(sample.prefix,view.payload,length);
+    if(!accepted) dataRxLastRejected=sample;
+}
+
 bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,uint8_t channel,int8_t rssi)
 {
     auto self=static_cast<AirportMtkAwdlInterface *>(context);
@@ -1350,7 +1378,9 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
     }
     // Validate the whole aggregate before delivering any subframe. Each
     // subframe carries its own AWDL sequence; MPDU sequence is insufficient
-    // after hardware deaggregation. Keep the peer replay window per MSDU.
+    // after hardware deaggregation. Non-QoS and each QoS TID have independent
+    // sequence domains; a different stream must never advance this window.
+    unsigned stream=f[0]==0x88 ? f[24]&15 : 16;
     size_t at=mtkawdl::dataHeaderLength(f,n);
     while(at<n) {
         mtkawdl::DataView view={};
@@ -1360,7 +1390,18 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         if(memcmp(view.destination,self->state.mac,6) && !(view.destination[0]&1)) {
             ++self->dataRxWrongDestination; continue;
         }
-        if(!self->state.acceptData(self->dataPeers.entries[peer].replayState,view.sequence)) {
+#ifdef KERNEL
+        // Metadata is retained in the heap-owned trace and published by the
+        // scheduler once per second, never allocated/published in RX itself.
+        const auto &window=self->dataPeers.entries[peer].windows[stream];
+        uint16_t previous=window.sequence;
+        uint64_t bitmap=window.bitmap;
+#endif
+        bool accepted=self->dataPeers.acceptData(peer,stream,view.sequence,now);
+#ifdef KERNEL
+        self->recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted);
+#endif
+        if(!accepted) {
             ++self->dataRxReplay; continue;
         }
         uint8_t eth[1514];

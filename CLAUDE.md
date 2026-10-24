@@ -67,22 +67,25 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 - While associated, AWDL may leave the AP's channel only behind a power-save
   handshake: `MtkMwx::awdlInfraSleep` sends Null data PM=1 to the AP before an
-  off-channel ROC (awdlReserve waits 2 ms after it and caps the ROC at 40 ms),
+  off-channel ROC (awdlReserve waits 2 ms after it and caps the ROC at 300 ms;
+  the grant counts from its arrival, and 40 ms expired before the window),
   `awdlInfraWakeIfIdle` sends PM=0 once no such ROC is pending/granted. An
   unannounced switch got us disassociated within ~2 s (2026-10-24: ROC to
   channel 6 on AP channel 149). Without leaving, AirDrop fails: the iPhone is
   only heard on channel 6, peers flap and Bonjour resolve times out
   (`missingEndpoint`). Boot-arg `amtk_awdl_offchan=0` restores the AP-channel
   only mode (`awdlOnlyChannel`, `planRadio`'s `onlyChannel`). Unverified on
-  hardware; ioreg `MTKAWDLInfraPS*` counts the handshakes.
+  hardware for AirDrop; 0.1.3 ran 81 handshakes with the AP link intact.
+  ioreg `MTKAWDLInfraPS*` counts the handshakes.
 - Unassociated, Wi-Fi scans and joins win over AWDL: `mt7921_mcu_hw_scan`
   suspends scans for AWDL only while associated (RUN), otherwise it aborts
   the AWDL ROC and scans; `awdlReserve` refuses ROC during a scan and while
   `mwx_awdl_infra_joining` (AUTH/ASSOC, or RUN with the RSN port not yet
   valid). Suspending every scan while AWDL was on made all joins fail with
   -3905 while AirDrop was open (2026-10-24).
-- Firmware ROC grants take tens of ms (seen up to ~240 ms; the lead
-  estimator then plans ~140 ms ahead). While associated, `planRadio`'s
+- Firmware ROC grant latency while associated (0.1.3 histogram): on the AP
+  channel 20-40 ms, off it 80-160 ms (one >160 ms); the lead estimator then
+  plans ~156 ms ahead. While associated, `planRadio`'s
   `homeChannel` (the AP channel) lets one grant span trailing idle slots up
   to the next off-channel window instead of a ROC per window. ioreg
   `MTKAWDLROCLatency{Unassoc,APChannel,OffChannel}` histograms grant latency
@@ -108,6 +111,20 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 - `0xFD3C` LE feature mask is rejected by MediaTek; the shim turns the
   rejection into Command Complete (docs/BLE-ADVERTISING.md). Unverified on
   hardware.
+- BLE advertising (AirDrop, Nearby) never started: bluetoothd's chip table
+  (`[this+0x334]` chip ID) gives a THIRD_PARTY_DONGLE no extended / BT-spec
+  advertising sets, so `LE_InitMultipleAdvertising` returns 0x98 and
+  LeBroadcaster logs `status = 0x0098`; no HCI command fails. Prefs cannot
+  fix it (`LE/SupportsMultipleAdvertising` sets another flag,
+  `AE/DisableExtAdvertising` only disables). `Patcher.cpp` routes
+  `_cs_validate_page` and patches bluetoothd's extended-advertising check to
+  return true as its page is validated (77-byte x86_64 pattern, macOS 26.7.1
+  25G241; `-mtkbtnoextadv` off). Lilu's user patcher (`onProcLoad`) is off on
+  Big Sur+ (`isUserDisabled` in Lilu's kern_start.cpp), so it cannot be used;
+  BlueToolFixup/RestrictEvents use the same page route. ioreg `MtkWirelessBT`
+  `BluetoothdExtAdvRouted`/`BluetoothdPages`/`BluetoothdExtAdvPatched`.
+  Unverified on hardware. Lilu DEBUG + `-liludbg liludump=120` writes
+  `/var/log/Lilu_*.txt`, the only way to see Lilu/plugin SYSLOG here.
 - `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
   AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
   crashes make launchd throttle it (640–1200 s).

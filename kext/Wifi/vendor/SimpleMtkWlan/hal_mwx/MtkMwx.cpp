@@ -1248,6 +1248,7 @@ mwx_stop(struct ifnet *ifp)
 		 * clear these. Clear them before advertising the stop. */
 		ic->ic_flags &= ~(IEEE80211_F_BGSCAN | IEEE80211_F_ASCAN);
 		ic->ic_wcl_scan_requested = false;
+		ic->ic_wcl_scan_inflight = false;
 		ic->ic_wcl_scan_active = false;
 		ic->ic_wcl_scan_ssid_length = 0;
 		if (ic->ic_event_handler)
@@ -1652,7 +1653,9 @@ mwx_bgscan(struct ieee80211com *ic)
 		printf("%s: could not initiate scan\n", DEVNAME(sc));
 		return err;
 	}
-    if(sc->sc_awdl_scan_suspended) return 0;
+    // No firmware scan was submitted. Returning success here makes
+    // net80211 set F_BGSCAN forever, rejecting later WCL scans as busy.
+    if(sc->sc_awdl_scan_suspended) return EBUSY;
 
 	sc->sc_flags |= MWX_FLAG_BGSCAN;
 	sc->sc_scan_requests++;
@@ -5228,11 +5231,18 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
     // One radio cannot scan while honoring an AWDL reservation. Keep the
     // logical scan pending and finish it when AWDL releases the radio. Do
     // not repeatedly cancel/end/restart a foreground scan each timer tick.
-    // MtkWireless: only while associated. Unassociated, the scan is how
+    // MtkWireless: unsolicited scans only while associated. A WCL request
+    // must finish even with AWDL enabled so airportd gets fresh results.
+    // Unassociated, the scan is how
     // airportd finds the AP to join; suspending it until AWDL went idle
     // failed every join (-3905) while AirDrop was open. Release the AWDL
     // ROC instead; awdlReserve waits for the scan.
-    if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN) {
+    bool requestedScan=false;
+#ifdef AIRPORT_WCL
+    requestedScan=ic->ic_wcl_scan_requested ||
+        (ic->ic_wcl_join_requested && sc->sc_ns_state==IEEE80211_S_SCAN);
+#endif
+    if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN && !requestedScan) {
         sc->sc_awdl_scan_suspended=true;
         return 0;
     }
@@ -5250,6 +5260,9 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	memset(req, 0, sizeof(*req));
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
+#ifdef AIRPORT_WCL
+	ic->ic_wcl_scan_inflight = true;
+#endif
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
 
 	req->seq_num = sc->sc_scan_seq_num /* | sc->sc_band_idx << 7 */;
@@ -5383,8 +5396,12 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	    le32toh(req->scan_func), req->ssid_type);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
-	if (rv != 0)
+	if (rv != 0) {
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+#ifdef AIRPORT_WCL
+		ic->ic_wcl_scan_inflight = false;
+#endif
+	}
 
 	return rv;
 }
@@ -5403,8 +5420,12 @@ mt7921_mcu_hw_scan_cancel(struct mwx_softc *sc)
 
 	rv = mwx_mcu_send_msg(sc, MCU_CE_CMD_CANCEL_HW_SCAN, &req,
 	    sizeof(req), NULL);
-	if (rv == 0)
+	if (rv == 0) {
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+#ifdef AIRPORT_WCL
+		sc->sc_ic.ic_wcl_scan_inflight = false;
+#endif
+	}
 	return rv;
 }
 
@@ -7897,8 +7918,12 @@ MtkMwx::getTxQueueSize()
 void
 MtkMwx::clearScanningFlags()
 {
-	if (com)
+	if (com) {
 		com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
+#ifdef AIRPORT_WCL
+		com->sc_ic.ic_wcl_scan_inflight = false;
+#endif
+	}
 }
 
 void
@@ -8879,8 +8904,12 @@ static bool mwx_awdl_infra_joining(mwx_softc *sc)
         (ic->ic_flags & IEEE80211_F_RSNON) && !ic->ic_bss->ni_port_valid;
 }
 
-// MtkWireless: longest off-channel ROC while associated (two AWs plus lead).
-static const uint32_t mwxAwdlOffChannelMaxMs = 40;
+// MtkWireless: longest off-channel ROC while associated. The grant runs from
+// its arrival, which for an off-channel ROC comes 80-160 ms after the request
+// (planned with the measured lead, ~160 ms ahead of the window); a 40 ms cap
+// expired before every channel-6 window began (0.1.3: 94 grants, 0 AWs). The
+// scheduler aborts the ROC after the window, so this only bounds a stall.
+static const uint32_t mwxAwdlOffChannelMaxMs = 300;
 
 // MtkWireless: boot-arg amtk_awdl_offchan=0 keeps AWDL on the AP channel
 // while associated (0.1.1 behaviour). Default: leave it with a PM handshake.
@@ -9253,22 +9282,11 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     // MtkWireless: joining an AP owns the radio. AUTH/ASSOC frames and the
     // 4-way handshake are lost if AWDL takes it elsewhere meanwhile.
     if(mwx_awdl_infra_joining(com)) { ++com->sc_awdl_roc_join_blocked; return kIOReturnNotReady; }
-    // Unassociated scans (looking for the AP) win; see mt7921_mcu_hw_scan.
-    if((com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) &&
-       com->sc_ic.ic_state!=IEEE80211_S_RUN) {
-        ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady;
-    }
+    // MtkWireless: a real scan owns the radio until SCAN_DONE/watchdog.
+    // Associated unsolicited scans are suspended before submission; an
+    // explicit WCL scan must complete too, or the network list stays empty.
     if(com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
-        // Cancel only an actual firmware scan. The logical SCAN/BGSCAN
-        // state remains pending until disable; it must not block every ROC.
-        int scanRv=mt7921_mcu_hw_scan_cancel(com);
-        if(!operation.valid()) return kIOReturnAborted;
-        if(scanRv) { ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady; }
-        com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-        timeout_del(&com->sc_scan_to);
-        com->sc_awdl_scan_suspended=true;
-        ++com->sc_awdl_roc_scan_blocked;
-        return kIOReturnNotReady;
+        ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady;
     }
     IOLockLock(com->sc_awdl_lock);
     bool retryLater=com->sc_awdl_roc_abort_pending && mwx_awdl_now()<com->sc_awdl_roc_abort_retry_at;
@@ -9416,6 +9434,9 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLInfraPSSleeps",com->sc_awdl_infra_ps_sleeps,64);
     mwxController()->setProperty("MTKAWDLInfraPSWakes",com->sc_awdl_infra_ps_wakes,64);
     mwxController()->setProperty("MTKAWDLInfraPSFailed",com->sc_awdl_infra_ps_failed,64);
+    mwxController()->setProperty("MTKWiFiRxWrongBSS",com->sc_ic.ic_stats.is_rx_wrongbss,32);
+    mwxController()->setProperty("MTKWiFiRxDeauth",com->sc_ic.ic_stats.is_rx_deauth,32);
+    mwxController()->setProperty("MTKWiFiRxDisassoc",com->sc_ic.ic_stats.is_rx_disassoc,32);
     mwxController()->setProperty("MTKAWDLFirmwareContext","p2p-discovery");
     mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);

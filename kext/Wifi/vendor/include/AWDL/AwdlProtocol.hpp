@@ -26,6 +26,7 @@ bool mtk_awdl_valid_action_envelope(const uint8_t *f, size_t n);
 bool mtk_awdl_parse_action(const uint8_t *f, size_t n, mtkawdl::Advertisement *out);
 uint8_t mtk_awdl_peer_channel(const mtkawdl::Peer *p, uint64_t now);
 void mtk_awdl_data_peers_reset(mtkawdl::DataPeers *d);
+bool mtk_awdl_data_peers_accept(mtkawdl::DataPeers *d, size_t index, size_t stream, uint16_t seq, uint64_t now);
 bool mtk_awdl_data_peers_live(const void *entry, uint64_t now);
 int32_t mtk_awdl_data_peers_find(const mtkawdl::DataPeers *d, const uint8_t *mac, uint64_t now);
 int32_t mtk_awdl_data_peers_observe(mtkawdl::DataPeers *d, const uint8_t *mac, uint64_t now);
@@ -125,13 +126,20 @@ struct Peer {
 };
 // Native cache/traffic registration is authoritative for data membership;
 // synchronization advertisements have a separate, short-lived radio schedule.
+struct DataReplayWindow {
+    uint64_t bitmap, lastRx;
+    uint16_t sequence;
+    bool active;
+};
 struct DataPeers {
     struct Entry {
         Peer replayState;
+        DataReplayWindow windows[17]; // TID 0..15; non-QoS at 16
         uint64_t seen;
         bool cached, traffic;
     } entries[maxPeers]={};
     void reset() { mtk_awdl_data_peers_reset(this); }
+    bool acceptData(size_t index,size_t stream,uint16_t seq,uint64_t now) { return mtk_awdl_data_peers_accept(this,index,stream,seq,now); }
     bool live(const Entry &e,uint64_t now) const { return mtk_awdl_data_peers_live(&e,now); }
     int find(const uint8_t *mac,uint64_t now) const { return mtk_awdl_data_peers_find(this,mac,now); }
     int observe(const uint8_t *mac,uint64_t now) { return mtk_awdl_data_peers_observe(this,mac,now); }

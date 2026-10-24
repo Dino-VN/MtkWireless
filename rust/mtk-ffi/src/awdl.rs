@@ -4,7 +4,7 @@
 
 use mtk_wlan::awdl::advertisers::{AdvertiserRecord, decode_advertiser_record};
 use mtk_wlan::awdl::protocol::{
-    self as p, Advertisement, DataPeerEntry, DataPeers, Peer, Reservation, RocGrant, RocResult,
+    self as p, Advertisement, DataPeerEntry, DataPeers, DataReplayWindow, Peer, Reservation, RocGrant, RocResult,
     Sequence, State, TxStatusCounters,
 };
 use mtk_wlan::awdl::timeline::{
@@ -67,6 +67,9 @@ export! {
     fn mtk_awdl_peer_channel(peer: *const Peer, now: u64) -> u8 { peer.as_ref().map_or(0, |x| x.channel(now)) }
 
     fn mtk_awdl_data_peers_reset(d: *mut DataPeers) { if let Some(d) = d.as_mut() { d.reset() } }
+    fn mtk_awdl_data_peers_accept(d: *mut DataPeers, index: usize, stream: usize, seq: u16, now: u64) -> bool {
+        d.as_mut().is_some_and(|d| d.accept_data(index, stream, seq, now))
+    }
     fn mtk_awdl_data_peers_live(e: *const DataPeerEntry, now: u64) -> bool { e.as_ref().is_some_and(|e| DataPeers::live(e, now)) }
     fn mtk_awdl_data_peers_find(d: *const DataPeers, address: *const u8, now: u64) -> i32 {
         match (d.as_ref(), mac(address)) { (Some(d), Some(a)) => d.find(a, now), _ => -1 }
@@ -274,6 +277,8 @@ static LAYOUT: &[usize] = layout! {
     Sequence { channels, count, step }
     Advertisement { sequence, master, sync, period, counter, down, presence, metric, distance, master_counter, self_counter }
     Peer { mac, advertisement, seen, epoch, base_counter, last_data, replay, used, has_data }
+    DataReplayWindow { bitmap, last_rx, sequence, active }
+    DataPeerEntry { replay_state, windows, seen, cached, traffic }
     DataPeers { entries }
     State { mac, master, sync, forced_sync, sequence, own_sequence, peers, epoch, base_counter, data_counter,
         frame_counter, psf_period, metric, master_metric, distance, master_counter, self_counter, synchronized,

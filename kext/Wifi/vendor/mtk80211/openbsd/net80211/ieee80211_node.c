@@ -1425,6 +1425,17 @@ ieee80211_end_scan(struct _ifnet *ifp)
     if (ic->ic_opmode == IEEE80211_M_STA)
         ieee80211_clean_inactive_nodes(ic, IEEE80211_INACT_SCAN);
     
+#ifdef AIRPORT_WCL
+    /* MtkWireless: airportd owns scans and joins. With no request, the
+     * BSD notfound retry loop scans forever (WCL forbids selecting a BSS
+     * without a join), starving AWDL even when Wi-Fi is only idle.
+     * Keep logical SCAN so the next explicit request can restart it. */
+    if (!bgscan && !ic->ic_wcl_scan_requested && !ic->ic_wcl_join_requested) {
+        ic->ic_flags &= ~IEEE80211_F_ASCAN;
+        return;
+    }
+#endif
+
     ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
     
 #ifndef IEEE80211_STA_ONLY

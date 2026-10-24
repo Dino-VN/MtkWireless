@@ -153,6 +153,19 @@ private:
     uint8_t discoveryTxPeers[3][6] = {};
     uint64_t dataRxFrames = 0, dataRxInvalid = 0, dataRxUnknownPeer = 0;
     uint64_t dataRxWrongDestination = 0, dataRxReplay = 0, dataRxDecoded = 0;
+    // Heap-owned, bounded trace before the replay gate. awdl0 BPF sees only
+    // accepted packets, so it cannot explain a stalled RX sequence window.
+    struct __attribute__((packed)) DataRxSample {
+        uint64_t timeUS, previousBitmap;
+        uint16_t sequence, previousSequence, mpduSequence, payloadLength;
+        uint8_t result, channel; int8_t rssi; uint8_t prefixLength;
+        uint8_t source[6], destination[6], header[26], prefix[80];
+    };
+    static_assert(sizeof(DataRxSample)==146,"AWDL RX trace format");
+    DataRxSample dataRxTrace[64] = {}, dataRxLastRejected = {};
+    uint64_t dataRxTraceCount = 0, dataRxDuplicate = 0, dataRxTooOld = 0;
+    void recordDataRx(const uint8_t*,const mtkawdl::DataView&,uint64_t,
+                      uint8_t,int8_t,uint16_t,uint64_t,bool);
     IOReturn dataTxStatus = kIOReturnNotReady;
     uint64_t serviceTicks = 0, reserveAttempts = 0, grantObservations = 0, awStartNotifications = 0;
     uint64_t reserveWaitUS = 0, reserveMaxWaitUS = 0, reserveInvalidations = 0;

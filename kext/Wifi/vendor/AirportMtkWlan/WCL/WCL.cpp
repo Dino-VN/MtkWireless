@@ -276,7 +276,7 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
     }
     scanPending = true;
     scanCompleted = false;
-    scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
+    scanSkipCompletion = ic->ic_wcl_scan_inflight &&
         ((scan.type != 2 && scan.ssidLength != 0) ||
          ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
     ic->ic_wcl_scan_requested = true;
@@ -294,7 +294,9 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
             scanSource->cancelTimeout();
             return kIOReturnBusy;
         }
-    } else if (ic->ic_state != IEEE80211_S_SCAN) {
+    } else {
+        // MtkWireless: logical SCAN may be idle after its last completion.
+        // The HAL ignores this transition if a firmware scan is still live.
         int error = ic->ic_newstate(ic, IEEE80211_S_SCAN, -1);
         if (error) {
             scanPending = false;
@@ -563,7 +565,7 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
-    if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
+    if (ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         WCL_LOG("join rejected: newstate SCAN failed\n");
         joinPending = false;
         joinTimer->cancelTimeout();
@@ -815,6 +817,9 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
                     scanSkipCompletion = false;
                 else {
                     scanCompleted = true;
+                    // End net80211's retry loop before the completion timer
+                    // runs; otherwise it starts another unsolicited scan.
+                    ic->ic_wcl_scan_requested = false;
                     scanSource->setTimeoutMS(0);
                 }
             }

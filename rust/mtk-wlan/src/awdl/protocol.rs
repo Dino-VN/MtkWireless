@@ -340,10 +340,48 @@ pub fn accept_data(p: &mut Peer, seq: u16) -> bool {
     true
 }
 
+/// MSDU duplicate history, separate from native peer authorization. Captured
+/// iPhones use independent AWDL counters for non-QoS and each QoS TID, and
+/// restart a unicast counter after inactivity while keeping the same MAC.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DataReplayWindow {
+    pub bitmap: u64,
+    pub last_rx: u64,
+    pub sequence: u16,
+    pub active: bool,
+}
+
+impl DataReplayWindow {
+    pub fn accept(&mut self, seq: u16, now: u64) -> bool {
+        if !self.active || now < self.last_rx || now - self.last_rx > PEER_LIFETIME_US {
+            self.active = true;
+            self.sequence = seq;
+            self.bitmap = 1;
+            self.last_rx = now;
+            return true;
+        }
+        self.last_rx = now;
+        let delta = seq.wrapping_sub(self.sequence) as i16;
+        if delta > 0 {
+            self.bitmap = if delta >= 64 { 1 } else { (self.bitmap << delta) | 1 };
+            self.sequence = seq;
+            return true;
+        }
+        let back = self.sequence.wrapping_sub(seq) as u32;
+        if back >= 64 || self.bitmap & (1u64 << back) != 0 {
+            return false;
+        }
+        self.bitmap |= 1u64 << back;
+        true
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DataPeerEntry {
     pub replay_state: Peer,
+    pub windows: [DataReplayWindow; 17], // TID 0..15; non-QoS at 16
     pub seen: u64,
     pub cached: bool,
     pub traffic: bool,
@@ -362,6 +400,12 @@ unsafe impl Zeroable for DataPeers {}
 unsafe impl Zeroable for State {}
 
 impl DataPeers {
+    pub fn accept_data(&mut self, index: usize, stream: usize, seq: u16, now: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(index) else { return false };
+        if !Self::live(entry, now) { return false; }
+        entry.windows.get_mut(stream).is_some_and(|w| w.accept(seq, now))
+    }
+
     pub fn reset(&mut self) {
         zero(self);
     }
@@ -1876,6 +1920,64 @@ pub fn receive_roc_grant(
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn independent_data_streams_and_idle_restart() {
+        let mut peers = DataPeers::default();
+        let mac = [2, 1, 2, 3, 4, 5];
+        let start = 10_000_000;
+        assert!(peers.set_cached(&mac, true, start));
+        let index = peers.find(&mac, start) as usize;
+        // 2026-10-24 trace: multicast 0..7 previously suppressed unicast
+        // SYNs 0..7. TID 1 at 4096 then suppressed TID 0 at 193.
+        for seq in 0..8 {
+            assert!(peers.accept_data(index, 16, seq, start));
+            assert!(peers.accept_data(index, 0, seq, start));
+        }
+        assert!(peers.accept_data(index, 0, 192, start));
+        assert!(peers.accept_data(index, 1, 4096, start));
+        assert!(peers.accept_data(index, 0, 193, start));
+        assert!(peers.accept_data(index, 16, 8, start));
+        assert!(!peers.accept_data(index, 0, 193, start));
+        assert!(!peers.accept_data(index, 1, 4096, start));
+        assert!(!peers.accept_data(index, 16, 8, start));
+        // Advertisements / repeated cache adds cannot clear duplicate history.
+        let later = start + PEER_LIFETIME_US;
+        assert!(peers.set_cached(&mac, true, later));
+        assert!(!peers.accept_data(index, 0, 0, later));
+        // A live multicast stream cannot prevent idle unicast from restarting.
+        let restart = later + PEER_LIFETIME_US + 1;
+        assert!(peers.accept_data(index, 16, 49, restart - 1));
+        assert!(peers.accept_data(index, 0, 0, restart));
+        assert!(!peers.accept_data(index, 0, 0, restart));
+        assert!(peers.accept_data(index, 0, 1, restart));
+        assert!(peers.entries[index].cached);
+        assert_eq!(peers.find(&mac, restart), index as i32);
+        assert!(!peers.accept_data(index, 17, 0, restart));
+        assert!(!peers.accept_data(MAX_PEERS, 0, 0, restart));
+        assert!(peers.set_cached(&mac, false, restart));
+        assert!(!peers.accept_data(index, 0, 2, restart));
+        assert!(peers.set_cached(&mac, true, restart));
+        assert!(peers.accept_data(index, 0, 0, restart));
+    }
+
+    #[test]
+    fn data_stream_window_wrap_reorder_and_expiry() {
+        let mut window = DataReplayWindow::default();
+        assert!(window.accept(65535, 100));
+        assert!(window.accept(0, 100));
+        assert!(!window.accept(65535, 100));
+        assert!(window.accept(65534, 100));
+        assert!(!window.accept(65534, 100));
+        assert!(window.accept(63, 100));
+        assert!(window.accept(1, 100));
+        assert!(!window.accept(65535, 100));
+        assert!(!window.accept(1, 100 + PEER_LIFETIME_US));
+        assert!(window.accept(1, 101 + 2 * PEER_LIFETIME_US));
+        // A clock restart also cannot pin a window in the old epoch.
+        assert!(window.accept(0, 1));
+        assert!(!window.accept(0, 1));
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

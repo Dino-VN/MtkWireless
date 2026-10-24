@@ -268,6 +268,41 @@ ieee80211_input_hwdecrypt(struct ieee80211com *ic, struct ieee80211_node *ni,
    return m;
 }
 
+/* MtkWireless: AWDL's other_bss filter also admits traffic for nearby
+ * stations. Validate it before touching the BSS sequence/reorder/RSSI state,
+ * not just in the data decapsulation path. In STA mode find_rxnode may hand
+ * us ic_bss even when the transmitter is an unrelated AP. AWDL frames have
+ * already been dispatched by the HAL; beacons/probe responses must still
+ * reach the scan cache regardless of their BSSID.
+ * Return 2 for a foreign scan advertisement: cache it without updating our
+ * BSS's sequence number, RSSI, inactivity or background-scan timers.
+ * Caller has checked the complete header (or the control Address 2 minimum).
+ */
+static int
+ieee80211_accept_sta_frame(const struct ieee80211com *ic,
+    const struct ieee80211_frame *wh, int type, int subtype, int dir)
+{
+    if (ic->ic_opmode != IEEE80211_M_STA)
+        return 1;
+    if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+        !IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr))
+        return 0;
+    if (type == IEEE80211_FC0_TYPE_MGT &&
+        (subtype == IEEE80211_FC0_SUBTYPE_BEACON ||
+         subtype == IEEE80211_FC0_SUBTYPE_PROBE_RESP))
+        return IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid) &&
+            IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid) ? 1 : 2;
+    if (!IEEE80211_ADDR_EQ(wh->i_addr2, ic->ic_bss->ni_bssid))
+        return 0;
+    if (type == IEEE80211_FC0_TYPE_MGT &&
+        !IEEE80211_ADDR_EQ(wh->i_addr3, ic->ic_bss->ni_bssid))
+        return 0;
+    if (type == IEEE80211_FC0_TYPE_DATA &&
+        dir != IEEE80211_FC1_DIR_FROMDS)
+        return 0;
+    return 1;
+}
+
 /*
  * Process a received frame.  The node associated with the sender
  * should be supplied.  If nothing was found in the node table then
@@ -292,7 +327,7 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
     struct ieee80211_frame *wh;
     u_int16_t *orxseq, nrxseq, qos;
     u_int8_t dir, type, subtype, tid;
-    int hdrlen, hasqos;
+    int hdrlen, hasqos, sta_rx;
     
     _KASSERT(ni != NULL);
     
@@ -331,6 +366,11 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         }
     } else
         hdrlen = 0;
+    sta_rx = ieee80211_accept_sta_frame(ic, wh, type, subtype, dir);
+    if (!sta_rx) {
+        ic->ic_stats.is_rx_wrongbss++;
+        goto out;
+    }
     if ((hasqos = ieee80211_has_qos(wh))) {
         qos = ieee80211_get_qos(wh);
         tid = qos & IEEE80211_QOS_TID;
@@ -419,7 +459,7 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
     }
     
     /* duplicate detection (see 9.2.9) */
-    if (ieee80211_has_seq(wh) &&
+    if (sta_rx == 1 && ieee80211_has_seq(wh) &&
         ic->ic_state != IEEE80211_S_SCAN) {
         nrxseq = letoh16(*(u_int16_t *)wh->i_seq) >>
         IEEE80211_SEQ_SEQ_SHIFT;
@@ -441,7 +481,7 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         }
         *orxseq = nrxseq;
     }
-    if (ic->ic_state > IEEE80211_S_SCAN) {
+    if (sta_rx == 1 && ic->ic_state > IEEE80211_S_SCAN) {
         ni->ni_rssi = rxi->rxi_rssi;
         ni->ni_rstamp = rxi->rxi_tstamp;
         ni->ni_inact = 0;
