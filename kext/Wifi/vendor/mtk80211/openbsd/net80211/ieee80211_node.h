@@ -251,7 +251,7 @@ struct ieee80211_rxinfo {
 	u_int32_t		rxi_flags;
 	u_int32_t		rxi_tstamp;
 	int             rxi_rssi;
-    uint8_t         rxi_chan;
+    uint16_t        rxi_chan;   /* ic_channels index, 0 = unknown */
 };
 #define IEEE80211_RXI_HWDEC		0x00000001
 #define IEEE80211_RXI_AMPDU_DONE	0x00000002
@@ -442,6 +442,9 @@ struct ieee80211_node {
     uint32_t        ni_he_oper_params;
     uint16_t        ni_he_oper_nss_set;
     uint8_t         ni_he_optional[8];
+    uint16_t        ni_he_6ghz_capa;  /* HE 6 GHz Band Capabilities */
+    uint8_t         ni_he_6ghz_oper[5]; /* HE 6 GHz Operation Information */
+    uint8_t         ni_he_6ghz_oper_valid;
     
 	/* Timeout handlers which trigger Tx Block Ack negotiation. */
 	CTimeout*		ni_addba_req_to[IEEE80211_NUM_TID];
@@ -695,6 +698,9 @@ void ieee80211_setup_vhtopmode(struct ieee80211_node *, const uint8_t *);
 void ieee80211_clear_vhtcaps(struct ieee80211_node *);
 void ieee80211_setup_hecaps(struct ieee80211_node *, const uint8_t *,
                            uint8_t);
+const struct ieee80211_he_6ghz_oper *ieee80211_he_6ghz_oper_ie(const uint8_t *);
+void ieee80211_setup_he_6ghz(struct ieee80211_node *, const uint8_t *,
+    const struct ieee80211_he_6ghz_oper *);
 int ieee80211_setup_heop(struct ieee80211_node *, const uint8_t *,
     uint8_t);
 int ieee80211_setup_rates(struct ieee80211com *,

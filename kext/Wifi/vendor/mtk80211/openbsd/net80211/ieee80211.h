@@ -1993,6 +1993,15 @@ ieee80211_he_ppe_size(uint8_t ppe_thres_hdr, const uint8_t *phy_cap_info)
     return n;
 }
 
+/* HE 6 GHz Band Capabilities Information (802.11ax 9.4.2.263) */
+#define IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START    0x0007
+#define IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP 0x0038
+#define IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN      0x00c0
+#define IEEE80211_HE_6GHZ_CAP_SM_PS             0x0600
+#define IEEE80211_HE_6GHZ_CAP_RD_RESPONDER      0x0800
+#define IEEE80211_HE_6GHZ_CAP_RX_ANTPAT_CONS    0x1000
+#define IEEE80211_HE_6GHZ_CAP_TX_ANTPAT_CONS    0x2000
+
 /**
  * ieee80211_he_6ghz_oper - HE 6 GHz operation Information field
  * @primary: primary channel

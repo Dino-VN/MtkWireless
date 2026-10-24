@@ -90,12 +90,6 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #ifndef IEEE80211_CHAN_40MHZ
 #define IEEE80211_CHAN_40MHZ IEEE80211_CHAN_HT40
 #endif
-#ifndef IEEE80211_CHAN_6GHZ
-#define IEEE80211_CHAN_6GHZ 0
-#endif
-#ifndef IEEE80211_IS_CHAN_6GHZ
-#define IEEE80211_IS_CHAN_6GHZ(_c) false
-#endif
 
 #ifndef M_DEVBUF
 #define M_DEVBUF 0
@@ -680,6 +674,48 @@ const struct mwx_rate {
 
 
 #define MWX_NUM_6GHZ_CHANNELS   nitems(mwx_channels_6ghz)
+
+/*
+ * MtkWireless: 6 GHz (MT7922, MT7921K) is off unless boot-arg amtk_6ghz=1.
+ * Every 6 GHz BSS requires OWE or WPA3-SAE with hash-to-element and PMF;
+ * ieee80211_sae.c does hunting-and-pecking only, so advertising 6 GHz would
+ * offer networks the join cannot complete.
+ */
+static bool
+mwx_6ghz_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled < 0) {
+		int value = 0;
+
+		if (!PE_parse_boot_argn("amtk_6ghz", &value, sizeof(value)))
+			value = 0;
+		enabled = value != 0;
+	}
+	return enabled;
+}
+
+/* MtkWireless: 6 GHz TX power cap in 0.5 dB units. 12 dBm is the LPI
+ * client limit at 20 MHz (-1 dBm/MHz, FCC 15.407; ETSI allows more), so it
+ * holds at every width. SP and VLP are not used. */
+#define MWX_6GHZ_LPI_POWER	24
+
+/*
+ * MtkWireless: the RXD channel field numbers 6 GHz channel n as
+ * 181 + (n - 1) / 4 (Linux mt792x_get_status_freq_info). Returns the
+ * ic_channels index, 0 if unknown.
+ */
+static uint16_t
+mwx_rxd_chan_idx(uint8_t ch)
+{
+	unsigned n;
+
+	if (ch <= 180)
+		return ch;
+	n = (ch - 181) * 4 + 1;
+	return n <= 233 ? IEEE80211_CHAN_6GHZ_BASE + n : 0;
+}
 
 #define MWX_RATE_HT_SISO_MCS_INV_PLCP 0x20
 
@@ -2272,13 +2308,44 @@ mwx_preinit(struct mwx_softc *sc)
 				    IEEE80211_CHAN_DFS | IEEE80211_CHAN_PASSIVE;
 		}
 	}
-#ifdef NOTYET
-	/* TODO support for 6GHz */
+	/*
+	 * MtkWireless: 6 GHz channel n is ic_channels[IEEE80211_CHAN_6GHZ_BASE
+	 * + n] (ieee80211_var.h). HE only, OFDM legacy rates. Non-PSC channels
+	 * are passive: APs there announce themselves (beacons, RNR). Not AWDL
+	 * channels (awdlChannelAllowed).
+	 */
 	if (sc->sc_capa.has_6ghz) {
+		struct ieee80211_channel *c;
+		uint16_t capa;
+
+		ic->ic_sup_rates[IEEE80211_MODE_11A] =
+		    ieee80211_std_rateset_11a;
 		for (i = 0; i < MWX_NUM_6GHZ_CHANNELS; i++) {
+			chan = mwx_channels_6ghz[i];
+			c = &ic->ic_channels[IEEE80211_CHAN_6GHZ_BASE + chan];
+			c->ic_freq = ieee80211_ieee2mhz(chan,
+			    IEEE80211_CHAN_6GHZ);
+			c->ic_flags = IEEE80211_CHAN_6GHZ | IEEE80211_CHAN_OFDM;
+			if (!IEEE80211_IS_6GHZ_PSC(chan))
+				c->ic_flags |= IEEE80211_CHAN_PASSIVE;
 		}
+		/* From the 5 GHz HT/VHT capabilities, as Linux mt7921; SM
+		 * power save disabled, as mac80211 sends it. */
+		capa = ((ic->ic_ampdu_params & IEEE80211_AMPDU_PARAM_SS) >> 2) &
+		    IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START;
+		capa |= (((ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK) >>
+		    IEEE80211_VHTCAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT) << 3) &
+		    IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP;
+		capa |= ((ic->ic_vhtcaps & IEEE80211_VHTCAP_MAX_MPDU_MASK)
+		    << 6) & IEEE80211_HE_6GHZ_CAP_MAX_MPDU_LEN;
+		capa |= IEEE80211_HE_6GHZ_CAP_SM_PS;
+		if (ic->ic_vhtcaps & IEEE80211_VHTCAP_TX_ANTENNA_PATTERN)
+			capa |= IEEE80211_HE_6GHZ_CAP_TX_ANTPAT_CONS;
+		if (ic->ic_vhtcaps & IEEE80211_VHTCAP_RX_ANTENNA_PATTERN)
+			capa |= IEEE80211_HE_6GHZ_CAP_RX_ANTPAT_CONS;
+		ic->ic_he_6ghz_capa = capa;
 	}
-#endif
 
 	/* Configure channel information obtained from firmware. */
 	ieee80211_channel_init(ifp);
@@ -3972,7 +4039,8 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
             unsigned kind=0;
             if(sc->sc_ic.ic_opmode==IEEE80211_M_STA && sc->sc_ic.ic_state==IEEE80211_S_RUN &&
                sc->sc_ic.ic_bss && sc->sc_ic.ic_bss->ni_chan)
-                kind=ieee80211_chan2ieee(&sc->sc_ic,sc->sc_ic.ic_bss->ni_chan)==sc->sc_awdl_roc.channel ? 1 : 2;
+                kind=!IEEE80211_IS_CHAN_6GHZ(sc->sc_ic.ic_bss->ni_chan) &&
+                    ieee80211_chan2ieee(&sc->sc_ic,sc->sc_ic.ic_bss->ni_chan)==sc->sc_awdl_roc.channel ? 1 : 2;
             ++sc->sc_awdl_roc_latency[kind][b];
         }
         if(sc->sc_awdl_roc_grant_delay_us>sc->sc_awdl_roc_max_grant_delay_us)
@@ -5032,8 +5100,11 @@ mt7921_mcu_get_nic_capability(struct mwx_softc *sc)
 			break;
 		switch (type) {
 		case MT_NIC_CAP_6G:
-			/* TODO 6GHZ SUPPORT */
-			sc->sc_capa.has_6ghz = /* XXX 1 */ 0;
+			/* MtkWireless: first byte nonzero on 6 GHz parts, as
+			 * Linux mt7921 reads it. 6 GHz is HE only. */
+			sc->sc_capa.has_6ghz = len >= 1 &&
+			    mtod(m, uint8_t *)[0] != 0 && mwx_6ghz_enabled() &&
+			    (sc->sc_ic.ic_userflags & IEEE80211_F_HEON) != 0;
 			break;
 		case MT_NIC_CAP_MAC_ADDR:
 			if (len < ETHER_ADDR_LEN)
@@ -5269,7 +5340,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	struct mbuf *m;
 	int n_ssids = 0;
 	int rv;
-	uint8_t nchan, n_2g = 0, n_5g = 0;
+	uint8_t nchan, n_2g = 0, n_5g = 0, n_6g = 0;
 	uint16_t dwell;
 
     // One radio cannot scan while honoring an AWDL reservation. Keep the
@@ -5367,10 +5438,17 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			continue;
 		/* Restrict to the channels WCL asked for, if any. */
 		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
-			unsigned int chn = ieee80211_chan2ieee(ic, c);
-			if (chn >= 256 || !(ic->ic_wcl_scan_channels[chn / 8] &
+			unsigned int chn = ieee80211_chan2idx(ic, c);
+			if (chn > IEEE80211_CHAN_MAX ||
+			    !(ic->ic_wcl_scan_channels[chn / 8] &
 			    (1U << (chn % 8))))
 				continue;
+		} else if (IEEE80211_IS_CHAN_6GHZ(c) &&
+		    !IEEE80211_IS_6GHZ_PSC(ieee80211_chan2ieee(ic, c))) {
+			/* MtkWireless: a full scan visits the 15 PSC channels
+			 * of 6 GHz only (14 + 27 + 15 fit the 64 the firmware
+			 * takes); WCL asks for others by channel list. */
+			continue;
 		}
 
 		if (nchan < 32)
@@ -5378,11 +5456,13 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		else
 			chan = &req->ext_channels[nchan - 32];
 
-		channel_num = ieee80211_mhz2ieee(c->ic_freq, 0);
-		/* TODO IEEE80211_IS_CHAN_6GHZ -> chan->band = 3*/
+		channel_num = ieee80211_chan2ieee(ic, c);
 		if (IEEE80211_IS_CHAN_2GHZ(c)) {
 			chan->band = 1;
 			n_2g++;
+		} else if (IEEE80211_IS_CHAN_6GHZ(c)) {
+			chan->band = 3;
+			n_6g++;
 		} else {
 			chan->band = 2;
 			n_5g++;
@@ -5442,8 +5522,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x ssids=%u ext_ssids=%u ssid_type_ext=%u\n",
-	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u 6g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x ssids=%u ext_ssids=%u ssid_type_ext=%u\n",
+	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, n_6g, req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
@@ -5706,7 +5786,8 @@ mt7921_mcu_set_channel_domain(struct mwx_softc *sc)
 	int i, len, rv;
 	int n_2ch = 0, n_5ch = 0, n_6ch = 0;
 
-	len = sizeof(*hdr) + IEEE80211_CHAN_MAX * sizeof(channel);
+	len = sizeof(*hdr) + (MWX_NUM_2GHZ_CHANNELS + MWX_NUM_5GHZ_CHANNELS +
+	    MWX_NUM_6GHZ_CHANNELS) * sizeof(*channel);
 	m = mwx_mcu_alloc_msg(len);
 	if (m == NULL)
 		return ENOMEM;
@@ -5744,21 +5825,20 @@ mt7921_mcu_set_channel_domain(struct mwx_softc *sc)
 		channel++;
 		n_5ch++;
 	}
-#ifdef NOTYET
-	/* 6GHz handling */
+	/* MtkWireless: 6 GHz as mt76_connac_mcu_set_channel_domain sends it
+	 * (hw_value = channel number); no Linux flags, as for an LPI rule. */
 	hdr->bw_6g = 3; /* BW_20_40_80_160M */
-	for (i = 0; i <= IEEE80211_CHAN_MAX; i++) {
+	for (i = IEEE80211_CHAN_6GHZ_BASE; i <= IEEE80211_CHAN_MAX; i++) {
 		chan = &ic->ic_channels[i];
 		if (!IEEE80211_IS_CHAN_6GHZ(chan))
 			continue;
 
 		channel->hw_value = htole16(ieee80211_chan2ieee(ic, chan));
-		channel->flags = htole32(0);	/* XXX */
+		channel->flags = htole32(0);
 
 		channel++;
 		n_6ch++;
 	}
-#endif
 
 	memcpy(hdr->alpha2, sc->sc_alpha2, sizeof(sc->sc_alpha2));
 	hdr->n_2ch = n_2ch;
@@ -5805,7 +5885,10 @@ mwx_set_bss_bw(struct mwx_softc *sc, struct ieee80211_node *ni)
 	if (ni == NULL || ni->ni_chan == NULL ||
 	    ni->ni_chan == IEEE80211_CHAN_ANYC)
 		return;
-	if ((ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_VHT)) == 0)
+	/* A 6 GHz BSS is HE only; its width came from HE 6 GHz Operation. */
+	if ((ni->ni_flags & (IEEE80211_NODE_HT | IEEE80211_NODE_VHT)) == 0 &&
+	    !(IEEE80211_IS_CHAN_6GHZ(ni->ni_chan) &&
+	      (ni->ni_flags & IEEE80211_NODE_HE)))
 		return;
 	c = ni->ni_chan;
 	sc->sc_bss_bw = mt7921_mcu_chan_bw(ni);
@@ -5858,12 +5941,9 @@ mt7921_mcu_set_chan_info(struct mwx_softc *sc, int cmd)
 		req.center_ch = sc->sc_bss_center;
 	}
 
-#ifdef NOTYET
 	if (channel->ic_flags & IEEE80211_CHAN_6GHZ)
 		req.channel_band = 2;
-	else
-#endif
-	if (channel->ic_flags & IEEE80211_CHAN_5GHZ)
+	else if (channel->ic_flags & IEEE80211_CHAN_5GHZ)
 		req.channel_band = 1;
 	else
 		req.channel_band = 0;
@@ -5897,35 +5977,37 @@ mt7921_mcu_build_sku(struct mwx_softc *sc, int band, int8_t *sku)
 {
 	int max_power = 127;
 	int i, offset = 4;
+	/* 0x28: 20 dBm; MtkWireless: 6 GHz LPI, see MWX_6GHZ_LPI_POWER. */
+	const int pwr = band == MT_TX_PWR_BAND_6GHZ ? MWX_6GHZ_LPI_POWER : 0x28;
 
 	memset(sku, max_power, MT_SKU_POWER_LIMIT);
 
 	if (band == MT_TX_PWR_BAND_2GHZ) {
 		/* cck */
-		memset(sku, 0x28, 4);
+		memset(sku, pwr, 4);
 	}
 
 	/* ofdm */
-	memset(sku + offset, 0x28, 8);
+	memset(sku + offset, pwr, 8);
 	offset += 8;
 
 	/* ht */
 	for (i = 0; i < 2; i++) {
-		memset(sku + offset, 0x28, 8);
+		memset(sku + offset, pwr, 8);
 		offset += 8;
 	}
-	sku[offset++] = 0x28;
+	sku[offset++] = pwr;
 
 	/* vht */
 	for (i = 0; i < 4; i++) {
 		/* this only sets 10 out of 12 bytes on purpose */
-		memset(sku + offset, 0x28, 10);
+		memset(sku + offset, pwr, 10);
 		offset += 12;
 	}
 
 	/* he */
 	for (i = 0; i < 7; i++) {
-		memset(sku + offset, 0x28, 12);
+		memset(sku + offset, pwr, 12);
 		offset += 12;
 	}
 }
@@ -6503,7 +6585,7 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 	status->seqno = IEEE80211_SEQ_TO_SN(seq_ctrl);
 	status->qos_ctl = qos_ctl;
 #endif
-	rxi->rxi_chan = info.channel;
+	rxi->rxi_chan = mwx_rxd_chan_idx(info.channel);
 
 	if (rxi->rxi_flags & IEEE80211_RXI_HWDEC) {
 		/*
@@ -7198,12 +7280,15 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 	struct sta_rec_state *state;
 	struct sta_rec_phy *phy;
 	uint16_t supp_rates = 0, basic_rates = 0;
-	int is_2g, ht, vht, he, i, idx;
+	int is_2g, is_6g, ht, vht, he, i, idx;
 
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	is_6g = IEEE80211_IS_CHAN_6GHZ(ni->ni_chan);
 	ht = assoc && (ni->ni_flags & IEEE80211_NODE_HT) != 0;
 	vht = ht && !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
-	he = ht && (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
+	/* 6 GHz: HE without HT/VHT. */
+	he = assoc && (ht || is_6g) &&
+	    (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
 	    (ni->ni_flags & IEEE80211_NODE_HE) != 0;
 
 	if (sc->sc_knobs & MWX_KNOB_OLD_STA) {
@@ -7257,6 +7342,14 @@ mt7921_mcu_add_sta_tlv(struct mbuf *m, uint16_t *tlvnum, struct mwx_softc *sc,
 
 	if (he)
 		mt7921_mcu_add_sta_he_tlv(m, tlvnum, sc, ni);
+	if (he && is_6g) {
+		struct sta_rec_he_6g_capa *he6;
+
+		/* As mt76_connac_mcu_sta_tlv() in the ASSOC state. */
+		he6 = (struct sta_rec_he_6g_capa *)mwx_append_tlv(m, tlvnum,
+		    STA_REC_HE_6G, sizeof(*he6));
+		he6->capa = htole16(ni->ni_he_6ghz_capa);
+	}
 
 	/* Legacy rate bitmaps, indexed like the mt76 band rate tables. */
 	for (i = 0; i < ni->ni_rates.rs_nrates; i++) {
@@ -7394,6 +7487,25 @@ mt7921_mcu_wtbl_ht_tlv(struct mbuf *m, uint16_t *tlvnum,
 		ht->af = ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_LE;
 		ht->mm = (ni->ni_ampdu_param & IEEE80211_AMPDU_PARAM_SS) >> 2;
 		len += sizeof(*ht);
+	} else if (assoc && IEEE80211_IS_CHAN_6GHZ(ni->ni_chan) &&
+	    ni->ni_he_6ghz_capa != 0) {
+		struct wtbl_vht *vht;
+
+		/* MtkWireless: as mt76_connac_mcu_wtbl_ht_tlv(), A-MPDU
+		 * limits from the HE 6 GHz Band Capabilities. */
+		ht = (struct wtbl_ht *)mwx_append_tlv(m, tlvnum, WTBL_HT,
+		    sizeof(*ht));
+		ht->ht = 1;
+		ht->af = (ni->ni_he_6ghz_capa &
+		    IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP) >> 3;
+		ht->mm = ni->ni_he_6ghz_capa &
+		    IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START;
+		len += sizeof(*ht);
+		vht = (struct wtbl_vht *)mwx_append_tlv(m, tlvnum, WTBL_VHT,
+		    sizeof(*vht));
+		vht->vht = 1;
+		len += sizeof(*vht);
+		ht = NULL;	/* no VHT Capabilities to merge below */
 	}
 
 	if (ht != NULL && (ni->ni_flags & IEEE80211_NODE_VHT) &&
@@ -7991,6 +8103,12 @@ MtkMwx::is5GBandSupport()
 	return com != NULL && com->sc_capa.has_5ghz;
 }
 
+bool
+MtkMwx::is6GBandSupport()
+{
+	return com != NULL && com->sc_capa.has_6ghz;
+}
+
 int
 MtkMwx::getTxNSS()
 {
@@ -8323,7 +8441,7 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 			uint8_t sco, band, pad[2];
 		} __packed rlm;
 	} __packed channel = {};
-	int rv, is_2g, ht, vht, he;
+	int rv, is_2g, is_6g, ht, vht, he;
 
 	if (ic->ic_opmode != IEEE80211_M_STA)
 		return 0;
@@ -8331,9 +8449,11 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	    ni->ni_chan == IEEE80211_CHAN_ANYC)
 		return EINVAL;
 	is_2g = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan);
+	is_6g = IEEE80211_IS_CHAN_6GHZ(ni->ni_chan);
 	ht = (ni->ni_flags & IEEE80211_NODE_HT) != 0;
 	vht = !is_2g && (ni->ni_flags & IEEE80211_NODE_VHT) != 0;
-	he = ht && (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
+	/* 6 GHz: HE without HT/VHT Operation. */
+	he = (ht || is_6g) && (ic->ic_flags & IEEE80211_F_HEON) != 0 &&
 	    (ni->ni_flags & IEEE80211_NODE_HE) != 0;
 	bss.bss_idx = mvif->idx;
 	bss.basic.tag = htole16(UNI_BSS_INFO_BASIC);
@@ -8355,7 +8475,12 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	if (is_2g)
 		bss.basic.phymode = PHY_MODE_B | PHY_MODE_G |
 		    (ht ? PHY_MODE_GN : 0) | (he ? PHY_MODE_AX_24G : 0);
-	else
+	else if (is_6g) {
+		/* As mt76_connac_get_phy_mode{,_ext}() for 6 GHz. */
+		bss.basic.phymode = PHY_MODE_A | PHY_MODE_AN | PHY_MODE_AC |
+		    PHY_MODE_AX_5G;
+		bss.basic.phymode_ext = PHY_MODE_EXT_AX_6G;
+	} else
 		bss.basic.phymode = PHY_MODE_A | (ht ? PHY_MODE_AN : 0) |
 		    (vht ? PHY_MODE_AC : 0) | (he ? PHY_MODE_AX_5G : 0);
 	bss.basic.nonht_basic_phy = htole16(is_2g ?
@@ -8400,7 +8525,8 @@ mt7921_mcu_set_associated_bss(struct mwx_softc *sc, int associated)
 	channel.rlm.tx_streams = sc->sc_capa.num_streams;
 	channel.rlm.rx_streams = sc->sc_capa.antenna_mask;
 	channel.rlm.short_st = 1;
-	channel.rlm.band = is_2g ? 0 : 1;
+	/* enum nl80211_band, as mt76_connac_mcu_uni_set_chctx() */
+	channel.rlm.band = is_2g ? 0 : is_6g ? 3 : 1;
 	rv = mwx_send_assoc_status(sc, MCU_UNI_CMD_BSS_INFO_UPDATE,
 	    &channel, sizeof(channel));
 	MWX_DEV_LOG(sc, "associated BSS RLM channel=%u center=%u bw=%u sco=%u band=%u rv=%d\n",
@@ -8550,7 +8676,8 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 	    (sc->sc_knobs & MWX_KNOB_NO_40) == 0) {
 		if (sc->sc_capa.has_2ghz)
 			*he0 |= IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
-		if (sc->sc_capa.has_5ghz)
+		/* B1 covers 40 and 80 MHz in the 5 and 6 GHz bands. */
+		if (sc->sc_capa.has_5ghz || sc->sc_capa.has_6ghz)
 			*he0 |=
 			    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
 	}
@@ -9000,6 +9127,10 @@ uint8_t MtkMwx::awdlInfraChannel()
         com->sc_ic.ic_state != IEEE80211_S_RUN || !com->sc_ic.ic_bss ||
         !com->sc_ic.ic_bss->ni_chan)
         return 0;
+    // MtkWireless: a 6 GHz AP channel is never an AWDL channel; 0xff makes
+    // every AWDL ROC off-channel (PM handshake, or none with offchan=0).
+    if (IEEE80211_IS_CHAN_6GHZ(com->sc_ic.ic_bss->ni_chan))
+        return 0xff;
     unsigned channel = ieee80211_chan2ieee(&com->sc_ic, com->sc_ic.ic_bss->ni_chan);
     return channel <= 165 ? uint8_t(channel) : 0;
 }

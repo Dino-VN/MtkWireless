@@ -192,7 +192,8 @@ ieee80211_channel_init(struct _ifnet *ifp)
             /*
              * Verify driver passed us valid data.
              */
-            if (i != ieee80211_chan2ieee(ic, c)) {
+            if (i != ieee80211_chan2idx(ic, c) ||
+                (i >= IEEE80211_CHAN_6GHZ_BASE) != !!IEEE80211_IS_CHAN_6GHZ(c)) {
                 XYLog("%s: bad channel ignored; "
                       "freq %u flags %x number %u\n",
                       ifp->if_xname, c->ic_freq, c->ic_flags,
@@ -214,6 +215,9 @@ ieee80211_channel_init(struct _ifnet *ifp)
                 ic->ic_modecaps |= 1<<IEEE80211_MODE_11N;
             if (IEEE80211_IS_CHAN_AC(c))
                 ic->ic_modecaps |= 1<<IEEE80211_MODE_11AC | 1<<IEEE80211_MODE_11AX;
+            /* 6 GHz is HE only, with OFDM (11a) legacy rates. */
+            if (IEEE80211_IS_CHAN_6GHZ(c))
+                ic->ic_modecaps |= 1<<IEEE80211_MODE_11A | 1<<IEEE80211_MODE_11AX;
         }
     }
     /* validate ic->ic_curmode */
@@ -302,6 +306,14 @@ ieee80211_ifdetach(struct _ifnet *ifp)
 u_int
 ieee80211_mhz2ieee(u_int freq, u_int flags)
 {
+    /* MtkWireless: 6 GHz, 5935 (channel 2) and 5955 + 5 * n. */
+    if ((flags & IEEE80211_CHAN_6GHZ) ||
+        (!(flags & (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ)) &&
+         freq >= 5935 && freq <= 7115)) {
+        if (freq == 5935)
+            return 2;
+        return (freq - 5950) / 5;
+    }
     if (flags & IEEE80211_CHAN_2GHZ) {    /* 2GHz band */
         if (freq == 2484)
             return 14;
@@ -329,13 +341,41 @@ u_int
 ieee80211_chan2ieee(struct ieee80211com *ic, const struct ieee80211_channel *c)
 {
     struct _ifnet *ifp = &ic->ic_if;
-    if (ic->ic_channels <= c && c <= &ic->ic_channels[IEEE80211_CHAN_MAX])
-        return c - ic->ic_channels;
-    else if (c == IEEE80211_CHAN_ANYC)
+    if (ic->ic_channels <= c && c <= &ic->ic_channels[IEEE80211_CHAN_MAX]) {
+        u_int idx = c - ic->ic_channels;
+        return idx >= IEEE80211_CHAN_6GHZ_BASE ?
+            idx - IEEE80211_CHAN_6GHZ_BASE : idx;
+    } else if (c == IEEE80211_CHAN_ANYC)
         return IEEE80211_CHAN_ANY;
     
     XYLog("严重%s: bogus channel pointer", ifp->if_xname);
     return 1;
+}
+
+/*
+ * MtkWireless: ic_channels[] index of a channel, for the ic_chan_* bitmaps.
+ * Unlike ieee80211_chan2ieee(), unique across bands.
+ */
+u_int
+ieee80211_chan2idx(struct ieee80211com *ic, const struct ieee80211_channel *c)
+{
+    if (ic->ic_channels <= c && c <= &ic->ic_channels[IEEE80211_CHAN_MAX])
+        return c - ic->ic_channels;
+    if (c == IEEE80211_CHAN_ANYC)
+        return IEEE80211_CHAN_ANY;
+    return 1;
+}
+
+/*
+ * MtkWireless: ic_channels[] index of IEEE channel chan in the band given by
+ * flags (IEEE80211_CHAN_6GHZ or not).
+ */
+u_int
+ieee80211_ieee2idx(u_int chan, u_int flags)
+{
+    if (flags & IEEE80211_CHAN_6GHZ)
+        return chan + IEEE80211_CHAN_6GHZ_BASE;
+    return chan;
 }
 
 /*
@@ -344,6 +384,11 @@ ieee80211_chan2ieee(struct ieee80211com *ic, const struct ieee80211_channel *c)
 u_int
 ieee80211_ieee2mhz(u_int chan, u_int flags)
 {
+    if (flags & IEEE80211_CHAN_6GHZ) {    /* 6GHz band */
+        if (chan == 2)
+            return 5935;
+        return 5950 + (chan * 5);
+    }
     if (flags & IEEE80211_CHAN_2GHZ) {    /* 2GHz band */
         if (chan == 14)
             return 2484;
@@ -1173,9 +1218,10 @@ ieee80211_setmode(struct ieee80211com *ic, enum ieee80211_phymode mode)
         IEEE80211_CHAN_A,    /* IEEE80211_MODE_11A */
         IEEE80211_CHAN_B,    /* IEEE80211_MODE_11B */
         IEEE80211_CHAN_PUREG,    /* IEEE80211_MODE_11G */
-        IEEE80211_CHAN_HT,    /* IEEE80211_MODE_11N */
-        IEEE80211_CHAN_VHT | IEEE80211_CHAN_HT,    /* IEEE80211_MODE_11AC */
-        IEEE80211_CHAN_VHT | IEEE80211_CHAN_HT,    /* IEEE80211_MODE_11AX */
+        /* MtkWireless: 6 GHz stays active (scans) after an 11n/ac join. */
+        IEEE80211_CHAN_HT | IEEE80211_CHAN_6GHZ,    /* IEEE80211_MODE_11N */
+        IEEE80211_CHAN_VHT | IEEE80211_CHAN_HT | IEEE80211_CHAN_6GHZ, /* IEEE80211_MODE_11AC */
+        IEEE80211_CHAN_VHT | IEEE80211_CHAN_HT | IEEE80211_CHAN_6GHZ, /* IEEE80211_MODE_11AX */
     };
     const struct ieee80211_channel *c;
     u_int modeflags;
@@ -1227,14 +1273,14 @@ ieee80211_setmode(struct ieee80211com *ic, enum ieee80211_phymode mode)
      * not the right one.
      */
     if (ic->ic_ibss_chan == NULL || isclr(ic->ic_chan_active,
-                                          ieee80211_chan2ieee(ic, ic->ic_ibss_chan))) {
+                                          ieee80211_chan2idx(ic, ic->ic_ibss_chan))) {
         for (i = 0; i <= IEEE80211_CHAN_MAX; i++)
             if (isset(ic->ic_chan_active, i)) {
                 ic->ic_ibss_chan = &ic->ic_channels[i];
                 break;
             }
         if ((ic->ic_ibss_chan == NULL) || isclr(ic->ic_chan_active,
-                                                ieee80211_chan2ieee(ic, ic->ic_ibss_chan)))
+                                                ieee80211_chan2idx(ic, ic->ic_ibss_chan)))
             panic("Bad IBSS channel %u",
                   ieee80211_chan2ieee(ic, ic->ic_ibss_chan));
     }
@@ -1358,7 +1404,7 @@ ieee80211_chan2mode(struct ieee80211com *ic,
     }
     
     /* Deduce a legacy mode based on the channel characteristics. */
-    if (IEEE80211_IS_CHAN_5GHZ(chan))
+    if (IEEE80211_IS_CHAN_5GHZ(chan) || IEEE80211_IS_CHAN_6GHZ(chan))
         return IEEE80211_MODE_11A;
     else if (chan->ic_flags & (IEEE80211_CHAN_OFDM|IEEE80211_CHAN_DYN))
         return IEEE80211_MODE_11G;

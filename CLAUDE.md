@@ -143,6 +143,20 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
 - Turning on `IEEE80211_C_MFP` changes WPA2 joins too: APs with MFPC now
   negotiate PMF. `amtk_pmf=0` is the escape hatch. Unverified on hardware.
 
+## Wi-Fi 6 GHz (docs/WIFI-6GHZ.md, unverified on hardware)
+
+- Off unless boot-arg `amtk_6ghz=1` (`mwx_6ghz_enabled`): 6 GHz BSSes need
+  OWE or SAE with H2E (ieee80211_sae.c is hunting-and-pecking only), with
+  PMF. 6 GHz channel n is `ic_channels[IEEE80211_CHAN_6GHZ_BASE +
+  n]` (flag `IEEE80211_CHAN_6GHZ`); `ieee80211_chan2ieee` gives the number,
+  `ieee80211_chan2idx` the index. Use the index for every `ic_chan_*` and
+  WCL channel bitmap; never index `ic_channels` by a frame's channel number
+  without its band.
+- Apple chanspec band bits 14-15: 0 = 2.4, 3 = 5, 1 = 6 GHz (`0x5000|ch`);
+  `apple80211_channel` flag 0x2000. AWDL never goes to 6 GHz; associated on
+  6 GHz, `awdlInfraChannel()` is 0xff so every AWDL ROC takes the PM
+  handshake.
+
 ## How macOS uses the Bluetooth controller (do not regress)
 
 - `bluetoothd` (bm3_usb) talks to the USB device from user space; the kernel

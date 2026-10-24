@@ -851,6 +851,54 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     XYLog("%s chan_width=%s support_160=%d support_80_80=%d\n", __FUNCTION__, ieee80211_chan_width_name[ni->ni_chw], support_160, support_80_80);
 }
 
+/*
+ * MtkWireless: a 6 GHz BSS has no HT/VHT Operation; its width and center
+ * come from the HE 6 GHz Operation Information. 80+80 is not used; 160 MHz
+ * only if both sides support it.
+ */
+static void
+ieee80211_he_6ghz_negotiate_chw(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    const uint8_t *op = ni->ni_he_6ghz_oper;
+    uint8_t ccfs0 = op[2], ccfs1 = op[3];
+    int center = ccfs0;
+
+    ni->ni_chw = IEEE80211_CHAN_WIDTH_20;
+    ni->ni_chan->ic_center_freq1 = ni->ni_chan->ic_freq;
+    ni->ni_chan->ic_center_freq2 = 0;
+    if (!ni->ni_he_6ghz_oper_valid || ccfs0 == 0)
+        return;
+    switch (op[1] & IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH) {
+    case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_160MHZ:
+        if ((ic->ic_he_cap_elem.phy_cap_info[0] &
+             IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) &&
+            (ni->ni_he_cap_elem.phy_cap_info[0] &
+             IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G) &&
+            (ccfs1 == 0 || abs(ccfs1 - ccfs0) == 8)) {
+            ni->ni_chw = IEEE80211_CHAN_WIDTH_160;
+            center = ccfs1 ? ccfs1 : ccfs0;
+            break;
+        }
+        /* FALLTHROUGH: the primary 80 MHz is centered on ccfs0 */
+    case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_80MHZ:
+        ni->ni_chw = IEEE80211_CHAN_WIDTH_80;
+        break;
+    case IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH_40MHZ:
+        ni->ni_chw = IEEE80211_CHAN_WIDTH_40;
+        break;
+    default:
+        return;
+    }
+    if ((ic->ic_he_cap_elem.phy_cap_info[0] &
+         IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G) == 0) {
+        ni->ni_chw = IEEE80211_CHAN_WIDTH_20;
+        return;
+    }
+    ni->ni_chan->ic_center_freq1 = ieee80211_ieee2mhz(center, IEEE80211_CHAN_6GHZ);
+    XYLog("%s 6 GHz chan_width=%s center=%d\n", __FUNCTION__,
+          ieee80211_chan_width_name[ni->ni_chw], center);
+}
+
 void
 ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 {
@@ -875,6 +923,10 @@ ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
     
     ni->ni_flags |= IEEE80211_NODE_HE;
     
+    if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) {
+        ieee80211_he_6ghz_negotiate_chw(ic, ni);
+        return;
+    }
     if (!(htole32(ni->ni_he_oper_params) & IEEE80211_HE_OPERATION_VHT_OPER_INFO))
         return;
 

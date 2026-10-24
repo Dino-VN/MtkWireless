@@ -1753,8 +1753,14 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
     const uint8_t *heopmode;
+    const uint8_t *he6cap = NULL;
+    const struct ieee80211_he_6ghz_oper *he6op = NULL;
     u_int16_t capinfo, bintval;
-    u_int8_t chan, bchan, erp, dtim_count, dtim_period;
+    /* MtkWireless: chan and bchan are ic_channels indices (6 GHz above
+     * IEEE80211_CHAN_6GHZ_BASE); channel numbers in the frame are in the
+     * band it was received on. */
+    u_int chan, bchan;
+    u_int8_t erp, dtim_count, dtim_period;
     int is_new;
     
     /*
@@ -1796,8 +1802,10 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     htcaps = htop = NULL;
     if (rxi->rxi_chan)
          bchan = rxi->rxi_chan;
+     else if (ic->ic_bss->ni_chan != IEEE80211_CHAN_ANYC)
+         bchan = ieee80211_chan2idx(ic, ic->ic_bss->ni_chan);
      else
-         bchan = ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan);
+         bchan = 0;
     chan = bchan;
     erp = 0;
     dtim_count = dtim_period = 0;
@@ -1889,6 +1897,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                     case IEEE80211_ELEMID_EXT_HE_SPR:
                         break;
                     case IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA:
+                        he6cap = frm;
                         break;
                 }
                 break;
@@ -1917,6 +1926,17 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         DPRINTF(("vhtopmode ie too short, got %d, expected %lu\n", vhtopmode[1], sizeof(struct ieee80211_ie_vht_operation) - 2));
         vhtopmode = NULL;
     }
+    if (bchan >= IEEE80211_CHAN_6GHZ_BASE) {
+        /* A DS Parameter Set on 6 GHz names a 6 GHz channel. */
+        if (chan < IEEE80211_CHAN_6GHZ_BASE)
+            chan += IEEE80211_CHAN_6GHZ_BASE;
+        if (heopmode != NULL)
+            he6op = ieee80211_he_6ghz_oper_ie(heopmode);
+        /* Duplicate beacons come on the other 20 MHz channels of the
+         * BSS; the HE 6 GHz Operation names the primary channel. */
+        if (he6op != NULL)
+            chan = IEEE80211_CHAN_6GHZ_BASE + he6op->primary;
+    }
     if (
 #if IEEE80211_CHAN_MAX < 255
         chan > IEEE80211_CHAN_MAX ||
@@ -1929,10 +1949,12 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         ic->ic_stats.is_rx_badchan++;
         return;
     }
-    if ((rxi->rxi_chan != 0 && chan != rxi->rxi_chan) ||
+    if (!(he6op != NULL &&
+          (he6op->control & IEEE80211_HE_6GHZ_OPER_CTRL_DUP_BEACON)) &&
+        ((rxi->rxi_chan != 0 && chan != rxi->rxi_chan) ||
         ((ic->ic_state != IEEE80211_S_SCAN ||
          !(ic->ic_caps & IEEE80211_C_SCANALL)) &&
-        chan != bchan)) {
+        chan != bchan))) {
         /*
          * Frame was received on a channel different from the
          * one indicated in the DS params element id;
@@ -1984,6 +2006,7 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         ieee80211_setup_hecaps(ni, hecap + 3, hecap[1] - 1);
         ieee80211_setup_heop(ni, heopmode + 3, heopmode[1] - 1);
     }
+    ieee80211_setup_he_6ghz(ni, he6cap, he6op);
     
     ni->ni_dtimcount = dtim_count;
     ni->ni_dtimperiod = dtim_period;
@@ -2183,7 +2206,8 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     }
     IEEE80211_ADDR_COPY(ni->ni_bssid, wh->i_addr3);
     if (ic->ic_state == IEEE80211_S_SCAN &&
-        IEEE80211_IS_CHAN_5GHZ(ni->ni_chan)) {
+        (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) ||
+         IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))) {
         /*
          * During a scan on 5Ghz, prefer RSSI measured for probe
          * response frames. i.e. don't allow beacons to lower the
@@ -2742,6 +2766,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
     const uint8_t *heopmode;
+    const uint8_t *he6cap = NULL;
     u_int16_t capinfo, status, associd;
     u_int8_t rate;
     
@@ -2840,6 +2865,7 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
                     case IEEE80211_ELEMID_EXT_HE_SPR:
                         break;
                     case IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA:
+                        he6cap = frm;
                         break;
                 }
                 break;
@@ -2886,6 +2912,9 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
         ieee80211_setup_hecaps(ni, hecap + 3, hecap[1] - 1);
         ieee80211_setup_heop(ni, heopmode + 3, heopmode[1] - 1);
     }
+    if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
+        ieee80211_setup_he_6ghz(ni, he6cap, heopmode != NULL ?
+            ieee80211_he_6ghz_oper_ie(heopmode) : NULL);
 
     ieee80211_ht_negotiate(ic, ni);
     ieee80211_vht_negotiate(ic, ni);

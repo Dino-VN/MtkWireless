@@ -256,6 +256,9 @@ enum apple80211_channel_flag
     // extension channel is below.
     APPLE80211_C_FLAG_80MHZ        = 0x400,  // name made up - set if channelWidth == 80 && 5ghz && AC
     APPLE80211_C_FLAG_160MHZ       = 0x800,  // zxystd: Apple Broadcom not use it, but we can use!
+    // MtkWireless: ChanSpecConvToApple80211Channel (IO80211Family 26.7.1)
+    // sets this for chanspec band 0x4000 instead of 2GHZ/5GHZ.
+    APPLE80211_C_FLAG_6GHZ         = 0x2000, // 6 GHz
 };
 
 enum apple80211_rate_flag

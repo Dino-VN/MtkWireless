@@ -30,6 +30,7 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 | Roaming | — | 1.0.1+, untested on hardware: same-SSID roaming for open and WPA/WPA2-Personal networks keeps the link up and reports the roam to macOS (`WCL_REASSOC` supported). A full re-association, not 802.11r; no roam scans while AWDL is on; `amtk_roam=0` turns it off. [docs/ROAMING.md](docs/ROAMING.md) |
 | Throughput, sleep/wake | — | A-MPDU/A-MSDU, SGI, 2×2 MCS 9 (11ac) / MCS 11 (11ax). Sleep stops the HAL, wake restarts it and reloads firmware if the restart fails (`MTKSleepStopStatus`, `MTKWakeStartStatus` in ioreg) |
 | 802.11ax | — | 1.0.1+: offered by default (80 MHz, no TWT/MU-MIMO/160 MHz); `amtk_he=0` turns it off |
+| 6 GHz (Wi-Fi 6E) | — | 1.0.1+, untested on hardware, off unless `amtk_6ghz=1`: MT7922/MT7921K only, HE up to 80 MHz, LPI power (12 dBm). 6 GHz networks need OWE or WPA3-SAE with hash-to-element, which joins do not do yet. AWDL never uses 6 GHz. [docs/WIFI-6GHZ.md](docs/WIFI-6GHZ.md) |
 | AWDL (Apple Wireless Direct Link) | ✅ | leaves the AP channel behind a power-save handshake (0.1.2+, `MTKAWDLInfraPS*`) |
 
 Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).

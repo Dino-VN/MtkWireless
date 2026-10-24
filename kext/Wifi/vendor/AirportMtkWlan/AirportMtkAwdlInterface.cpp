@@ -1726,7 +1726,9 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple
        d->encoding>1 || !mtkawdl::validPresence(unsigned(d->step_count)+1) || d->duplicate_count)
         return kIOReturnUnsupported;
     mtkawdl::Sequence s={}; s.count=d->length; s.step=d->step_count;
-    for(unsigned i=0;i<s.count;++i) { unsigned c=d->seqs[i].channel; if(c && (c>165 || !hal->awdlChannelAllowed(c))) return kIOReturnBadArgument; s.channels[i]=c; }
+    // MtkWireless: AWDL stays off 6 GHz (flag 0x2000, APPLE80211_C_FLAG_6GHZ;
+    // spelled out for tests/awdl); its numbers alias 2.4/5 GHz ones.
+    for(unsigned i=0;i<s.count;++i) { unsigned c=d->seqs[i].channel; if(c && ((d->seqs[i].flags & 0x2000) || c>165 || !hal->awdlChannelAllowed(c))) return kIOReturnBadArgument; s.channels[i]=c; }
     state.setSequence(s,awdlNow());
     channelSequence=*d;
     setProperty("MTKAWDLNativeChannelSequence",state.ownSequence.channels,state.ownSequence.count);

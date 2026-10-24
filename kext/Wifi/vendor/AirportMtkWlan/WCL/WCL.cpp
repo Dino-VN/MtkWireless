@@ -66,6 +66,16 @@ void AirportMtkSkywalkInterface::wclCountryUpdateThread(void *arg, void *)
     IOFree(update, sizeof(*update));
 }
 
+static_assert(AirportWCL::kSixGHzChannelBase == IEEE80211_CHAN_6GHZ_BASE,
+              "WCL channel bitmaps index ic_channels");
+
+static AirportWCL::Band wclBand(const ieee80211_channel *c)
+{
+    if (IEEE80211_IS_CHAN_6GHZ(c))
+        return AirportWCL::Band::SixGHz;
+    return IEEE80211_IS_CHAN_5GHZ(c) ? AirportWCL::Band::FiveGHz : AirportWCL::Band::TwoGHz;
+}
+
 IOReturn AirportMtkSkywalkInterface::wclCountryUpdateGated(
     OSObject *, void *arg, void *, void *, void *)
 {
@@ -310,6 +320,8 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
     if (scan.type == 2)
         ic->ic_wcl_scan_targets = {};
     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
+    static_assert(sizeof(ic->ic_wcl_scan_channels) == sizeof(scan.channels),
+                  "WCL scan channel bitmap");
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
     scanSource->setTimeoutMS(20000);
     if (ic->ic_state == IEEE80211_S_RUN) {
@@ -359,7 +371,7 @@ void AirportMtkSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, co
     if (!node->ni_chan || node->ni_chan == IEEE80211_CHAN_ANYC)
         return;
     unsigned channel = ieee80211_chan2ieee(ic, node->ni_chan);
-    if (!channel || channel > 196)
+    if (!channel || channel > (IEEE80211_IS_CHAN_6GHZ(node->ni_chan) ? 233 : 196))
         return;
     size_t size = sizeof(AirportWCL::BeaconMetadata) + length;
     auto metadata = static_cast<AirportWCL::BeaconMetadata *>(IOMalloc(size));
@@ -367,7 +379,7 @@ void AirportMtkSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, co
         return;
     *metadata = {};
     metadata->ieLength = uint32_t(length);
-    metadata->channelSpec = uint16_t(channel | (IEEE80211_IS_CHAN_5GHZ(node->ni_chan) ? 0xd000 : 0x1000));
+    metadata->channelSpec = AirportWCL::chanspec20(channel, wclBand(node->ni_chan));
     metadata->channel = channel;
     metadata->ssidLength = node->ni_esslen;
     memcpy(metadata->ssid, node->ni_essid, node->ni_esslen);
@@ -1054,8 +1066,11 @@ IOReturn AirportMtkSkywalkInterface::getWCL_CHANNELS_INFO(apple80211ChannelInfo 
             continue;
         const ieee80211_channel *channel = &ic->ic_channels[i];
         auto &entry = info->channels[info->count++];
-        entry.channel = i;
-        entry.channelSpec = uint16_t(i | (IEEE80211_IS_CHAN_5GHZ(channel) ? 0xd000 : 0x1000));
+        entry.channel = ieee80211_chan2ieee(ic, channel);
+        entry.channelSpec = AirportWCL::chanspec20(entry.channel, wclBand(channel));
+        // AppleBCMWLANCore::getWCL_CHANNELS_INFO: is6ESupportedInCurrentCountry.
+        if (IEEE80211_IS_CHAN_6GHZ(channel))
+            info->supports6GHz = 1;
         if (channel->ic_flags & IEEE80211_CHAN_DFS)
             entry.flags |= 2;
         if (channel->ic_flags & IEEE80211_CHAN_PASSIVE)
@@ -1085,7 +1100,7 @@ IOReturn AirportMtkSkywalkInterface::copyWCLChannels(void *data)
         const ieee80211_channel *channel = &ic->ic_channels[i];
         if (!isset(ic->ic_chan_active, i) || !channel->ic_freq)
             continue;
-        AirportWCL::appendChannel(*info, i, IEEE80211_IS_CHAN_5GHZ(channel),
+        AirportWCL::appendChannel(*info, ieee80211_chan2ieee(ic, channel), wclBand(channel),
             channel->ic_flags & IEEE80211_CHAN_DFS,
             channel->ic_flags & IEEE80211_CHAN_PASSIVE,
             IEEE80211_IS_CHAN_HT40(channel) || IEEE80211_IS_CHAN_VHT40(channel),
@@ -1131,10 +1146,11 @@ void AirportMtkSkywalkInterface::fillWCLRoamPeer(const ieee80211_node *node,
     peer.authType = current_authtype_upper;
     bool fiveGHz = false;
     if (node->ni_chan && node->ni_chan != IEEE80211_CHAN_ANYC) {
-        fiveGHz = IEEE80211_IS_CHAN_5GHZ(node->ni_chan);
+        fiveGHz = !IEEE80211_IS_CHAN_2GHZ(node->ni_chan);
         peer.channel = ieee80211_chan2ieee(ic, node->ni_chan);
         peer.channelFlags = APPLE80211_C_FLAG_20MHZ |
-            (fiveGHz ? APPLE80211_C_FLAG_5GHZ : APPLE80211_C_FLAG_2GHZ);
+            (IEEE80211_IS_CHAN_6GHZ(node->ni_chan) ? APPLE80211_C_FLAG_6GHZ :
+             fiveGHz ? APPLE80211_C_FLAG_5GHZ : APPLE80211_C_FLAG_2GHZ);
     }
     if (node->ni_flags & IEEE80211_NODE_HE)
         peer.phyMode = APPLE80211_MODE_11AX;

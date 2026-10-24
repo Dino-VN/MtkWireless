@@ -35,8 +35,9 @@ using IOReturn = int;
 constexpr int kIOReturnSuccess = 0;
 struct OSObject {};
 struct apple80211_capability_data {uint32_t version;uint8_t capabilities[21];};
-struct Radio {uint32_t ic_caps=0; bool band5=false;
-    bool is5GBandSupport(){return band5;}};
+struct Radio {uint32_t ic_caps=0; bool band5=false, band6=false;
+    bool is5GBandSupport(){return band5;}
+    bool is6GBandSupport(){return band6;}};
 struct Hal {Radio radio;Radio*get80211Controller(){return &radio;}
     Radio*getDriverInfo(){return &radio;}};
 struct AirportMtkAwdlInterface {static bool nativeDataPathAvailable(){return true;}};
@@ -61,9 +62,10 @@ int main(){
     // Apple80211Scan tests CARD_CAPABILITIES byte 9 bit 1 to encode
     // SCAN_SSID_LIST / SCAN_BSSID_LIST in the modern WCL SCAN_REQ.
     // Instant Hotspot supplies a list even when it contains only one SSID.
-    for(unsigned flags=0;flags<64;++flags){
-        driver.hal.radio.ic_caps=flags;
+    for(unsigned flags=0;flags<128;++flags){
+        driver.hal.radio.ic_caps=flags&63;
         driver.hal.radio.band5=flags&1;
+        driver.hal.radio.band6=flags&64;
         driver.awdlExperimental=flags&2;
         apple80211_capability_data caps;
         memset(&caps,0xaa,sizeof(caps));
@@ -78,6 +80,8 @@ int main(){
         assert(bool(caps.capabilities[3]&0x20)==driver.hal.radio.band5);
         assert(bool(caps.capabilities[4]&1)==driver.awdlExperimental);
         assert(bool(caps.capabilities[17]&0x80)==bool(flags&IEEE80211_C_HE));
+        // WCLDeviceConfiguration::is6GSupported: capability byte 0xf, bit 6.
+        assert(bool(caps.capabilities[11]&0x40)==driver.hal.radio.band6);
     }
     // The per-SSID WCL request keeps the hotspot's target and channel.
     // Offsets match apple80211ScanRequest consumed by the production decoder.
@@ -90,6 +94,25 @@ int main(){
     assert(request.identifier==123 && request.type==1 && request.ssidLength==4);
     assert(memcmp(request.ssid,"Dino",4)==0 && request.channelCount==1);
     assert(request.channels[149/8]&(1U<<(149%8)));
+    // 6 GHz entries (APPLE80211_C_FLAG_6GHZ) land above the 2.4/5 GHz bits.
+    put(0x5c,37);put(0x60,0x2000);
+    assert(AirportWCL::decodeScan(wire,sizeof(wire),request));
+    assert(!(request.channels[37/8]&(1U<<(37%8))));
+    assert(request.channels[(256+37)/8]&(1U<<((256+37)%8)));
+    assert(AirportWCL::scanChannelSelected(request.channels,true,256+37));
+    assert(!AirportWCL::scanChannelSelected(request.channels,true,37));
+    put(0x5c,237);assert(AirportWCL::decodeScan(wire,sizeof(wire),request));
+    for(uint8_t b : request.channels) assert(!b);
+    // AppleChannelSpec_t as IO80211Family decodes it.
+    assert(AirportWCL::chanspec20(6,AirportWCL::Band::TwoGHz)==0x1006);
+    assert(AirportWCL::chanspec20(149,AirportWCL::Band::FiveGHz)==0xd095);
+    assert(AirportWCL::chanspec20(37,AirportWCL::Band::SixGHz)==0x5025);
+    assert(AirportWCL::chanspecIndex(0x5025)==256+37 && AirportWCL::chanspecIndex(0xd095)==149);
+    AirportWCL::NativeChannelInfo channelsInfo{};
+    assert(AirportWCL::appendChannel(channelsInfo,37,AirportWCL::Band::SixGHz,false,true,true,true));
+    assert(channelsInfo.channelSpec[0]==0x5025 && channelsInfo.channel[0]==37);
+    assert(channelsInfo.channelBitmap[0]==(3U|(1U<<9)|(1U<<12)|32U));
+    put(0x5c,149);put(0x60,0x10);
     put(0x1c,33);assert(!AirportWCL::decodeScan(wire,sizeof(wire),request));
     put(0x1c,4);assert(!AirportWCL::decodeScan(wire,sizeof(wire)-1,request));
     // Decode the modern list emitted by IO80211ScanRequest (including its
@@ -163,7 +186,7 @@ int main(){
     assert(rl==sizeof(rsn)-4 && rsn[1]==20 && rsn[14]==1 && rsn[19]==2 && rsn[20]==0x80);
     uint8_t only[]={48,20,1,0, 0,0x0f,0xac,4, 1,0,0,0x0f,0xac,4, 1,0,0,0x0f,0xac,8, 0xc0,0};
     assert(AirportWCL::selectWPA2TransitionMode(only,sizeof(only))==sizeof(only));
-    puts("PASS: Instant Hotspot capability, WCL SSID lists, firmware primary/extended targets, passive scans, FFI validation, PMF/SAE capability, WPA3 join classification");
+    puts("PASS: Instant Hotspot capability, WCL SSID lists, firmware primary/extended targets, passive scans, 6 GHz chanspecs, FFI validation, PMF/SAE capability, WPA3 join classification");
 }
 '''
 cargo = shutil.which('cargo') or str(Path.home() / '.cargo/bin/cargo')

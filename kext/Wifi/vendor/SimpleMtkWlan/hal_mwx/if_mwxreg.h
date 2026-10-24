@@ -1422,6 +1422,15 @@ struct sta_rec_he {
 #define	STA_REC_HE_CAP_TX_1024QAM_UNDER_RU242	(1U << 19)
 #define	STA_REC_HE_CAP_RX_1024QAM_UNDER_RU242	(1U << 20)
 
+/* MtkWireless: Linux mt76_connac_mcu.h */
+#define	STA_REC_HE_6G			0x17
+struct sta_rec_he_6g_capa {
+	uint16_t	tag;
+	uint16_t	len;
+	uint16_t	capa;
+	uint8_t		rsv[2];
+} __packed;
+
 #define	STA_REC_HE_V2			0x19
 struct sta_rec_he_v2 {
 	uint16_t	tag;
@@ -1441,6 +1450,7 @@ struct sta_rec_he_v2 {
 #define	PHY_MODE_AC			(1U << 5)
 #define	PHY_MODE_AX_24G			(1U << 6)
 #define	PHY_MODE_AX_5G			(1U << 7)
+#define	PHY_MODE_EXT_AX_6G		(1U << 0)	/* phymode_ext */
 
 struct bss_info_uni_he {
 	uint16_t	tag;

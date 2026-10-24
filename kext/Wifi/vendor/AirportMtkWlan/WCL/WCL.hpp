@@ -244,13 +244,36 @@ static_assert(offsetof(NativeChannelInfo, supports80MHz) == 0xafe, "CHANNELS_INF
 static_assert(offsetof(NativeChannelInfo, firmwareChannelSpec) == 0xc90, "CHANNELS_INFO firmware chanspec");
 static_assert(offsetof(NativeChannelInfo, channelBitmap) == 0x12d0, "CHANNELS_INFO bitmap");
 
-inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGHz,
+// 6 GHz channel n is bit/index kSixGHzChannelBase + n in channel bitmaps,
+// like ic_channels[] (IEEE80211_CHAN_6GHZ_BASE): numbers alias 2.4/5 GHz.
+constexpr unsigned kSixGHzChannelBase = 256;
+constexpr unsigned kChannelBitmapBits = 512;
+
+enum class Band { TwoGHz, FiveGHz, SixGHz };
+
+// AppleChannelSpec_t of a 20 MHz channel: bits 14-15 band (0 = 2.4 GHz,
+// 3 = 5 GHz, 1 = 6 GHz; ChanSpecConvToApple80211Channel and
+// fill6gPscChanSpec, IO80211Family 26.7.1), bits 11-13 width 2 = 20 MHz.
+inline uint16_t chanspec20(unsigned channel, Band band) {
+    uint16_t bandBits = band == Band::FiveGHz ? 0xc000 :
+        band == Band::SixGHz ? 0x4000 : 0;
+    return uint16_t((channel & 0xff) | 0x1000 | bandBits);
+}
+
+// Bitmap index of an AppleChannelSpec_t's primary channel.
+inline unsigned chanspecIndex(uint16_t spec) {
+    unsigned channel = spec & 0xff;
+    return channel && (spec & 0xc000) == 0x4000 ? kSixGHzChannelBase + channel : channel;
+}
+
+inline bool appendChannel(NativeChannelInfo &info, unsigned channel, Band band,
                           bool dfs, bool passive, bool supports40MHz, bool supports80MHz)
 {
     if (!channel || channel > 255 || info.count >= 400)
         return false;
     unsigned index = info.count++;
-    uint16_t spec = uint16_t(channel | (fiveGHz ? 0xd000 : 0x1000));
+    bool fiveGHz = band == Band::FiveGHz;
+    uint16_t spec = chanspec20(channel, band);
     info.channelSpec[index] = spec;
     info.firmwareChannelSpec[index] = spec;
     info.channel[index] = channel;
@@ -258,7 +281,10 @@ inline bool appendChannel(NativeChannelInfo &info, unsigned channel, bool fiveGH
     info.passive[index] = passive;
     info.supports40MHz[index] = supports40MHz;
     info.supports80MHz[index] = supports80MHz;
+    // Broadcom WL_CHAN_* (handleChanInfoTimer): VALID_HW|VALID_SW, BAND_5G,
+    // RADAR, PASSIVE; 6 GHz is BAND_6G (bit 9) with LPI power (bit 12).
     info.channelBitmap[index] = 3U | (fiveGHz ? 4U : 0U) |
+        (band == Band::SixGHz ? (1U << 9) | (1U << 12) : 0U) |
         (dfs ? 8U : 0U) | (passive ? 32U : 0U);
     return true;
 }
@@ -368,12 +394,13 @@ struct ScanRequest {
     uint32_t ssidLength;
     uint8_t bssid[6];
     uint32_t channelCount;
-    uint8_t channels[32];
+    uint8_t channels[kChannelBitmapBits / 8]; // by ic_channels index
     mtk_wlan_scan_ssids targets;
 };
 
 inline bool scanChannelSelected(const uint8_t *channels, bool restricted, unsigned channel) {
-    return !restricted || (channel < 256 && (channels[channel / 8] & (1U << (channel % 8))));
+    return !restricted || (channel < kChannelBitmapBits &&
+                           (channels[channel / 8] & (1U << (channel % 8))));
 }
 
 inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
@@ -398,11 +425,17 @@ inline bool decodeScan(const void *buffer, size_t length, ScanRequest &out) {
     for (uint32_t i = 0; i < count; ++i) {
         const uint8_t *entry = p + 0x58 + size_t(i) * 12;
         uint32_t channel = read32(entry + 4), flags = read32(entry + 8);
-        // Do not confuse 6 GHz channel numbers with overlapping 2.4 GHz ones.
-        if (!channel || channel > 196 || (flags & 0x2000))
+        if (!channel)
             continue;
-        if (((flags & 0x8) && channel > 14) || ((flags & 0x10) && channel <= 14))
+        // APPLE80211_C_FLAG_6GHZ: 6 GHz numbers overlap 2.4/5 GHz ones.
+        if (flags & 0x2000) {
+            if (channel > 233)
+                continue;
+            channel += kSixGHzChannelBase;
+        } else if (channel > 196 || ((flags & 0x8) && channel > 14) ||
+                   ((flags & 0x10) && channel <= 14)) {
             continue;
+        }
         out.channels[channel / 8] |= 1U << (channel % 8);
     }
     return true;
@@ -627,7 +660,7 @@ struct ReassocRequest {
     uint8_t flags;
     uint8_t ssidLength;
     uint8_t ssid[32];
-    uint8_t channels[32];
+    uint8_t channels[kChannelBitmapBits / 8]; // by ic_channels index
 };
 
 inline bool validUnicastAddress(const uint8_t *address) {
@@ -659,7 +692,7 @@ inline bool decodeReassoc(const void *buffer, size_t length, ReassocRequest &out
     }
     for (uint32_t i = 0; i < count; ++i) {
         // AppleChannelSpec_t: primary channel in the low byte.
-        unsigned channel = read16(p + 2 * i) & 0xff;
+        unsigned channel = chanspecIndex(read16(p + 2 * i));
         if (channel)
             out.channels[channel / 8] |= 1U << (channel % 8);
     }

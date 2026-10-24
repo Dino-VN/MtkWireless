@@ -222,7 +222,14 @@ static void array_sprintf(char *output, uint8_t output_size, const uint8_t *arra
     }
 }
 
-#define	IEEE80211_CHAN_MAX	255
+/*
+ * MtkWireless: ic_channels[] is indexed by IEEE channel number for 2.4 and
+ * 5 GHz; 6 GHz numbers (1-233) collide with those, so 6 GHz channel n lives
+ * at IEEE80211_CHAN_6GHZ_BASE + n. ieee80211_chan2ieee() still returns the
+ * IEEE number; ieee80211_chan2idx() returns the index for ic_chan_* bitmaps.
+ */
+#define	IEEE80211_CHAN_6GHZ_BASE	256
+#define	IEEE80211_CHAN_MAX	511
 #define	IEEE80211_CHAN_ANY	0xffff		/* token for ``any channel'' */
 #define	IEEE80211_CHAN_ANYC \
 	((struct ieee80211_channel *) NULL)
@@ -325,6 +332,7 @@ struct ieee80211_channel {
 #define IEEE80211_CHAN_VHT80    0x08000000 /* VHT80 channel */
 #define IEEE80211_CHAN_VHT160    0x10000000 /* VHT160 channel */
 #define IEEE80211_CHAN_VHT80_80    0x20000000 /* VHT80+80 channel */
+#define IEEE80211_CHAN_6GHZ    0x40000000 /* 6 GHz spectrum channel */
 
 #define IEEE80211_CHAN_HT40    (IEEE80211_CHAN_HT40U | IEEE80211_CHAN_HT40D)
 #define IEEE80211_CHAN_HT    (IEEE80211_CHAN_HT20 | IEEE80211_CHAN_HT40)
@@ -335,7 +343,7 @@ struct ieee80211_channel {
                 | IEEE80211_CHAN_VHT160)
 
 #define IEEE80211_CHAN_ALL  \
-    (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ | \
+    (IEEE80211_CHAN_2GHZ | IEEE80211_CHAN_5GHZ | IEEE80211_CHAN_6GHZ | \
     IEEE80211_CHAN_CCK | IEEE80211_CHAN_OFDM | IEEE80211_CHAN_PASSIVE | IEEE80211_CHAN_DYN | IEEE80211_CHAN_XR | \
     IEEE80211_CHAN_HT | IEEE80211_CHAN_VHT)
 
@@ -368,6 +376,10 @@ struct ieee80211_channel {
 	(((_c)->ic_flags & IEEE80211_CHAN_2GHZ) != 0)
 #define	IEEE80211_IS_CHAN_5GHZ(_c) \
 	(((_c)->ic_flags & IEEE80211_CHAN_5GHZ) != 0)
+#define	IEEE80211_IS_CHAN_6GHZ(_c) \
+	(((_c)->ic_flags & IEEE80211_CHAN_6GHZ) != 0)
+/* 6 GHz preferred scanning channels: 5, 21, ..., 229. */
+#define	IEEE80211_IS_6GHZ_PSC(_n)	((_n) >= 5 && (_n) <= 229 && (_n) % 16 == 5)
 #define	IEEE80211_IS_CHAN_OFDM(_c) \
 	(((_c)->ic_flags & IEEE80211_CHAN_OFDM) != 0)
 #define	IEEE80211_IS_CHAN_CCK(_c) \
@@ -469,7 +481,7 @@ struct ieee80211com {
     uint8_t ic_wcl_scan_ssid[32];
     mtk_wlan_scan_ssids ic_wcl_scan_targets;
     bool ic_wcl_scan_restricted;
-    uint8_t ic_wcl_scan_channels[32];
+    uint8_t ic_wcl_scan_channels[64]; /* by ic_channels index */
     uint32_t ic_wcl_scan_away_time_ms; /* SET_SCAN_HOME_AWAY_TIME, 0 = unset */
     /* MtkWireless: same-ESS roaming for the current WCL join. A background
      * scan may then leave the joined BSSID (F_DESBSSID still names it);
@@ -613,6 +625,7 @@ struct ieee80211com {
     
     /* HE state */
     struct ieee80211_he_cap_elem ic_he_cap_elem;   /* Fixed portion of the HE capabilities element. */
+    uint16_t ic_he_6ghz_capa;   /* HE 6 GHz Band Capabilities, if 6 GHz */
     struct ieee80211_he_mcs_nss_supp ic_he_mcs_nss_supp;   /* The supported NSS/MCS combinations. */
     uint8_t ic_ppe_thres[IEEE80211_HE_PPE_THRES_MAX_LEN]; /* Holds the PPE Thresholds data. */
     
@@ -754,6 +767,9 @@ u_int8_t ieee80211_plcp2rate(u_int8_t, enum ieee80211_phymode);
 u_int	ieee80211_mhz2ieee(u_int, u_int);
 u_int	ieee80211_chan2ieee(struct ieee80211com *,
 		const struct ieee80211_channel *);
+u_int	ieee80211_chan2idx(struct ieee80211com *,
+		const struct ieee80211_channel *);
+u_int	ieee80211_ieee2idx(u_int, u_int);
 u_int	ieee80211_ieee2mhz(u_int, u_int);
 int	ieee80211_min_basic_rate(struct ieee80211com *);
 int	ieee80211_max_basic_rate(struct ieee80211com *);

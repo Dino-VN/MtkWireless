@@ -9,8 +9,10 @@ a disconnect followed by an auto-join.
 
 Covered: open networks and WPA/WPA2-Personal (PSK, SHA256-PSK, the PSK side
 of a WPA3 transition network). Not covered: WEP, 802.1X (the PMK is cached for
-the joined BSSID only), 802.11r FT, 802.11k/v and 6 GHz (the driver has no
-6 GHz support). Boot-arg `amtk_roam=0` restores the old behavior.
+the joined BSSID only), 802.11r FT, 802.11k/v and roaming to 6 GHz (off
+unless `amtk_6ghz=1`, and 6 GHz BSSes take SAE H2E or OWE only; see
+[WIFI-6GHZ.md](WIFI-6GHZ.md)). Boot-arg `amtk_roam=0` restores the old
+behavior.
 
 ## How WCL sees a Broadcom roam (macOS 26.7.1 25G241)
 

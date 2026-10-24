@@ -868,6 +868,10 @@ getCARD_CAPABILITIES(OSObject *object,
     // Tahoe configureValidAWDLChannels reads capability bit 29 for dual band.
     // A single radio can support both bands; this does not advertise RSDB.
     if (fHalService->getDriverInfo()->is5GBandSupport()) cd->capabilities[3] |= 0x20;
+    // MtkWireless: 6 GHz, where AppleBCMWLANCore::getCARD_CAPABILITIES puts
+    // feature 0x5d: byte 0xf of apple80211_capability_data, bit 6
+    // (WCLDeviceConfiguration::is6GSupported).
+    if (fHalService->getDriverInfo()->is6GBandSupport()) cd->capabilities[11] |= 0x40;
     // Tahoe WCLDeviceConfiguration::isHeSupported reads byte 17, bit 7.
     // WCL uses this capability together with the BSS HE IE for PHY reporting.
     if (caps & IEEE80211_C_HE)

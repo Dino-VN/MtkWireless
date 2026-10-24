@@ -497,8 +497,9 @@ ieee80211_ess_calculate_score(struct ieee80211com *ic,
     if (ni->ni_capinfo & IEEE80211_CAPINFO_PRIVACY)
         score += 4;
     
-    /* 5GHz with a good signal */
-    if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+    /* 5 or 6 GHz with a good signal */
+    if ((IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) ||
+         IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) &&
         ni->ni_rssi > min_5ghz_rssi)
         score += 2;
     
@@ -918,7 +919,7 @@ ieee80211_next_scan(struct _ifnet *ifp)
     for (;;) {
         if (++chan > &ic->ic_channels[IEEE80211_CHAN_MAX])
             chan = &ic->ic_channels[0];
-        if (isset(ic->ic_chan_scan, ieee80211_chan2ieee(ic, chan))) {
+        if (isset(ic->ic_chan_scan, ieee80211_chan2idx(ic, chan))) {
             /*
              * Ignore channels marked passive-only
              * during an active scan.
@@ -932,7 +933,7 @@ ieee80211_next_scan(struct _ifnet *ifp)
             return;
         }
     }
-    clrbit(ic->ic_chan_scan, ieee80211_chan2ieee(ic, chan));
+    clrbit(ic->ic_chan_scan, ieee80211_chan2idx(ic, chan));
     DPRINTF(("chan %d->%d\n",
              ieee80211_chan2ieee(ic, ic->ic_bss->ni_chan),
              ieee80211_chan2ieee(ic, chan)));
@@ -1069,7 +1070,7 @@ ieee80211_match_bss(struct ieee80211com *ic, struct ieee80211_node *ni,
         return IEEE80211_NODE_ASSOCFAIL_ESSID;
     fail = 0;
     if ((ic->ic_flags & IEEE80211_F_BGSCAN) == 0 &&
-        isclr(ic->ic_chan_active, ieee80211_chan2ieee(ic, ni->ni_chan)))
+        isclr(ic->ic_chan_active, ieee80211_chan2idx(ic, ni->ni_chan)))
         fail |= IEEE80211_NODE_ASSOCFAIL_CHAN;
     if (ic->ic_des_chan != IEEE80211_CHAN_ANYC &&
         ni->ni_chan != ic->ic_des_chan)
@@ -1372,7 +1373,8 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
             if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan) &&
                 (selbs2 == NULL || ni->ni_rssi > selbs2->ni_rssi))
                 selbs2 = ni;
-            else if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+            else if ((IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) ||
+                      IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) &&
                      (selbs5 == NULL || ni->ni_rssi > selbs5->ni_rssi))
                 selbs5 = ni;
         } else if (selbs == NULL || ni->ni_rssi > selbs->ni_rssi)
@@ -1462,7 +1464,7 @@ ieee80211_end_scan(struct _ifnet *ifp)
          */
         memset(occupied, 0, sizeof(occupied));
         RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree)
-        setbit(occupied, ieee80211_chan2ieee(ic, ni->ni_chan));
+        setbit(occupied, ieee80211_chan2idx(ic, ni->ni_chan));
         for (i = 0; i < IEEE80211_CHAN_MAX; i++)
             if (isset(ic->ic_chan_active, i) && isclr(occupied, i))
                 break;
@@ -2882,6 +2884,41 @@ ieee80211_setup_hecaps(struct ieee80211_node *ni, const uint8_t *data,
         memcpy(ni->ni_ppe_thres,
                &data[sizeof(ni->ni_he_cap_elem) + mcs_nss_size],
                he_ppe_size);
+}
+
+/*
+ * MtkWireless: the 6 GHz Operation Information of an HE Operation element
+ * (the whole element, from its ID), or NULL if absent or truncated.
+ */
+const struct ieee80211_he_6ghz_oper *
+ieee80211_he_6ghz_oper_ie(const uint8_t *heop)
+{
+    const struct ieee80211_he_operation *op;
+
+    /* ID, length, extension ID, then he_oper_params and the MCS/NSS set */
+    if (heop == NULL || heop[1] < 1 + sizeof(*op))
+        return NULL;
+    op = (const struct ieee80211_he_operation *)(heop + 3);
+    if (ieee80211_he_oper_size(heop + 3) > heop[1])
+        return NULL;
+    return ieee80211_he_6ghz_oper(op);
+}
+
+/*
+ * MtkWireless: HE 6 GHz Band Capabilities (element from its ID) and the
+ * HE 6 GHz Operation Information of a BSS. Kept until the next frame that
+ * carries them; the HAL needs both for the station record and BSS width.
+ */
+void
+ieee80211_setup_he_6ghz(struct ieee80211_node *ni, const uint8_t *cap,
+    const struct ieee80211_he_6ghz_oper *op)
+{
+    if (cap != NULL && cap[1] >= 3)
+        ni->ni_he_6ghz_capa = LE_READ_2(cap + 3);
+    if (op != NULL) {
+        memcpy(ni->ni_he_6ghz_oper, op, sizeof(ni->ni_he_6ghz_oper));
+        ni->ni_he_6ghz_oper_valid = 1;
+    }
 }
 
 int

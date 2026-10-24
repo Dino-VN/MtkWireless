@@ -76,7 +76,11 @@ static int ieeeChanFlag2appleScanFlagVentura(int flags)
         ret |= APPLE80211_C_FLAG_2GHZ;
     if (flags & IEEE80211_CHAN_5GHZ)
         ret |= APPLE80211_C_FLAG_5GHZ;
-    ret |= (APPLE80211_C_FLAG_ACTIVE | APPLE80211_C_FLAG_20MHZ);
+    if (flags & IEEE80211_CHAN_6GHZ)
+        ret |= APPLE80211_C_FLAG_6GHZ;
+    ret |= APPLE80211_C_FLAG_20MHZ;
+    if (!(flags & IEEE80211_CHAN_PASSIVE) || !(flags & IEEE80211_CHAN_6GHZ))
+        ret |= APPLE80211_C_FLAG_ACTIVE;
     return ret;
 }
 
@@ -87,6 +91,8 @@ static int ieeeChanFlag2apple(int flags, int bw)
         ret |= APPLE80211_C_FLAG_2GHZ;
     if (flags & IEEE80211_CHAN_5GHZ)
         ret |= APPLE80211_C_FLAG_5GHZ;
+    if (flags & IEEE80211_CHAN_6GHZ)
+        ret |= APPLE80211_C_FLAG_6GHZ;
     if (!(flags & IEEE80211_CHAN_PASSIVE))
         ret |= APPLE80211_C_FLAG_ACTIVE;
     if (flags & IEEE80211_CHAN_DFS)
@@ -781,7 +787,8 @@ getSUPPORTED_CHANNELS(struct apple80211_sup_channel_data *ad)
     ad->version = APPLE80211_VERSION;
     ad->num_channels = 0;
     struct ieee80211com *ic = fHalService->get80211Controller();
-    for (int i = 0; i < IEEE80211_CHAN_MAX; i++) {
+    for (int i = 0; i < IEEE80211_CHAN_MAX &&
+         ad->num_channels < APPLE80211_MAX_CHANNELS; i++) {
         if (ic->ic_channels[i].ic_freq != 0) {
             ad->supported_channels[ad->num_channels].channel = ieee80211_chan2ieee(ic, &ic->ic_channels[i]);
             ad->supported_channels[ad->num_channels].flags = ieeeChanFlag2appleScanFlagVentura(ic->ic_channels[i].ic_flags);

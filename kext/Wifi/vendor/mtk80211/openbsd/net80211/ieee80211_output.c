@@ -1607,7 +1607,7 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? sizeof(struct ieee80211_ie_htcap) + sizeof(struct ieee80211_wme_info) : 0) +
         ((ic->ic_flags & IEEE80211_F_VHTON) ? sizeof(struct ieee80211_ie_vhtcap) + 2 : 0) +
-        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN) : 0));
+        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN + 2 + 1 + 2) : 0));
 	if (m == NULL)
 		return NULL;
 
@@ -1654,16 +1654,27 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 #endif
 		frm = ieee80211_add_wpa(frm, ic, ni);
 	}
+	/* MtkWireless: a 6 GHz STA sends no HT or VHT Capabilities, but the
+	 * HE 6 GHz Band Capabilities (802.11ax 26.17.1). */
 	if (ic->ic_flags & IEEE80211_F_HTON) {
-		frm = ieee80211_add_htcaps(frm, ic);
+		if (!IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
+			frm = ieee80211_add_htcaps(frm, ic);
 		frm = ieee80211_add_wme_info(frm, ic);
 	}
     
-    if (ic->ic_flags & IEEE80211_F_VHTON)
+    if ((ic->ic_flags & IEEE80211_F_VHTON) &&
+        !IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
         frm = ieee80211_add_vhtcaps(frm, ic);
     
-    if (ic->ic_flags & IEEE80211_F_HEON)
+    if (ic->ic_flags & IEEE80211_F_HEON) {
         frm = ieee80211_add_hecaps(frm, ic);
+        if (IEEE80211_IS_CHAN_6GHZ(ni->ni_chan)) {
+            *frm++ = IEEE80211_ELEMID_EXTENSION;
+            *frm++ = 1 + 2;
+            *frm++ = IEEE80211_ELEMID_EXT_HE_6GHZ_CAPA;
+            LE_WRITE_2(frm, ic->ic_he_6ghz_capa); frm += 2;
+        }
+    }
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);
