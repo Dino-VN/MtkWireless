@@ -637,6 +637,16 @@ const uint8_t mwx_channels_5ghz[] = {
 
 #define MWX_NUM_5GHZ_CHANNELS   nitems(mwx_channels_5ghz)
 
+/* MtkWireless: 5 GHz channels that need DFS (52-64, 100-144) everywhere. */
+static inline int
+mwx_chan_is_dfs(uint8_t chan)
+{
+	return (chan >= 52 && chan <= 64) || (chan >= 100 && chan <= 144);
+}
+
+/* Linux enum ieee80211_channel_flags, as MCU_CE_CMD_SET_CHAN_DOMAIN takes. */
+#define MWX_LINUX_CHAN_RADAR	(1U << 3)
+
 const uint8_t mwx_channels_6ghz[] = {
 	/* UNII-5 */
 	1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57,
@@ -2250,6 +2260,11 @@ mwx_preinit(struct mwx_softc *sc)
 			ic->ic_channels[chan].ic_flags |= IEEE80211_CHAN_HT |
 			    IEEE80211_CHAN_VHT20 | IEEE80211_CHAN_VHT40 |
 			    IEEE80211_CHAN_VHT80;
+			/* MtkWireless: UNII-2/2e need radar detection: passive
+			 * scan only, reported as DFS to airportd, never AWDL. */
+			if (mwx_chan_is_dfs(chan))
+				ic->ic_channels[chan].ic_flags |=
+				    IEEE80211_CHAN_DFS | IEEE80211_CHAN_PASSIVE;
 		}
 	}
 #ifdef NOTYET
@@ -5716,7 +5731,10 @@ mt7921_mcu_set_channel_domain(struct mwx_softc *sc)
 			continue;
 
 		channel->hw_value = htole16(ieee80211_chan2ieee(ic, chan));
-		channel->flags = htole32(0);	/* XXX */
+		/* MtkWireless: Linux IEEE80211_CHAN_RADAR, as mt76 passes it;
+		 * the firmware scans these channels passively. */
+		channel->flags = htole32((chan->ic_flags & IEEE80211_CHAN_DFS) ?
+		    MWX_LINUX_CHAN_RADAR : 0);
 
 		channel++;
 		n_5ch++;
@@ -8443,8 +8461,9 @@ mt7921_mcu_set_bss_he(struct mwx_softc *sc, struct ieee80211_node *ni,
 }
 
 /*
- * HE (802.11ax) station capabilities, offered only with the amtk_he=1
- * boot-arg (IEEE80211_F_HEON in ic_userflags). A conservative profile
+ * HE (802.11ax) station capabilities, offered unless the amtk_he=0
+ * boot-arg clears IEEE80211_F_HEON in ic_userflags (MtkWireless: on by
+ * default; MWX_KNOB_NO_HE turns it off at runtime). A conservative profile
  * like itlwm's: no TWT, OMI, STBC, beamforming, PPE thresholds or
  * A-MSDU in A-MPDU, and no 160 MHz since VHT does not offer it either.
  * mwx_apply_phy_knobs() sets the channel width bits for each join.
@@ -8484,7 +8503,7 @@ mwx_setup_he_caps(struct mwx_softc *sc)
 	ic->ic_he_mcs_nss_supp.rx_mcs_80 = htole16(map);
 	ic->ic_he_mcs_nss_supp.tx_mcs_80 = htole16(map);
 	ic->ic_caps |= IEEE80211_C_HE;
-	MWX_DEV_LOG(sc, "HE capability offered (amtk_he=1): mcs80=0x%04x\n",
+	MWX_DEV_LOG(sc, "HE capability offered: mcs80=0x%04x\n",
 	    map);
 }
 

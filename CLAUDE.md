@@ -60,7 +60,11 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   `IEEE80211_AKM_SAE`, EAPOL descriptor version 0, HW-decrypted robust mgmt
   frames accepted in `ieee80211_input`, STA-side SA Query moved out of
   `IEEE80211_STA_ONLY`), WCL SAE joins (`LegacyAuth::Sae`, cipher 10
-  password, `selectWPA2TransitionMode` only without PMF), and
+  password, `selectWPA2TransitionMode` only without PMF), DFS channels
+  52-144 flagged `IEEE80211_CHAN_DFS | PASSIVE` in `mwx_preinit` and sent as
+  Linux `IEEE80211_CHAN_RADAR` in `mt7921_mcu_set_channel_domain`
+  (`mwx_chan_is_dfs`), HE offered by default (`AirportMtkWlan.cpp`,
+  `amtk_he=0` off), and
   `include/AWDL/*.hpp`: same structs, logic forwarded to Rust
   (`rust/mtk-wlan/src/awdl`, ABI `rust/mtk-ffi/src/awdl.rs`).
 - AWDL structs are shared by C++ and Rust. When a field changes, change both

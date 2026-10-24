@@ -25,9 +25,11 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 | Wi-Fi menu, scan, join, DHCP | ✅ | WPA2 / WPA3-transition AP, 5 GHz channel 149, 80 MHz, 802.11ac |
 | WPA3-Personal (SAE), 802.11w PMF | — | 1.0.1+, untested on hardware: SAE group 19 (hunting-and-pecking) in the Rust core, PMF with IGTK/BIP and SA Query; WPA3-only and PMF-required networks join, transition networks prefer SAE. No H2E/SAE-PK (WPA3-only 6 GHz needs H2E). `amtk_pmf=0` returns to WPA2-PSK only. [docs/WIFI.md](docs/WIFI.md#wpa3-personal-and-pmf) |
 | Join while AirDrop/AWDL is active | ✅ | 0.1.3+: scans and joins take the radio from AWDL until associated |
-| 2.4 GHz, DFS channels, roaming | — | |
-| Throughput, sleep/wake | — | |
-| 802.11ax (`amtk_he=1`) | — | experimental |
+| 2.4 GHz, 5 GHz band choice | — | both bands scanned; airportd picks the BSS (it prefers 5 GHz when the signal is good) |
+| DFS channels (52–144) | — | 1.0.1+: marked DFS/passive (passive scan, never used for AWDL); joining a DFS AP is untested |
+| Roaming | — | no seamless roaming: macOS WCL roam commands are unsupported, so a weak AP is left only when the link drops and auto-join picks another BSS |
+| Throughput, sleep/wake | — | A-MPDU/A-MSDU, SGI, 2×2 MCS 9 (11ac) / MCS 11 (11ax). Sleep stops the HAL, wake restarts it and reloads firmware if the restart fails (`MTKSleepStopStatus`, `MTKWakeStartStatus` in ioreg) |
+| 802.11ax | — | 1.0.1+: offered by default (80 MHz, no TWT/MU-MIMO/160 MHz); `amtk_he=0` turns it off |
 | AWDL (Apple Wireless Direct Link) | ✅ | leaves the AP channel behind a power-save handshake (0.1.2+, `MTKAWDLInfraPS*`) |
 
 Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
@@ -40,7 +42,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | Audio (A2DP), AirPods AAC-ELD | ✅ | Read Clock and non-flushable ACL fixes |
 | BLE scanning | ✅ | Mac sees the iPhone |
 | BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs the bluetoothd page patch (macOS 26.7.1 only), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
-| Mac connecting to an iPhone over BLE | ❌ | times out; this is what breaks iPhone Mirroring pairing |
+| Mac connecting to an iPhone over BLE | ❌ | times out |
 | HFP microphone | ⚠️ | CVSD only, quiet and choppy |
 
 ### Apple features
@@ -51,7 +53,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | AirDrop iPhone → Mac, iOS 18 | ✅ | |
 | AirDrop iPhone → Mac, iOS 27 | ✅ | 0.1.13+: iOS 27 adds an 8-byte header to AWDL data frames; both framings are accepted |
 | Handoff, Universal Clipboard | ✅ | |
-| iPhone Mirroring | ❌ | passes the Mac checks, then pairing for iPhone unlock fails (Mac → iPhone BLE connect timeout). |
+| iPhone Mirroring | ❌ | not possible: needs Apple silicon or a T2 chip (Secure Enclave), which this machine does not have |
 | Instant Hotspot (same iCloud / Family) | ⚠️ | iPhone activation succeeds; directed scan fails on 1.0.0. 1.0.1 fixes the scan path, pending hardware verification; see [diagnosis](docs/INSTANT-HOTSPOT.md). |
 | Auto Unlock, Sidecar, AirPlay to Mac, Continuity Camera | — | |
 

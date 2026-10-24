@@ -303,8 +303,10 @@ bool AirportMtkWlan::start(IOService *provider)
     if (PE_parse_boot_argn("-noht40", &boot_value, sizeof(boot_value)))
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_NOHT40;
 
-    int he_enabled = 0;
-    if (PE_parse_boot_argn("amtk_he", &he_enabled, sizeof(he_enabled)) && he_enabled == 1)
+    // MtkWireless: 802.11ax is offered by default; amtk_he=0 turns it off.
+    int he_enabled = 1;
+    PE_parse_boot_argn("amtk_he", &he_enabled, sizeof(he_enabled));
+    if (he_enabled != 0)
         fHalService->get80211Controller()->ic_userflags |= IEEE80211_F_HEON;
 
     if (!fHalService->attach(pciNub)) {
