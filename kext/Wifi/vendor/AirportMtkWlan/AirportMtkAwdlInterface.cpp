@@ -752,6 +752,10 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataRxTraceCount",dataRxTraceCount,64);
     setProperty("MTKAWDLDataRxTrace",dataRxTrace,sizeof(dataRxTrace));
     setProperty("MTKAWDLDataRxLastRejected",&dataRxLastRejected,sizeof(dataRxLastRejected));
+    setProperty("MTKAWDLDataRxInvalidTraceVersion",static_cast<uint64_t>(1),32);
+    setProperty("MTKAWDLDataRxInvalidTraceCount",dataRxInvalidTraceCount,64);
+    setProperty("MTKAWDLDataRxInvalidTrace",dataRxInvalidTrace,sizeof(dataRxInvalidTrace));
+    setProperty("MTKAWDLDataRxWrongDestinationLast",&dataRxWrongDestinationLast,sizeof(dataRxWrongDestinationLast));
     setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     setProperty("MTKAWDLServiceTicks",serviceTicks,64);
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
@@ -1295,6 +1299,19 @@ void AirportMtkAwdlInterface::recordDataRx(const uint8_t *f,const mtkawdl::DataV
     if(!accepted) dataRxLastRejected=sample;
 }
 
+void AirportMtkAwdlInterface::recordInvalidDataRx(const uint8_t *f,size_t n,
+    uint64_t now,uint8_t channel,int8_t rssi,bool wrongDestination)
+{
+    auto &sample=wrongDestination ? dataRxWrongDestinationLast :
+        dataRxInvalidTrace[dataRxInvalidTraceCount++%32];
+    memset(&sample,0,sizeof(sample));
+    sample.timeUS=now; sample.frameLength=static_cast<uint32_t>(n);
+    sample.channel=channel; sample.rssi=rssi;
+    size_t length=n<sizeof(sample.prefix) ? n : sizeof(sample.prefix);
+    sample.prefixLength=length;
+    memcpy(sample.prefix,f,length);
+}
+
 bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,uint8_t channel,int8_t rssi)
 {
     auto self=static_cast<AirportMtkAwdlInterface *>(context);
@@ -1370,10 +1387,19 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         return true;
     }
     ++self->dataRxFrames;
-    if(!mtkawdl::validDataFrame(f,n)) { ++self->dataRxInvalid; return true; }
+    if(!mtkawdl::validDataFrame(f,n)) {
+        ++self->dataRxInvalid;
+#ifdef KERNEL
+        self->recordInvalidDataRx(f,n,now,channel,rssi);
+#endif
+        return true;
+    }
     int peer=self->dataPeers.find(f+10,now);
     if(peer<0) { ++self->dataRxUnknownPeer; return true; }
     if(memcmp(f+4,self->state.mac,6) && !(f[4]&1)) {
+#ifdef KERNEL
+        self->recordInvalidDataRx(f,n,now,channel,rssi,true);
+#endif
         ++self->dataRxWrongDestination; return true;
     }
     // Validate the whole aggregate before delivering any subframe. Each

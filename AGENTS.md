@@ -139,6 +139,25 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   invalid frames; their cause is still under investigation. The collector
   captures all IPv6 now, including non-mDNS UDP used by newer AirDrop,
   and includes bluetoothd logs and IOResources patch counters.
+- 0.1.12 adds diagnostic prefixes for frames rejected before awdl0 BPF:
+  `MTKAWDLDataRxInvalidTrace*` is a 32-record heap-owned ring; each packed
+  208-byte little-endian record is time u64, frame length u32, prefix length
+  u16, channel u8, RSSI i8, and 192 prefix bytes. A separate retained
+  `MTKAWDLDataRxWrongDestinationLast` uses the same format. Published once
+  per second; no RX acceptance or scheduling changes. The analyzer emits
+  `invalid-rx-trace.csv` and `wrong-destination-rx.csv`. Do not infer an
+  aggregate's validation failure from its prefix alone. The 0.1.11 capture
+  completes inbound TCP/TLS/PairVerify and outbound AirDrop (result 0), but
+  does not show an incoming AirDrop QUIC connection. Another AWDL device is
+  present; the user only sees "Mac Pro của Dino" on the iPhone. Its role and
+  the invalid frames' relevance remain unproven pending the new trace.
+- iOS 27 AWDL data (0.1.13): non-aggregated QoS frames from the iPhone
+  carry an 8-byte envelope `aa aa 03 00 00 00` + BE16 length before the AWDL
+  SNAP (capture 2026-10-24 15:02: all 44 rejected frames, length = exactly
+  the rest of the MSDU). iOS 18 sends the SNAP right after the QoS header.
+  `data_view` accepts the envelope only on QoS non-aggregated frames with an
+  exact length and keeps every AWDL/IPv6 check; it never scans for an inner
+  SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
 
 ## How macOS uses the Bluetooth controller (do not regress)
 

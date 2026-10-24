@@ -166,6 +166,20 @@ private:
     uint64_t dataRxTraceCount = 0, dataRxDuplicate = 0, dataRxTooOld = 0;
     void recordDataRx(const uint8_t*,const mtkawdl::DataView&,uint64_t,
                       uint8_t,int8_t,uint16_t,uint64_t,bool);
+    // Rejected frames never reach awdl0 BPF. Keep bounded prefixes so a
+    // structural rejection can be distinguished from a harmless QoS Null.
+    struct __attribute__((packed)) InvalidDataRxSample {
+        uint64_t timeUS;
+        uint32_t frameLength;
+        uint16_t prefixLength;
+        uint8_t channel; int8_t rssi;
+        uint8_t prefix[192];
+    };
+    static_assert(sizeof(InvalidDataRxSample)==208,"invalid AWDL RX trace ABI");
+    InvalidDataRxSample dataRxInvalidTrace[32]={};
+    InvalidDataRxSample dataRxWrongDestinationLast={};
+    uint64_t dataRxInvalidTraceCount=0;
+    void recordInvalidDataRx(const uint8_t *,size_t,uint64_t,uint8_t,int8_t,bool=false);
     IOReturn dataTxStatus = kIOReturnNotReady;
     uint64_t serviceTicks = 0, reserveAttempts = 0, grantObservations = 0, awStartNotifications = 0;
     uint64_t reserveWaitUS = 0, reserveMaxWaitUS = 0, reserveInvalidations = 0;

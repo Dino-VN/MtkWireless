@@ -13,6 +13,8 @@ end = header.index('    IOReturn dataTxStatus', start)
 fields = header[start:end]
 start = source.index('void AirportMtkAwdlInterface::recordDataRx(')
 method = source[start:source.index('\n}\n', start)+3]
+start = source.index('void AirportMtkAwdlInterface::recordInvalidDataRx(')
+method += source[start:source.index('\n}\n', start)+3]
 code = r'''
 #include <AWDL/AwdlProtocol.hpp>
 #include <cassert>
@@ -48,6 +50,26 @@ int main() {
     view.sequence=0;
     recorder.recordDataRx(frame,view,202,6,-50,65535,1,true);
     assert(recorder.dataRxTooOld==1 && recorder.dataRxLastRejected.timeUS==201);
+    // Invalid frames may be shorter than a data header or larger than MTU.
+    // Only the supplied bytes are read; ring wrap retains the original size.
+    uint8_t shortFrame[1]={0xc4};
+    recorder.recordInvalidDataRx(shortFrame,sizeof(shortFrame),300,6,-60);
+    assert(recorder.dataRxInvalidTrace[0].prefixLength==1);
+    assert(recorder.dataRxInvalidTrace[0].prefix[0]==0xc4);
+    assert(!recorder.dataRxInvalidTrace[0].prefix[1]);
+    for(unsigned i=0;i<35;++i) {
+        payload[0]=i;
+        recorder.recordInvalidDataRx(payload,sizeof(payload),301+i,149,-50);
+    }
+    assert(recorder.dataRxInvalidTraceCount==36);
+    const auto &bad=recorder.dataRxInvalidTrace[35%32];
+    assert(bad.timeUS==335 && bad.frameLength==1516 && bad.prefixLength==192);
+    assert(bad.prefix[0]==34 && bad.channel==149 && bad.rssi==-50);
+    recorder.recordInvalidDataRx(frame,sizeof(frame),400,6,-40,true);
+    assert(recorder.dataRxInvalidTraceCount==36);
+    assert(recorder.dataRxWrongDestinationLast.timeUS==400);
+    assert(recorder.dataRxWrongDestinationLast.prefixLength==sizeof(frame));
+    assert(!memcmp(recorder.dataRxWrongDestinationLast.prefix,frame,sizeof(frame)));
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-awdl-rx-trace-') as work:

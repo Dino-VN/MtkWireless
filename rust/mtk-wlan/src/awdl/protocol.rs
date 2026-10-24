@@ -5,6 +5,7 @@
 //! `wrapping_*` and `as` casts.
 
 use super::bytes::{at, copy, eq, fill, le16, le32, mac, put16, put32, set};
+use mtk_common::Reader;
 
 pub const BSSID: [u8; 6] = [0, 0x25, 0, 0xff, 0x94, 0x73];
 pub const SNAP: [u8; 8] = [0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0];
@@ -1612,8 +1613,25 @@ pub fn data_view(f: &[u8], at_: usize) -> Option<(usize, DataView)> {
             }
             used += pad;
         }
-    } else if at_ != hdr {
-        return None;
+    } else {
+        if at_ != hdr {
+            return None;
+        }
+        // Hardware capture 2026-10-24: non-aggregated QoS RX can carry
+        // RFC1042 LLC (zero OUI), a BE length, then the usual AWDL SNAP.
+        // The extra length must cover exactly the remaining MSDU. Never
+        // scan for an inner SNAP or relax the AWDL/IPv6 validation below.
+        if hdr == 26 {
+            let mut reader = Reader::new(&f[p..]);
+            if reader.take(6).ok() == Some(&[0xaa, 0xaa, 3, 0, 0, 0][..]) {
+                let body = reader.be16().ok()? as usize;
+                if body != reader.remaining() {
+                    return None;
+                }
+                p += reader.position();
+                len = body;
+            }
+        }
     }
     let payload = &f[p..p + len];
     if !(56..=1516).contains(&len)
@@ -1920,6 +1938,114 @@ pub fn receive_roc_grant(
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    fn qos_llc_frame(size: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut eth = std::vec![0; size];
+        eth[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
+        eth[6..12].copy_from_slice(&[2, 1, 2, 3, 4, 6]);
+        eth[12..15].copy_from_slice(&[0x86, 0xdd, 0x60]);
+        eth[18..20].copy_from_slice(&((size - 54) as u16).to_be_bytes());
+        let mut wire = std::vec![0; size + 26];
+        assert_eq!(encode_data(&mut wire, &eth, 65535), wire.len());
+        let mut frame = wire[..24].to_vec();
+        frame[0] = 0x88;
+        frame.extend_from_slice(&[0, 0, 0xaa, 0xaa, 3, 0, 0, 0]);
+        frame.extend_from_slice(&((wire.len() - 24) as u16).to_be_bytes());
+        frame.extend_from_slice(&wire[24..]);
+        (frame, eth)
+    }
+
+    #[test]
+    fn qos_llc_length_envelope_decodes_without_changing_msdu() {
+        // Captured rejected frames include both short packets and IPv6
+        // packets up to MTU 1500. Test every size and original plain QoS.
+        for size in 54..=1514 {
+            let (frame, eth) = qos_llc_frame(size);
+            assert!(valid_data_frame(&frame));
+            let (used, view) = data_view(&frame, 26).unwrap();
+            assert_eq!(used, frame.len() - 26);
+            assert_eq!(view.payload, 34);
+            assert_eq!(view.sequence, 65535);
+            let mut out = std::vec![0; size];
+            assert_eq!(decode_data(&mut out, &frame, &mut 0), size);
+            assert_eq!(out, eth);
+            assert_eq!(decode_data(&mut out[..size - 1], &frame, &mut 0), 0);
+            let mut plain = frame[..26].to_vec();
+            plain.extend_from_slice(&frame[34..]);
+            assert!(valid_data_frame(&plain));
+            assert_eq!(decode_data(&mut out, &plain, &mut 0), size);
+            assert_eq!(out, eth);
+        }
+    }
+
+    #[test]
+    fn old_and_new_ios_framings_decode_the_same_msdu() {
+        // iOS 18 and older put the AWDL SNAP right after the 802.11 header
+        // (plain or QoS, or in an A-MSDU); iOS 27 adds the LLC length
+        // envelope. All of them must keep decoding to the same packet.
+        for size in [54, 60, 200, 1514] {
+            let (envelope, eth) = qos_llc_frame(size);
+            let qos = [&envelope[..26], &envelope[34..]].concat();
+            let mut plain = [&envelope[..24], &envelope[34..]].concat();
+            plain[0] = 8;
+            let msdu = &envelope[34..];
+            let mut amsdu = envelope[..26].to_vec();
+            amsdu[24] = 0x80;
+            amsdu.extend_from_slice(&envelope[4..10]);
+            amsdu.extend_from_slice(&envelope[10..16]);
+            amsdu.extend_from_slice(&(msdu.len() as u16).to_be_bytes());
+            amsdu.extend_from_slice(msdu);
+            for (name, frame) in [("non-QoS", &plain), ("QoS", &qos), ("iOS 27 envelope", &envelope)] {
+                assert!(valid_data_frame(frame), "{name} {size}");
+                let mut out = std::vec![0; size];
+                assert_eq!(decode_data(&mut out, frame, &mut 0), size, "{name} {size}");
+                assert_eq!(out, eth, "{name} {size}");
+            }
+            // A-MSDU goes through data_view per subframe, as the C++ RX loop.
+            assert!(valid_data_frame(&amsdu), "A-MSDU {size}");
+            let (used, v) = data_view(&amsdu, 26).unwrap();
+            assert_eq!(used, amsdu.len() - 26);
+            let mut out = std::vec![0; size];
+            let len = decode_data_view(&mut out, &amsdu[v.destination..v.destination + 6],
+                                       &amsdu[v.source..v.source + 6], &amsdu[v.payload..v.payload + v.length]);
+            assert_eq!(len, size, "A-MSDU {size}");
+            assert_eq!(out, eth, "A-MSDU {size}");
+        }
+    }
+
+    #[test]
+    fn qos_llc_envelope_rejects_truncation_and_malformed_inner_data() {
+        let (frame, _) = qos_llc_frame(1514);
+        for n in 0..frame.len() {
+            assert!(!valid_data_frame(&frame[..n]));
+        }
+        // LLC/OUI, BE length, inner SNAP, AWDL header and IPv6 length.
+        for offset in [26, 27, 28, 29, 30, 31, 32, 33, 34, 38, 42, 46, 48, 50, 54] {
+            let mut bad = frame.clone();
+            bad[offset] ^= if offset == 50 { 0x10 } else { 1 };
+            assert!(!valid_data_frame(&bad), "offset {offset}");
+        }
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(!valid_data_frame(&trailing));
+        let mut nested = frame[..34].to_vec();
+        nested.extend_from_slice(&frame[26..]);
+        let body = (nested.len() - 34) as u16;
+        nested[32..34].copy_from_slice(&body.to_be_bytes());
+        assert!(!valid_data_frame(&nested));
+        let mut aggregate = frame.clone();
+        aggregate[24] = 0x80;
+        assert!(!valid_data_frame(&aggregate));
+        let mut non_qos = frame[..24].to_vec();
+        non_qos[0] = 8;
+        non_qos.extend_from_slice(&frame[26..]);
+        assert!(!valid_data_frame(&non_qos));
+        let mut oversized = frame.clone();
+        oversized.push(0);
+        oversized[32..34].copy_from_slice(&1517u16.to_be_bytes());
+        oversized[54..56].copy_from_slice(&1461u16.to_be_bytes());
+        assert!(!valid_data_frame(&oversized));
+    }
 
     #[test]
     fn independent_data_streams_and_idle_restart() {

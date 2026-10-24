@@ -10,6 +10,30 @@ from pathlib import Path
 
 RECORD = struct.Struct('<QQHHHHBBbB6s6s26s80s')
 assert RECORD.size == 146
+INVALID_RECORD = struct.Struct('<QIHBB192s')
+assert INVALID_RECORD.size == 208
+
+
+def decode_invalid(raw):
+    if len(raw) != INVALID_RECORD.size:
+        raise ValueError('Incomplete invalid-frame RX record')
+    time, length, size, channel, rssi_byte, prefix = INVALID_RECORD.unpack(raw)
+    if not time:
+        return None
+    if size > 192 or size > length:
+        raise ValueError('Invalid rejected-frame prefix length')
+    prefix = prefix[:size]
+    rssi = rssi_byte if rssi_byte < 128 else rssi_byte - 256
+    # Report wire fields, not a guessed validation error: only a prefix of a
+    # potentially aggregated frame is retained, and its tail may be invalid.
+    return dict(time_us=time, length=length, prefix_length=size, channel=channel,
+                rssi=rssi, fc=prefix[:2].hex(),
+                destination=prefix[4:10].hex(':') if size >= 10 else '',
+                source=prefix[10:16].hex(':') if size >= 16 else '',
+                mpdu=int.from_bytes(prefix[22:24], 'little') >> 4 if size >= 24 else '',
+                fragment=prefix[22] & 15 if size >= 24 else '',
+                qos=prefix[24:26].hex() if size >= 26 and prefix[0] == 0x88 else '',
+                prefix_hex=prefix.hex())
 
 
 def decode(raw):
@@ -46,7 +70,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('folder', type=Path)
     args = parser.parse_args()
-    records = {}
+    records, invalid_records = {}, {}
+    wrong_destinations = {}
     for path in sorted(args.folder.glob('*.plist')):
         for entry in plistlib.loads(path.read_bytes()):
             if entry.get('MTKAWDLDataRxTraceVersion') != 1:
@@ -60,7 +85,42 @@ def main():
                     row = decode(raw)
                     if row:
                         records[raw] = row
+            if entry.get('MTKAWDLDataRxInvalidTraceVersion') == 1:
+                data = entry.get('MTKAWDLDataRxInvalidTrace', b'')
+                if len(data) % INVALID_RECORD.size:
+                    raise ValueError(f'{path}: truncated invalid-frame RX trace')
+                for offset in range(0, len(data), INVALID_RECORD.size):
+                    raw = data[offset:offset+INVALID_RECORD.size]
+                    row = decode_invalid(raw)
+                    if row:
+                        invalid_records[raw] = row
+                data = entry.get('MTKAWDLDataRxWrongDestinationLast', b'')
+                if data:
+                    row = decode_invalid(data)
+                    if row:
+                        wrong_destinations[data] = row
+    if wrong_destinations:
+        rows = sorted(wrong_destinations.values(), key=lambda row: row['time_us'])
+        target = args.folder / 'wrong-destination-rx.csv'
+        with target.open('w', newline='') as output:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f'{len(rows)} retained wrong-destination samples. CSV: {target}')
+    if invalid_records:
+        rows = sorted(invalid_records.values(), key=lambda row: row['time_us'])
+        target = args.folder / 'invalid-rx-trace.csv'
+        with target.open('w', newline='') as output:
+            writer = csv.DictWriter(output, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f'{len(rows)} distinct sampled invalid frames. CSV: {target}')
+        for (fc, length, qos), count in sorted(collections.Counter(
+                (r['fc'], r['length'], r['qos']) for r in rows).items()):
+            print(f'Invalid FC={fc} length={length} QoS={qos}: {count}')
     if not records:
+        if invalid_records or wrong_destinations:
+            return
         raise SystemExit('No pre-replay RX trace: this requires the 0.1.10 diagnostic Wi-Fi kext.')
     rows = sorted(records.values(), key=lambda row: row['time_us'])
     target = args.folder / 'rx-trace.csv'

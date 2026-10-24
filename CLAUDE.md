@@ -95,6 +95,13 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   to ioreg.
 - With AWDL on, the `other_bss` RX filter lets neighbor BSS traffic in; it
   shows up as `rx drop reason=amsdu-err` with wcid 0x3ff. That is noise.
+- iOS 27 AWDL data (0.1.13): non-aggregated QoS frames from the iPhone
+  carry an 8-byte envelope `aa aa 03 00 00 00` + BE16 length before the AWDL
+  SNAP (capture 2026-10-24 15:02: all 44 rejected frames, length = exactly
+  the rest of the MSDU). iOS 18 sends the SNAP right after the QoS header.
+  `data_view` accepts the envelope only on QoS non-aggregated frames with an
+  exact length and keeps every AWDL/IPv6 check; it never scans for an inner
+  SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
 
 ## How macOS uses the Bluetooth controller (do not regress)
 
