@@ -172,6 +172,18 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   exact length and keeps every AWDL/IPv6 check; it never scans for an inner
   SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
 
+- iOS 27 aggregate RX (2026-10-26): the LLC length envelope also occurs
+  inside individual A-MSDU subframes. The non-aggregate-only 0.1.13 handling
+  rejects them and stalls inbound QUIC uploads. Parse the envelope after
+  selecting each subframe, with Reader bounded to its declared body; retain
+  outer length/padding/source and all inner AWDL/IPv6 validation. All 18
+  complete rejected frames from the live trace pass the fixed ABI parser.
+  Regression covers every Ethernet size, mixed wrapped/plain subframes,
+  padding, truncation and cross-subframe lengths. Hardware verification of
+  the new Wi-Fi build is pending; see docs/AIRDROP-IOS27.md. A separate
+  successful transfer waited ~8 s in macOS's open/move UI after receipt;
+  do not confuse that with a stalled QUIC upload lacking receive completion.
+
 ## How macOS uses the Bluetooth controller (do not regress)
 
 - `bluetoothd` (bm3_usb) talks to the USB device from user space; the kernel

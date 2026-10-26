@@ -1617,20 +1617,20 @@ pub fn data_view(f: &[u8], at_: usize) -> Option<(usize, DataView)> {
         if at_ != hdr {
             return None;
         }
-        // Hardware capture 2026-10-24: non-aggregated QoS RX can carry
-        // RFC1042 LLC (zero OUI), a BE length, then the usual AWDL SNAP.
-        // The extra length must cover exactly the remaining MSDU. Never
-        // scan for an inner SNAP or relax the AWDL/IPv6 validation below.
-        if hdr == 26 {
-            let mut reader = Reader::new(&f[p..]);
-            if reader.take(6).ok() == Some(&[0xaa, 0xaa, 3, 0, 0, 0][..]) {
-                let body = reader.be16().ok()? as usize;
-                if body != reader.remaining() {
-                    return None;
-                }
-                p += reader.position();
-                len = body;
+    }
+    // iOS 27 captures: QoS RX carries RFC1042 LLC (zero OUI), a BE
+    // length, then AWDL SNAP, also INSIDE each A-MSDU subframe. Bound the
+    // reader to this MSDU, excluding aggregate padding and later subframes.
+    // Never scan for an inner SNAP or relax AWDL/IPv6 validation below.
+    if hdr == 26 {
+        let mut reader = Reader::new(&f[p..p + len]);
+        if reader.take(6).ok() == Some(&[0xaa, 0xaa, 3, 0, 0, 0][..]) {
+            let body = reader.be16().ok()? as usize;
+            if body != reader.remaining() {
+                return None;
             }
+            p += reader.position();
+            len = body;
         }
     }
     let payload = &f[p..p + len];
@@ -2011,6 +2011,82 @@ mod tests {
             assert_eq!(len, size, "A-MSDU {size}");
             assert_eq!(out, eth, "A-MSDU {size}");
         }
+    }
+
+    fn append_subframe(frame: &mut Vec<u8>, envelope: &[u8], wrapped: bool) {
+        if frame.len() != 26 {
+            // A-MSDU padding is relative to each subframe, not the MAC header.
+            let pad = (4 - (frame.len() - 26) % 4) % 4;
+            frame.resize(frame.len() + pad, 0);
+        }
+        let msdu = &envelope[if wrapped { 26 } else { 34 }..];
+        frame.extend_from_slice(&envelope[4..16]);
+        frame.extend_from_slice(&(msdu.len() as u16).to_be_bytes());
+        frame.extend_from_slice(msdu);
+    }
+
+    #[test]
+    fn ios27_aggregate_llc_envelopes_keep_subframe_boundaries() {
+        // 2026-10-26: iOS 27 QUIC upload MSDUs also carry the eight-byte
+        // envelope inside A-MSDU subframes. The old non-aggregate-only gate
+        // discarded these, including fully retained 146-byte frames.
+        for size in 54..=1514 {
+            let (envelope, eth) = qos_llc_frame(size);
+            for wrapped in [true, false] {
+                let mut frame = envelope[..26].to_vec();
+                frame[24] = 0x80;
+                append_subframe(&mut frame, &envelope, wrapped);
+                append_subframe(&mut frame, &envelope, !wrapped);
+                assert!(valid_data_frame(&frame), "size {size}, wrapped {wrapped}");
+                let mut at = 26;
+                for _ in 0..2 {
+                    let (used, view) = data_view(&frame, at).unwrap();
+                    let mut out = std::vec![0; size];
+                    assert_eq!(decode_data_view(&mut out,
+                        &frame[view.destination..view.destination + 6],
+                        &frame[view.source..view.source + 6],
+                        &frame[view.payload..view.payload + view.length]), size);
+                    assert_eq!(out, eth);
+                    assert_eq!(view.sequence, 65535);
+                    at += used;
+                }
+                assert_eq!(at, frame.len());
+            }
+        }
+    }
+
+    #[test]
+    fn ios27_aggregate_envelope_rejects_invalid_lengths_and_payloads() {
+        let (envelope, _) = qos_llc_frame(96);
+        let mut frame = envelope[..26].to_vec();
+        frame[24] = 0x80;
+        append_subframe(&mut frame, &envelope, true);
+        // One subframe has exactly the captured short-frame shape: 26-byte
+        // MAC + 14-byte subheader + 8-byte envelope + 98-byte AWDL MSDU.
+        assert_eq!(frame.len(), 146);
+        assert!(valid_data_frame(&frame));
+        for n in 0..frame.len() {
+            assert!(!valid_data_frame(&frame[..n]), "truncated at {n}");
+        }
+        // Subframe source, outer/inner lengths, LLC/OUI, SNAP, AWDL and IPv6.
+        for offset in [32, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+                       48, 52, 56, 60, 62, 64, 68] {
+            let mut bad = frame.clone();
+            bad[offset] ^= if offset == 64 { 0x10 } else { 1 };
+            assert!(!valid_data_frame(&bad), "offset {offset}");
+        }
+        append_subframe(&mut frame, &envelope, true);
+        let mut crosses_boundary = frame.clone();
+        // An inner length covering subsequent subframes must be rejected.
+        crosses_boundary[46..48].copy_from_slice(&((frame.len() - 48) as u16).to_be_bytes());
+        assert!(!valid_data_frame(&crosses_boundary));
+        let mut bad_second = frame.clone();
+        let (used, _) = data_view(&frame, 26).unwrap();
+        bad_second[26 + used + 14 + 8] ^= 1;
+        assert!(!valid_data_frame(&bad_second));
+        let mut trailing = frame.clone();
+        trailing.push(0);
+        assert!(!valid_data_frame(&trailing));
     }
 
     #[test]
