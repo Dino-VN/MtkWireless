@@ -72,7 +72,7 @@ They use exact 25G241 signatures and are applied only after the bridge is
 ready. `-mtkbtnoextadv` still controls advertising independently.
 
 After opening the Buds' microphone, inspect `MtkBtMsbcBridgeReady` and
-`SimpleMtkMsbcBridge` on IOResources. The `MtkWirelessBT` counters
+`MtkBtMsbcBridge` on IOResources. The `MtkWirelessBT` counters
 `BluetoothdWbsPatched` and `BluetoothdHfpFillPatched` report whether the
 wideband and PCM sender page patches matched. Published
 sample counts do not prove that playback is audible; check both directions
