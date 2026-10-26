@@ -53,6 +53,8 @@ public:
         bool lastSubmitReceive;
         MtkMsbcStream::TxDiagnostics txAudio;
         MtkMsbcStream::RxDiagnostics rxAudio;
+        IOReturn rxLastCompletionStatus, rxLastFrameStatus;
+        uint64_t rxFrameErrorTransfers, rxShortFrames, rxFrameErrors, rxCompleteBytes;
     };
     Status status();
     void publishStatus();
@@ -86,6 +88,8 @@ private:
     bool _lastSubmitReceive {};
     MtkMsbcStream::TxDiagnostics _txAudio;
     MtkMsbcStream::RxDiagnostics _rxAudio;
+    IOReturn _rxLastCompletionStatus {}, _rxLastFrameStatus {};
+    uint64_t _rxFrameErrorTransfers {}, _rxShortFrames {}, _rxFrameErrors {}, _rxCompleteBytes {};
     uint32_t _inFlight {};
     bool _active {};
     bool _interfaceChanging {};

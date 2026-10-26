@@ -216,7 +216,8 @@ UsbMsbcBridge::Status UsbMsbcBridge::status() {
         _txErrors, _rxErrors, _txZeroRequestFrames, _txZeroRequestErrors,
         _lastSubmitStatus, _lastSubmitFailureStatus, _lastTxFrameStatus, _lastTxZeroRequestStatus,
         _lastTxFrameIndex, _lastTxFrameRequested, _lastTxFrameActual, _lastSubmitReceive,
-        _txAudio, _rxAudio};
+        _txAudio, _rxAudio, _rxLastCompletionStatus, _rxLastFrameStatus,
+        _rxFrameErrorTransfers, _rxShortFrames, _rxFrameErrors, _rxCompleteBytes};
     IOLockUnlock(_guard);
     return value;
 }
@@ -257,6 +258,12 @@ void UsbMsbcBridge::publishStatus() {
     add("RxCrcFailures", value.rxAudio.crcFailures);
     add("RxParserDiscardedBytes", value.rxAudio.discardedBytes);
     add("RxLastParserReason", value.rxAudio.lastParserReason);
+    add("RxLastCompletionStatus", uint32_t(value.rxLastCompletionStatus));
+    add("RxLastFrameStatus", uint32_t(value.rxLastFrameStatus));
+    add("RxFrameErrorTransfers", value.rxFrameErrorTransfers);
+    add("RxShortFrames", value.rxShortFrames);
+    add("RxFrameErrors", value.rxFrameErrors);
+    add("RxCompleteBytes", value.rxCompleteBytes);
     resource->setProperty("MtkBtMsbcBridge", dictionary);
     dictionary->release();
 #endif
@@ -377,6 +384,21 @@ IOReturn UsbMsbcBridge::prepare(Transfer *transfer) {
 
 IOReturn UsbMsbcBridge::finish(Transfer *transfer, IOReturn status) {
     if (transfer->receive) {
+        // Like btusb_isoc_complete(): a frame-level error (short frame,
+        // missed service, no packet from the device) fails only that frame.
+        // The transfer status reports it too, so judge each frame instead and
+        // fail the batch only when the pipe itself went away.
+        IOLockLock(_guard);
+        if (status != kIOReturnSuccess) _rxLastCompletionStatus = status;
+        if (status == kIOReturnUnderrun || status == kIOReturnNotResponding ||
+            status == kIOReturnIsoTooOld || status == kIOReturnIsoTooNew ||
+            status == kIOReturnOverrun || status == kIOReturnNoBandwidth) {
+            ++_rxFrameErrorTransfers;
+            status = kIOReturnSuccess;
+        }
+        IOLockUnlock(_guard);
+    }
+    if (transfer->receive) {
         // HostFamily documents workloop-serialized pipe completions. Also fail
         // closed for an atypical/deferred concurrent callback so successful PCM
         // deliveries cannot reverse after the decode lock has been released.
@@ -418,8 +440,17 @@ IOReturn UsbMsbcBridge::finish(Transfer *transfer, IOReturn status) {
                 status = frameStatus = kIOReturnBadArgument;
                 break;
             }
-            transfer->completedCounts[i] = frame.status == kIOReturnSuccess ?
-                static_cast<uint16_t>(frame.completeCount) : 0;
+            const bool usable = frame.status == kIOReturnSuccess ||
+                (transfer->receive && frame.status == kIOReturnUnderrun);
+            transfer->completedCounts[i] = usable ? static_cast<uint16_t>(frame.completeCount) : 0;
+            if (transfer->receive) {
+                IOLockLock(_guard);
+                if (frame.status != kIOReturnSuccess) _rxLastFrameStatus = frame.status;
+                if (!usable) ++_rxFrameErrors;
+                else if (frame.completeCount < frame.requestCount) ++_rxShortFrames;
+                _rxCompleteBytes += transfer->completedCounts[i];
+                IOLockUnlock(_guard);
+            }
             if (!transfer->receive && frameStatus == kIOReturnSuccess &&
                 (frame.status != kIOReturnSuccess || frame.completeCount != frame.requestCount))
                 frameStatus = frame.status != kIOReturnSuccess ? frame.status : kIOReturnUnderrun;

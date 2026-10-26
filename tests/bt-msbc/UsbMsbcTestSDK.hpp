@@ -14,7 +14,9 @@ using IOReturn = int32_t;
 using AbsoluteTime = uint64_t;
 constexpr IOReturn kIOReturnSuccess = 0, kIOReturnBadArgument = -1,
     kIOReturnAborted = -2, kIOReturnIOError = -3, kIOReturnUnderrun = -4,
-    kIOReturnInvalid = -5, kIOReturnNoResources = -6;
+    kIOReturnInvalid = -5, kIOReturnNoResources = -6, kIOReturnNotResponding = -7,
+    kIOReturnIsoTooOld = -8, kIOReturnIsoTooNew = -9, kIOReturnOverrun = -10,
+    kIOReturnNoBandwidth = -11;
 constexpr unsigned kIODirectionIn = 1, kIODirectionOut = 2, kIODirectionInOut = 3;
 inline uint16_t OSSwapLittleToHostInt16(uint16_t x) { return x; }
 inline void *IOMallocZero(size_t n) { return std::calloc(1, n); }

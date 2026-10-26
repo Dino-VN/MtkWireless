@@ -49,7 +49,7 @@ int kernel = 25;
 bool msbcFlag;
 int getKernelVersion() { return kernel; }
 bool checkKernelArgument(const char *name) {
-    assert(!strcmp(name, "-mtkbtmsbc")); return msbcFlag;
+    assert(!strcmp(name, "-mtkbtnomsbc")); return !msbcFlag;
 }
 namespace StandardUSB {
 struct EndpointDescriptor { uint8_t bmAttributes, bEndpointAddress; };

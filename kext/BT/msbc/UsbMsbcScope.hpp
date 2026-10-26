@@ -12,8 +12,10 @@ static inline bool msbcCachedNumber(IORegistryEntry *entry, const char *key, uin
 }
 
 static inline bool msbcCachedMtkDevice(IORegistryEntry *entry) {
-    return msbcCachedNumber(entry, "idVendor", 0x13d3) &&
-        msbcCachedNumber(entry, "idProduct", 0x3610);
+    return (msbcCachedNumber(entry, "idVendor", 0x13d3) &&
+            msbcCachedNumber(entry, "idProduct", 0x3610)) ||
+        (msbcCachedNumber(entry, "idVendor", 0x0489) &&
+            msbcCachedNumber(entry, "idProduct", 0xe0cd));
 }
 
 static inline bool msbcCachedScoInterface(IORegistryEntry *entry) {

@@ -72,7 +72,7 @@ uint32_t rustFailed;
 void *leLock;
 int getKernelVersion() { return kernel; }
 bool checkKernelArgument(const char *name) {
-    if (!strcmp(name, "-mtkbtmsbc")) return flag;
+    if (!strcmp(name, "-mtkbtnomsbc")) return !flag;
     assert(!strcmp(name, "-mtkbtnoextadv")); return noExtAdv;
 }
 void *IOLockAlloc() { return reinterpret_cast<void *>(1); }

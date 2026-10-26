@@ -502,7 +502,7 @@ bool route(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size
 void installMsbcBridge(KernelPatcher &patcher, size_t index, mach_vm_address_t address, size_t size,
                        bool copyPipeRouted)
 {
-    if (getKernelVersion() != KernelVersion::Tahoe || !checkKernelArgument("-mtkbtmsbc") ||
+    if (getKernelVersion() != KernelVersion::Tahoe || checkKernelArgument("-mtkbtnomsbc") ||
         !copyPipeRouted || !orgCopyPipe)
         return;
     KernelPatcher::RouteRequest routes[] {
@@ -659,7 +659,7 @@ static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace), "ad
 
 /* HFP wideband gate: bluetoothd enables mSBC only for known chip IDs; a
  * THIRD_PARTY_DONGLE (chip 0) is outside the range. Accept chip 0, only while
- * the USB mSBC bridge (-mtkbtmsbc) is ready. 25G241 x86_64, exact signature.
+ * the USB mSBC bridge is ready (-mtkbtnomsbc off). 25G241 x86_64, exact signature.
  */
 const uint8_t wbsFind[] {
     0x55, 0x48, 0x89, 0xe5, 0xe8, 0x31, 0xfd, 0x01, 0x00, 0x8b, 0x88, 0x34, 0x03, 0x00, 0x00, 0x8d,
@@ -754,7 +754,7 @@ void Patcher::init(uint32_t rustSelfTestFailed)
     } else {
         leLock = IOLockAlloc();
         extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
-        msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && checkKernelArgument("-mtkbtmsbc");
+        msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && !checkKernelArgument("-mtkbtnomsbc");
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
         if (extAdvPatchEnabled || msbcPatchEnabled)
             lilu.onPatcherLoadForce(processPatcher);

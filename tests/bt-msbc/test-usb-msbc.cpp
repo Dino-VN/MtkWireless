@@ -332,6 +332,26 @@ int main() {
         for (auto &frame : f.frames) assert(frame.status == backendError && frame.completeCount == 0);
     }
     {
+        // MT7921: a missed isochronous IN frame fails the whole transfer
+        // (kIOReturnNotResponding) while the other frames carry data. Like
+        // btusb_isoc_complete(), drop only that frame.
+        Fixture f;
+        assert(f.submit(true) == 0);
+        auto p = pending.front(); pending.erase(pending.begin());
+        for (uint32_t i = 0; i < p.count; ++i) {
+            p.frames[i].status = 0;
+            p.frames[i].completeCount = p.frames[i].requestCount;
+        }
+        p.frames[3].status = kIOReturnNotResponding; p.frames[3].completeCount = 0;
+        p.completion.action(p.completion.owner, p.completion.parameter, kIOReturnNotResponding, p.frames);
+        p.data->release();
+        auto value = f.bridge->status();
+        assert(f.status == 0 && value.rxErrors == 0 && value.rxBatches == 1);
+        assert(value.rxFrameErrorTransfers == 1 && value.rxFrameErrors == 1);
+        assert(value.rxLastCompletionStatus == kIOReturnNotResponding);
+        assert(value.rxLastFrameStatus == kIOReturnNotResponding && value.rxCompleteBytes == 14 * 63);
+    }
+    {
         Fixture f;
         assert(f.submit(true) == 0);
         f.data->shortWrite = true; f.drain();
