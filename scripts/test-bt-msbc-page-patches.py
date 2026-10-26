@@ -30,12 +30,12 @@ def array(name):
     return declaration, bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", declaration))
 
 
-names = ("kMtkWbsOriginal", "kMtkWbsPatched", "kMtkHfpFillOriginal", "kMtkHfpFillPatched",
+names = ("wbsFind", "wbsReplace", "hfpFillFind", "hfpFillReplace",
          "extAdvFind", "extAdvReplace", "advAddressFind", "advAddressReplace",
          "advAddressRetryFind", "advAddressRetryReplace")
 arrays = {name: array(name)[1] for name in names}
-wbs, wbs_patch = arrays["kMtkWbsOriginal"], arrays["kMtkWbsPatched"]
-fill, fill_patch = arrays["kMtkHfpFillOriginal"], arrays["kMtkHfpFillPatched"]
+wbs, wbs_patch = arrays["wbsFind"], arrays["wbsReplace"]
+fill, fill_patch = arrays["hfpFillFind"], arrays["hfpFillReplace"]
 assert len(wbs) == len(wbs_patch) == 76
 assert [(i, a, b) for i, (a, b) in enumerate(zip(wbs, wbs_patch)) if a != b] == [(17, 255, 0), (19, 206, 207)]
 assert len(fill) == len(fill_patch) == 31
@@ -131,8 +131,8 @@ void apply(Page &page, vnode_t path = "/usr/sbin/bluetoothd") {
 }
 Page originals() {
     Page page {};
-    memcpy(page.data() + 10, kMtkWbsOriginal, sizeof(kMtkWbsOriginal));
-    memcpy(page.data() + 110, kMtkHfpFillOriginal, sizeof(kMtkHfpFillOriginal));
+    memcpy(page.data() + 10, wbsFind, sizeof(wbsFind));
+    memcpy(page.data() + 110, hfpFillFind, sizeof(hfpFillFind));
     memcpy(page.data() + 210, extAdvFind, sizeof(extAdvFind));
     memcpy(page.data() + 310, advAddressFind, sizeof(advAddressFind));
     memcpy(page.data() + 410, advAddressRetryFind, sizeof(advAddressRetryFind));
@@ -157,8 +157,8 @@ int main() {
         assert(extAdvPatchEnabled == adv && msbcPatchEnabled == (version == 25 && enabled));
         Page page = originals(), expected = page;
         if (wideband) {
-            memcpy(expected.data() + 10, kMtkWbsPatched, sizeof(kMtkWbsPatched));
-            memcpy(expected.data() + 110, kMtkHfpFillPatched, sizeof(kMtkHfpFillPatched));
+            memcpy(expected.data() + 10, wbsReplace, sizeof(wbsReplace));
+            memcpy(expected.data() + 110, hfpFillReplace, sizeof(hfpFillReplace));
         }
         if (adv) {
             memcpy(expected.data() + 210, extAdvReplace, sizeof(extAdvReplace));
@@ -180,9 +180,9 @@ int main() {
     }
     reset(25, true, true); Patcher::init(0); msbcReady = true;
     for (bool fill : {false, true}) {
-        const uint8_t *find = fill ? kMtkHfpFillOriginal : kMtkWbsOriginal;
-        const uint8_t *replace = fill ? kMtkHfpFillPatched : kMtkWbsPatched;
-        const size_t length = fill ? sizeof(kMtkHfpFillOriginal) : sizeof(kMtkWbsOriginal);
+        const uint8_t *find = fill ? hfpFillFind : wbsFind;
+        const uint8_t *replace = fill ? hfpFillReplace : wbsReplace;
+        const size_t length = fill ? sizeof(hfpFillFind) : sizeof(wbsFind);
         for (size_t offset : {size_t(0), PAGE_SIZE - length}) {
             Page page {}; memcpy(page.data() + offset, find, length); apply(page);
             assert(!memcmp(page.data() + offset, replace, length));

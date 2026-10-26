@@ -149,6 +149,7 @@ compile "$OBJ/bt-msbc" "${CXXFLAGS[@]}" "${BT_INCLUDES[@]}" "${BT_MSBC_SCALAR[@]
 for source in sbc bits; do
     object="$OBJ/bt-msbc/$source.o"
     "$CC" "${TARGET[@]}" "${CFLAGS[@]}" "${BT_INCLUDES[@]}" "${BT_MSBC_SCALAR[@]}" -std=c11 \
+        -Wno-sign-conversion -Wno-implicit-int-conversion -Wno-shorten-64-to-32 \
         -I "$BT_MSBC/vendor/google-libsbc/include" -I "$BT_MSBC/vendor/google-libsbc/src" \
         -c "$BT_MSBC/vendor/google-libsbc/src/$source.c" -o "$object"
     OBJS+=("$object")

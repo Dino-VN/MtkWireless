@@ -186,6 +186,14 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   `BluetoothdExtAdvRouted`/`BluetoothdPages`/`BluetoothdExtAdvPatched`.
   Unverified on hardware. Lilu DEBUG + `-liludbg liludump=120` writes
   `/var/log/Lilu_*.txt`, the only way to see Lilu/plugin SYSLOG here.
+- HFP wideband (`-mtkbtmsbc`, Tahoe, USB `13d3:3610` only; `kext/BT/msbc`):
+  bluetoothd keeps a 33-byte PCM SCO view; `UsbMsbcBridge` maps interface 1
+  alt 4 to alt 6, encodes/decodes mSBC in software (Google libsbc,
+  Apache-2.0, vendored) into whole 63-byte HCI packets, and reports 33 bytes
+  from `GetPipeProperties`. The `wbsFind`/`hfpFillFind` page patches apply
+  only once the bridge routes are ready. Codec code is built without SSE/
+  vectorization. Tests: `scripts/test-bt-msbc*.py`. Unverified on hardware
+  as packaged here (tested via a local BlueToolFixup build).
 - `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
   AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
   crashes make launchd throttle it (640–1200 s).

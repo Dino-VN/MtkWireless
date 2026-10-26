@@ -257,7 +257,7 @@ void UsbMsbcBridge::publishStatus() {
     add("RxCrcFailures", value.rxAudio.crcFailures);
     add("RxParserDiscardedBytes", value.rxAudio.discardedBytes);
     add("RxLastParserReason", value.rxAudio.lastParserReason);
-    resource->setProperty("SimpleMtkMsbcBridge", dictionary);
+    resource->setProperty("MtkBtMsbcBridge", dictionary);
     dictionary->release();
 #endif
 }
