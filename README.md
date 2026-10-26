@@ -50,7 +50,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 
 | Feature | Status | Notes |
 |---|---|---|
-| AirDrop iPhone <-> Mac, iOS 16 -> 27 | ✅ | |
+| AirDrop iPhone <-> Mac, iOS 16 -> 27 | ✅ | 1.0.3: faster transfers and large files no longer stall (~4 MB/s average iPhone -> Mac, peaks ~7 MB/s). [Details](docs/AIRDROP-PERFORMANCE.md) |
 | Handoff, Universal Clipboard, AirPlay to Mac | ✅ | |
 | iPhone Mirroring | ❌ | not possible: needs Apple silicon or a T2 chip (Secure Enclave), which this machine does not have |
 | Instant Hotspot (same iCloud / Family) | ⚠️ | iPhone activation succeeds; directed scan fails on 1.0.0. 1.0.1 fixes the scan path, pending hardware verification; see [diagnosis](docs/INSTANT-HOTSPOT.md). |

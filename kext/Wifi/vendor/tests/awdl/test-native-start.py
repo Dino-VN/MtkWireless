@@ -197,7 +197,7 @@ struct AirportMtkAwdlInterface:NativeProtocol {
  struct {uint8_t master[6]={};} syncState;
  void *bsd=nullptr;IOThread syncOwner=nullptr;uint64_t syncRequests=0,syncWaits=0,syncFailures=0;
  IOReturn setMacAddress(ether_addr&) override;ether_addr getSelfMacAddr() override;
- unsigned queueHead=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;mbuf_t queue[64]={};
+ unsigned queueHead=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;static constexpr unsigned kDataQueueSize=256;mbuf_t queue[kDataQueueSize]={};
  unsigned refs=1;void retain(){++refs;} void release() override {if(!--refs)delete this;} IOReturn setSync(bool);IOReturn setSyncInGate(bool);static IOReturn syncGated(OSObject*,void*,void*,void*,void*);
  void finishAvailabilityWindowForDisable(){if(awTimeline.open)notifyAvailabilityWindowEnd(awdlNow());}
  uint64_t nativeTx=0,nativeRx=0,nativeDrops=0;Timer clock;Timer *timer=&clock;

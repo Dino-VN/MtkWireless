@@ -261,7 +261,7 @@ unsigned AirportMtkAwdlInterface::submitNative(OSObject *target,IOSkywalkTxSubmi
         bool accepted=false;
         unsigned length=packet->getDataLength(), offset=packet->getDataOffset();
         if(self->enabled && self->dataPathEnabled && !self->stopping &&
-           self->queueCount<64 && length>=14 && length<=1514 && offset+length<=2048 &&
+           self->queueCount<kDataQueueSize && length>=14 && length<=1514 && offset+length<=2048 &&
            packet->getPacketBufferCount()==1) {
             auto bytes=static_cast<const uint8_t *>(packet->getDataVirtualAddress());
             mbuf_t frame=bytes ? self->makeFrame(bytes+offset,length) : NULL;
@@ -444,7 +444,7 @@ void AirportMtkAwdlInterface::shutdownInGate()
     enabled=false;
     dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
     trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
-    while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+    while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
     if(timerAdded) { owner->getWorkLoop()->removeEventSource(timer); timerAdded=false; }
     bsd=NULL;
 }
@@ -581,7 +581,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
         // completions during that wait, so drain again before canceling tick.
         drainCompletions();
         timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
-        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
     } else if(!stopping) {
         nextAction=0; timer->setTimeoutMS(1);
     }
@@ -607,7 +607,7 @@ mbuf_t AirportMtkAwdlInterface::makeFrame(const uint8_t *data,size_t length)
 UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
 {
     if(!m) return kIOReturnOutputDropped;
-    if(!enabled || stopping || queueCount==64 || !(mbuf_flags(m)&MBUF_PKTHDR)) {
+    if(!enabled || stopping || queueCount==kDataQueueSize || !(mbuf_flags(m)&MBUF_PKTHDR)) {
         mbuf_freem(m); return kIOReturnOutputDropped;
     }
     size_t n=mbuf_pkthdr_len(m); uint8_t eth[1514],frame[1542];
@@ -619,7 +619,7 @@ UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
     if(!size) return kIOReturnOutputDropped;
     m=makeFrame(frame,size);
     if(!m) return kIOReturnOutputDropped;
-    unsigned pos=(queueHead+queueCount)%64;
+    unsigned pos=(queueHead+queueCount)%kDataQueueSize;
     uint64_t now=awdlNow();
     queue[pos]=m; queueTime[pos]=now;
     queueDeadline[pos]=now+mtkawdl::dataQueueLifetimeUs(state,frame+4); ++queueCount;
@@ -719,6 +719,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLUMIStatus",static_cast<uint64_t>(umiStatus),32);
     setProperty("MTKAWDLADDBARequests",addbaRequests,64);
     setProperty("MTKAWDLADDBAQueued",addbaQueued,64);
+    setProperty("MTKAWDLADDBAAccepted",addbaAccepted,64);
     setProperty("MTKAWDLADDBASubmitted",addbaSubmitted,64);
     setProperty("MTKAWDLADDBAFailed",addbaFailed,64);
     setProperty("MTKAWDLADDBAExpired",addbaExpired,64);
@@ -729,7 +730,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     unsigned dataPending=0, umiPending=0;
     uint64_t oldestAge=0, nextExpiry=0;
     for(unsigned i=0;i<queueCount;++i) {
-        unsigned index=(queueHead+i)%64;
+        unsigned index=(queueHead+i)%kDataQueueSize;
         if(((const uint8_t *)mbuf_data(queue[index]))[0]==0xd0) { ++umiPending; continue; }
         ++dataPending;
         uint64_t age=now>=queueTime[index] ? now-queueTime[index] : 0;
@@ -748,6 +749,13 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataRxDecoded",dataRxDecoded,64);
     setProperty("MTKAWDLDataRxDuplicate",dataRxDuplicate,64);
     setProperty("MTKAWDLDataRxTooOld",dataRxTooOld,64);
+    unsigned narrowStreams=0, wideStreams=0;
+    for(const auto &peer:dataPeers.entries) for(const auto &window:peer.windows) {
+        if(window.active && window.sequenceBits==12) ++narrowStreams;
+        if(window.active && window.sequenceBits==16) ++wideStreams;
+    }
+    setProperty("MTKAWDLDataRx12BitStreams",static_cast<uint64_t>(narrowStreams),32);
+    setProperty("MTKAWDLDataRx16BitStreams",static_cast<uint64_t>(wideStreams),32);
     setProperty("MTKAWDLDataRxTraceVersion",static_cast<uint64_t>(1),32);
     setProperty("MTKAWDLDataRxTraceCount",dataRxTraceCount,64);
     setProperty("MTKAWDLDataRxTrace",dataRxTrace,sizeof(dataRxTrace));
@@ -816,6 +824,9 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLHostCounter",static_cast<uint64_t>(state.counter(now)),32);
     setProperty("MTKAWDLHostChannelSequence",state.sequence.channels,state.sequence.count);
     setProperty("MTKAWDLHostPresence",static_cast<uint64_t>(state.presence),32);
+    setProperty("MTKAWDLTrafficActive",trafficActive);
+    setProperty("MTKAWDLDensePresence",densePresence);
+    setProperty("MTKAWDLDensePresenceTransitions",presenceTransitions,64);
     setProperty("MTKAWDLHostRole",static_cast<uint64_t>(state.syncRole),32);
     unsigned peers=0;
     for(unsigned i=0;i<mtkawdl::maxPeers;++i) if(state.peers[i].used) ++peers;
@@ -845,10 +856,12 @@ void AirportMtkAwdlInterface::serviceInGate()
         // Native still owns the start even when firmware loses its context.
         if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
         awTimeline.reset();
-        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%64; --queueCount; }
+        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
         return;
     }
     uint64_t now=awdlNow();
+    // Change our sequence only between AWs: the open AW keeps its snapshot.
+    if(!awTimeline.open) updatePresence(now);
     if(awTimeline.due(now)) {
         // The timestamp is the recorded radio/schedule edge, even if this
         // timer runs late. Administrative cancellation uses its observed time.
@@ -883,7 +896,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     // A full queue must not remain wedged waiting for a radio grant.
     for(unsigned pending=queueCount;pending--;) {
         mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead], expiry=queueDeadline[queueHead];
-        queueHead=(queueHead+1)%64; --queueCount;
+        queueHead=(queueHead+1)%kDataQueueSize; --queueCount;
         if(now>=expiry) {
             const uint8_t *f=(const uint8_t *)mbuf_data(m);
             if(f[0]!=0xd0) ++dataTxExpired;
@@ -892,22 +905,46 @@ void AirportMtkAwdlInterface::serviceInGate()
             mbuf_freem(m);
         }
         else {
-            unsigned tail=(queueHead+queueCount)%64;
+            unsigned tail=(queueHead+queueCount)%kDataQueueSize;
             queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
         }
     }
-    // Decline peer ADDBA requests through the per-peer queue, which waits
-    // for the peer's channel and installs its firmware station.
+    // Answer peer ADDBA requests through the per-peer queue, which waits
+    // for the peer's channel. Accept only once the firmware recipient session
+    // exists on the peer's station (aggregation is the receive throughput
+    // limit); otherwise decline as before. A DELBA ends that session.
     for(auto &pending:addbaPending) {
         if(!pending.valid) continue;
         pending.valid=false;
-        const uint8_t *peer=pending.request+10;
-        if(dataPeers.find(peer,now)<0 || state.find(peer)<0 || queueCount>=64) { ++addbaDropped; continue; }
+        uint8_t request[sizeof(pending.request)];
+        memcpy(request,pending.request,sizeof(request));
+        const uint8_t *peer=request+10;
+        uint8_t tid=0; uint16_t ssn=0, window=0;
+        if(request[25]==mtkawdl::delba) {
+            if(mtkawdl::delbaRxTid(state.mac,request,24+6,&tid)) {
+                hal->awdlRxBlockAck(peer,tid,0,0,false);
+                if(stopping || !enabled) return;
+                now=awdlNow();
+            }
+            continue;
+        }
+        if(dataPeers.find(peer,now)<0 || state.find(peer)<0 || queueCount>=kDataQueueSize) { ++addbaDropped; continue; }
         uint8_t frame[24+9];
-        size_t size=mtkawdl::buildAddbaDecline(state,pending.request,sizeof(pending.request),frame,sizeof(frame));
+        size_t size=0;
+        if(mtkawdl::parseAddbaRequest(state.mac,request,sizeof(request),&tid,&ssn,&window)) {
+            IOReturn ba=hal->awdlRxBlockAck(peer,tid,ssn,window,true);
+            if(stopping || !enabled) return;
+            now=awdlNow();
+            if(ba==kIOReturnSuccess) {
+                size=mtkawdl::buildAddbaAccept(state,request,sizeof(request),window,frame,sizeof(frame));
+                if(size) ++addbaAccepted;
+            }
+            if(queueCount>=kDataQueueSize) { ++addbaDropped; continue; }
+        }
+        if(!size) size=mtkawdl::buildAddbaDecline(state,request,sizeof(request),frame,sizeof(frame));
         mbuf_t m=size ? makeFrame(frame,size) : NULL;
         if(!m) { ++addbaDropped; continue; }
-        unsigned tail=(queueHead+queueCount)%64;
+        unsigned tail=(queueHead+queueCount)%kDataQueueSize;
         queue[tail]=m; queueTime[tail]=now;
         queueDeadline[tail]=now+mtkawdl::dataQueueLifetimeUs(state,peer); ++queueCount; ++addbaQueued;
     }
@@ -933,7 +970,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         }
     }
     for(unsigned i=0;i<queueCount;++i) {
-        const uint8_t *frame=(const uint8_t *)mbuf_data(queue[(queueHead+i)%64]);
+        const uint8_t *frame=(const uint8_t *)mbuf_data(queue[(queueHead+i)%kDataQueueSize]);
         if(frame[4]&1) continue;
         uint8_t address[6]; memcpy(address,frame+4,6);
         int member=dataPeers.find(address,now);
@@ -1209,9 +1246,9 @@ void AirportMtkAwdlInterface::serviceInGate()
         uint64_t &deferred=blockAck ? addbaDeferred : unicastMI ? umiDeferred : dataTxDeferred;
         uint64_t &submitted=blockAck ? addbaSubmitted : unicastMI ? umiSubmitted : dataTxSubmitted;
         uint64_t &failed=blockAck ? addbaFailed : unicastMI ? umiFailed : dataTxFailed;
-        queueHead=(queueHead+1)%64; --queueCount;
+        queueHead=(queueHead+1)%kDataQueueSize; --queueCount;
         if(now<expiry && !ready) {
-            unsigned tail=(queueHead+queueCount)%64; queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
+            unsigned tail=(queueHead+queueCount)%kDataQueueSize; queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
             continue;
         }
         if(now>=expiry) {
@@ -1235,7 +1272,7 @@ void AirportMtkAwdlInterface::serviceInGate()
                 mbuf_t replacement=size ? makeFrame(refreshed,size) : NULL;
                 if(!replacement) {
                     if(!size) { ++umiFailed; mbuf_freem(m); continue; }
-                    unsigned tail=(queueHead+queueCount)%64;
+                    unsigned tail=(queueHead+queueCount)%kDataQueueSize;
                     queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
                     ++umiDeferred; break;
                 }
@@ -1248,12 +1285,12 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // original payload/sequence and its bounded queue lifetime.
                 if(txStatus==kIOReturnNotFound) {
                     // One missing station must not block multicast/other peers.
-                    unsigned tail=(queueHead+queueCount)%64;
+                    unsigned tail=(queueHead+queueCount)%kDataQueueSize;
                     queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
                     ++deferred;
                     continue;
                 }
-                queueHead=(queueHead+63)%64;
+                queueHead=(queueHead+kDataQueueSize-1)%kDataQueueSize;
                 queue[queueHead]=m; queueTime[queueHead]=time; queueDeadline[queueHead]=expiry; ++queueCount;
                 ++deferred;
                 // Busy/grant/ring pressure applies to the rest of this batch.
@@ -1278,7 +1315,7 @@ void AirportMtkAwdlInterface::serviceInGate()
 }
 
 void AirportMtkAwdlInterface::recordDataRx(const uint8_t *f,const mtkawdl::DataView &view,
-    uint64_t now,uint8_t channel,int8_t rssi,uint16_t previous,uint64_t bitmap,bool accepted)
+    uint64_t now,uint8_t channel,int8_t rssi,uint16_t previous,uint64_t bitmap,bool accepted,uint16_t sequenceMask)
 {
     auto &sample=dataRxTrace[dataRxTraceCount++%64];
     memset(&sample,0,sizeof(sample));
@@ -1288,7 +1325,7 @@ void AirportMtkAwdlInterface::recordDataRx(const uint8_t *f,const mtkawdl::DataV
     sample.payloadLength=view.length;
     sample.result=1; sample.channel=channel; sample.rssi=rssi;
     if(!accepted) {
-        uint16_t back=previous-view.sequence;
+        uint16_t back=(previous-view.sequence)&sequenceMask;
         sample.result=back<64 ? 2 : 3;
         if(back<64) ++dataRxDuplicate; else ++dataRxTooOld;
     }
@@ -1328,7 +1365,8 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
                 int slot=-1; bool duplicate=false;
                 for(unsigned i=0;i<4;++i) {
                     const auto &p=self->addbaPending[i];
-                    if(p.valid && !memcmp(p.request+10,f+10,6) && p.request[26]==f[26]) duplicate=true;
+                    if(p.valid && p.request[25]==mtkawdl::addbaRequest &&
+                       !memcmp(p.request+10,f+10,6) && p.request[26]==f[26]) duplicate=true;
                     if(!p.valid && slot<0) slot=i;
                 }
                 if(!duplicate && slot<0) ++self->addbaDropped;
@@ -1336,7 +1374,15 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
                     memcpy(self->addbaPending[slot].request,f,24+9);
                     self->addbaPending[slot].valid=true;
                 }
-            } else if(f[25]==mtkawdl::delba) ++self->delbaReceived;
+            } else if(f[25]==mtkawdl::delba) {
+                ++self->delbaReceived;
+                // Firmware teardown waits; the service loop owns it.
+                for(auto &p:self->addbaPending) if(!p.valid) {
+                    bzero(p.request,sizeof(p.request));
+                    memcpy(p.request,f,n<sizeof(p.request) ? n : sizeof(p.request));
+                    p.valid=true; break;
+                }
+            }
             return true;
         }
         if(!mtkawdl::validActionEnvelope(f,n) || !memcmp(f+10,self->state.mac,6)) {
@@ -1425,7 +1471,8 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
 #endif
         bool accepted=self->dataPeers.acceptData(peer,stream,view.sequence,now);
 #ifdef KERNEL
-        self->recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted);
+        self->recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted,
+            window.sequenceBits==12 ? 0xfff : 0xffff);
 #endif
         if(!accepted) {
             ++self->dataRxReplay; continue;
@@ -1490,7 +1537,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_reques
        !mtkawdl::validTemplateTLVs(d->data,d->data_len)) return kIOReturnBadArgument;
     uint64_t now=awdlNow();
     if(dataPeers.find(raw+4,now)<0 || state.find(raw+4)<0) return kIOReturnNotFound;
-    if(queueCount>=64) return kIOReturnNoResources;
+    if(queueCount>=kDataQueueSize) return kIOReturnNoResources;
     if(!state.radioScheduleReady()) return kIOReturnNotReady;
     uint8_t frame[2304];
     size_t size=mtkawdl::buildActionWithTemplate(state,frame,sizeof(frame),now,d->data,d->data_len);
@@ -1498,7 +1545,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_reques
     memcpy(frame+4,raw+4,6);
     mbuf_t m=makeFrame(frame,size);
     if(!m) return kIOReturnNoMemory;
-    unsigned tail=(queueHead+queueCount)%64;
+    unsigned tail=(queueHead+queueCount)%kDataQueueSize;
     queue[tail]=m; queueTime[tail]=now;
     queueDeadline[tail]=now+mtkawdl::dataQueueLifetimeUs(state,raw+4); ++queueCount; ++umiQueued;
     // makeFrame copied the borrowed payload before returning to native.
@@ -1729,7 +1776,8 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(apple
     // MtkWireless: AWDL stays off 6 GHz (flag 0x2000, APPLE80211_C_FLAG_6GHZ;
     // spelled out for tests/awdl); its numbers alias 2.4/5 GHz ones.
     for(unsigned i=0;i<s.count;++i) { unsigned c=d->seqs[i].channel; if(c && ((d->seqs[i].flags & 0x2000) || c>165 || !hal->awdlChannelAllowed(c))) return kIOReturnBadArgument; s.channels[i]=c; }
-    state.setSequence(s,awdlNow());
+    hostSequence=s; hostSequenceValid=true;
+    applySequence(awdlNow());
     channelSequence=*d;
     setProperty("MTKAWDLNativeChannelSequence",state.ownSequence.channels,state.ownSequence.count);
     return kIOReturnSuccess;
@@ -1819,6 +1867,30 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
     awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);
     release(); return kIOReturnSuccess;
 }
+void AirportMtkAwdlInterface::applySequence(uint64_t now)
+{
+    if(!hostSequenceValid) return;
+    uint8_t channel=mtkawdl::dataChannel(hostSequence);
+    state.setSequence(densePresence ? mtkawdl::denseSequence(hostSequence,channel) : hostSequence,now);
+}
+// awdld keeps its idle sequence (2 of 16 EAWs on the data channel) during
+// AirDrop; peers send only in EAWs we advertise. While a transfer runs
+// (traffic registration, or >=40 data frames/s), advertise and use the data
+// channel in every idle EAW; restore awdld's sequence 2 s after it stops.
+void AirportMtkAwdlInterface::updatePresence(uint64_t now)
+{
+    uint64_t frames=dataRxDecoded+dataTxSubmitted;
+    if(now-presenceSampleAt>=250000) {
+        if(frames-presenceFrames>=10) presenceActiveAt=now;
+        presenceFrames=frames; presenceSampleAt=now;
+    }
+    bool busy=trafficActive || (presenceActiveAt && now-presenceActiveAt<2000000);
+    uint8_t channel=hostSequenceValid ? mtkawdl::dataChannel(hostSequence) : 0;
+    bool want=busy && channel && hal->awdlDensePresenceAllowed(channel);
+    if(want==densePresence) return;
+    densePresence=want; ++presenceTransitions;
+    applySequence(now);
+}
 IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration *d)
 {
     if(!d || d->version>APPLE80211_VERSION || d->active>1 || d->name_len>sizeof(d->name) ||
@@ -1828,7 +1900,8 @@ IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_a
     if(trafficActive && (!d->active || memcmp(trafficPeer,d->addr,6)))
         dataPeers.setTraffic(trafficPeer,false,now);
     memcpy(trafficPeer,d->addr,6); trafficActive=d->active;
-    // Expedite queued traffic during an active Continuity session.
+    // Expedite queued traffic during an active Continuity session; the
+    // service loop also switches to dense presence (updatePresence).
     if(enabled && trafficActive) timer->setTimeoutMS(1);
     return kIOReturnSuccess;
 }

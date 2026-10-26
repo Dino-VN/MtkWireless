@@ -48,7 +48,7 @@ struct AirportMtkAwdlInterface:Native{
  AirportMtkWlan*owner=nullptr;MtkMwx*hal=nullptr;IOTimerEventSource*timer=nullptr;
  void*bsd=nullptr;bool timerAdded=false,stopping=false,enabled=false,nativeBaseInitialized=false,receiverRegistered=false,trafficActive=false,trafficPeerInstalled=false;
  unsigned queueHead=0,queueCount=0,templateLength=0,requestedChannel=0,grantedChannel=0;uint64_t nextAction=0,requestDeadline=0;
- void*queue[64]{};uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;
+ static constexpr unsigned kDataQueueSize=256;void*queue[kDataQueueSize]{};uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;
  mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;
  unsigned windowEnds=0;
  void notifyAvailabilityWindowEnd(uint64_t){++windowEnds;awTimeline.close();}

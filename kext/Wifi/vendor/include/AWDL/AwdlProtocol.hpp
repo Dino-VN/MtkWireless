@@ -56,6 +56,13 @@ bool mtk_awdl_valid_template_tlvs(const uint8_t *p, size_t n);
 size_t mtk_awdl_build_action_with_template(mtkawdl::State *s, uint8_t *f, size_t capacity, uint64_t now,
                                            const uint8_t *p, size_t n);
 bool mtk_awdl_block_ack_action(const uint8_t *f, size_t n, const uint8_t *mac);
+uint8_t mtk_awdl_data_channel(const mtkawdl::Sequence *s);
+void mtk_awdl_dense_sequence(const mtkawdl::Sequence *s, uint8_t channel, mtkawdl::Sequence *out);
+bool mtk_awdl_addba_request(const uint8_t *own, const uint8_t *request, size_t n, uint8_t *tid, uint16_t *ssn,
+                            uint16_t *window);
+bool mtk_awdl_delba_rx_tid(const uint8_t *own, const uint8_t *f, size_t n, uint8_t *tid);
+size_t mtk_awdl_build_addba_accept(mtkawdl::State *s, const uint8_t *request, size_t n, uint16_t window,
+                                   uint8_t *f, size_t capacity);
 size_t mtk_awdl_build_addba_decline(mtkawdl::State *s, const uint8_t *request, size_t n, uint8_t *f, size_t capacity);
 size_t mtk_awdl_refresh_action(mtkawdl::State *s, uint8_t *f, size_t n, uint64_t now);
 size_t mtk_awdl_encode_data(uint8_t *out, size_t capacity, const uint8_t *eth, size_t n, uint16_t seq);
@@ -66,6 +73,8 @@ bool mtk_awdl_valid_data_frame(const uint8_t *f, size_t n);
 size_t mtk_awdl_decode_data_view(uint8_t *out, size_t capacity, const mtkawdl::DataView *view);
 size_t mtk_awdl_decode_data(uint8_t *out, size_t capacity, const uint8_t *f, size_t n, uint16_t *seq);
 bool mtk_awdl_tx_status_observe(mtkawdl::TxStatusCounters *c, const uint8_t *p, size_t n);
+uint16_t mtk_awdl_tx_rate(const mtkawdl::TxStatusCounters *c, uint16_t wcid);
+uint16_t mtk_awdl_tx_rate_mbps(const mtkawdl::TxStatusCounters *c, size_t peer);
 void mtk_awdl_reservation_request(mtkawdl::Reservation *r, uint8_t token, uint8_t channel, uint64_t now);
 mtkawdl::RocResult mtk_awdl_reservation_accept(mtkawdl::Reservation *r, uint8_t token, uint8_t channel,
                                                uint32_t durationMs, uint64_t now);
@@ -130,6 +139,7 @@ struct DataReplayWindow {
     uint64_t bitmap, lastRx;
     uint16_t sequence;
     bool active;
+    uint8_t sequenceBits;
 };
 struct DataPeers {
     struct Entry {
@@ -212,11 +222,26 @@ inline size_t buildActionWithTemplate(State &s,uint8_t *f,size_t capacity,
     return mtk_awdl_build_action_with_template(&s,f,capacity,now,p,n);
 }
 // 802.11 Block Ack action frames (category 3) addressed to this AWDL MAC.
-// This transport has no firmware BA session or reorder buffer: decline.
+// An RX request is accepted once the HAL installs the firmware recipient
+// session (MtkMwx::awdlRxBlockAck), else declined. No reorder buffer: the
+// MSDU replay window admits out-of-order sequences within 64.
 enum : uint8_t { blockAckCategory=3, addbaRequest=0, addbaResponse=1, delba=2 };
-enum : uint16_t { statusRequestDeclined=37 };
+enum : uint16_t { statusRequestDeclined=37, rxBlockAckWindow=64 };
 inline bool blockAckAction(const uint8_t *f,size_t n,const uint8_t *mac) {
     return mtk_awdl_block_ack_action(f,n,mac);
+}
+inline uint8_t dataChannel(const Sequence &s) { return mtk_awdl_data_channel(&s); }
+inline Sequence denseSequence(const Sequence &s,uint8_t channel) {
+    Sequence d=s; mtk_awdl_dense_sequence(&s,channel,&d); return d;
+}
+inline bool parseAddbaRequest(const uint8_t *own,const uint8_t *request,size_t n,uint8_t *tid,uint16_t *ssn,uint16_t *window) {
+    return mtk_awdl_addba_request(own,request,n,tid,ssn,window);
+}
+inline bool delbaRxTid(const uint8_t *own,const uint8_t *f,size_t n,uint8_t *tid) {
+    return mtk_awdl_delba_rx_tid(own,f,n,tid);
+}
+inline size_t buildAddbaAccept(State &s,const uint8_t *request,size_t n,uint16_t window,uint8_t *f,size_t capacity) {
+    return mtk_awdl_build_addba_accept(&s,request,n,window,f,capacity);
 }
 inline size_t buildAddbaDecline(State &s,const uint8_t *request,size_t n,uint8_t *f,size_t capacity) {
     return mtk_awdl_build_addba_decline(&s,request,n,f,capacity);
@@ -248,13 +273,23 @@ inline size_t decodeData(uint8_t *out,size_t capacity,const uint8_t *f,size_t n,
 // Reserved software PIDs distinguish AWDL frame classes in MT7921 TXS.
 // WCIDs 15..18 belong exclusively to AWDL. A DMA release is not a TX result.
 constexpr uint8_t txPidUnicast=125, txPidMulticast=126, txPidAction=127;
+struct TxRate {
+    uint8_t index=0, successes=0;
+    bool failed=false, probing=false;
+    uint8_t backoff=0, stale=0;
+    uint16_t probeAfter=0;
+};
 struct TxStatusCounters {
     uint64_t dataAcked=0, dataFailed=0, multicastCompleted=0, multicastFailed=0;
     uint64_t actionCompleted=0, actionFailed=0;
     uint32_t lastStatus=0;
     uint16_t lastSequence=0, lastWcid=0;
     uint8_t lastPid=0;
+    TxRate rates[3]={};
+    bool ofdmOnly=false; // boot-arg amtk_awdl_ht=0
     bool observe(const uint8_t *p,size_t n) { return mtk_awdl_tx_status_observe(this,p,n); }
+    uint16_t rate(uint16_t wcid) const { return mtk_awdl_tx_rate(this,wcid); }
+    uint16_t rateMbps(size_t peer) const { return mtk_awdl_tx_rate_mbps(this,peer); }
 };
 // A matching, unexpired firmware grant is mandatory before any transmission.
 enum class RocResult : uint8_t {

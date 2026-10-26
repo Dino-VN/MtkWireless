@@ -16,6 +16,7 @@ code=r'''
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <array>
 #include <AWDL/AwdlTimeline.hpp>
 #define __IO80211_TARGET __MAC_26_0
 using IOReturn=unsigned;using UInt32=unsigned;
@@ -47,6 +48,9 @@ struct Hal{
  bool awdlCanTransmit(unsigned){return grant;}IOReturn awdlReserve(unsigned,unsigned){return 0;}
  std::vector<bool> peerOperations;
  IOReturn awdlPeer(const uint8_t*,bool add){++peerCalls;peerOperations.push_back(add);return peerResult;}
+ IOReturn rxBaResult=kIOReturnUnsupported;std::vector<std::array<unsigned,4>> rxBa;
+ bool awdlDensePresenceAllowed(uint8_t){return false;}
+ IOReturn awdlRxBlockAck(const uint8_t*,uint8_t tid,uint16_t ssn,uint16_t window,bool enable){rxBa.push_back({tid,ssn,window,enable});return enable?rxBaResult:0;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmitted;frames.push_back(m->bytes);delete m;return txResult;}
  IOReturn awdlTryTransmit(mbuf_t *m,unsigned){
   if(missingStation&&!((*m)->bytes[4]&1))return kIOReturnNotFound;
@@ -59,7 +63,7 @@ struct AirportMtkAwdlInterface{
  void *owner=nullptr;void retain(){}void release(){}
  bool enabled=true,stopping=false,trafficPeerInstalled=false,trafficActive=false,allocationFail=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;
+ uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0,addbaAccepted=0;
  mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
  NativePeerSample nativePeerSamples[16]{};unsigned nativePeerSampleNext=0;
@@ -80,11 +84,11 @@ struct AirportMtkAwdlInterface{
  uint32_t reserveLeadUS=mtkawdl::rocLeadUs;mtkawdl::RocLeadTiming reserveTiming;uint64_t grantLatencyObservedAt=0;
  mtkawdl::RocChannelTiming reserveChannelTiming;
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
- IOReturn reserveStatus=0,actionStatus=0,miStatus=0;mbuf_t queue[64]{};
+ IOReturn reserveStatus=0,actionStatus=0,miStatus=0;static constexpr unsigned kDataQueueSize=256;mbuf_t queue[kDataQueueSize]{};
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
  uint64_t dataRxFrames=0,dataRxInvalid=0,dataRxUnknownPeer=0,dataRxWrongDestination=0,dataRxReplay=0,dataRxDecoded=0;
  std::vector<std::vector<uint8_t>> received;
- uint64_t queueTime[64]{},queueDeadline[64]{};unsigned queueCount=0,queueHead=0,nativeCalls=0;
+ uint64_t queueTime[kDataQueueSize]{},queueDeadline[kDataQueueSize]{};unsigned queueCount=0,queueHead=0,nativeCalls=0;
  void setProperty(const char*,uint64_t,unsigned){}void setProperty(const char*,bool){}
  void setProperty(const char*,void*,unsigned){}
  void publishScheduler(uint64_t){}void inputNative(const uint8_t*f,size_t n){received.emplace_back(f,f+n);}
@@ -98,6 +102,7 @@ struct AirportMtkAwdlInterface{
  IOReturn setAWDL_AF_TX_MODE(apple80211_awdl_af_tx_mode*);
  IOReturn setAWDL_OOB_AUTO_REQUEST(apple80211_awdl_oob_request*);
  IOReturn setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*);
+ mtkawdl::Sequence hostSequence{};bool hostSequenceValid=false,densePresence=false;uint64_t presenceSampleAt=0,presenceFrames=0,presenceActiveAt=0,presenceTransitions=0;void applySequence(uint64_t);void updatePresence(uint64_t);
  UInt32 output(mbuf_t);void serviceInGate();static bool receive(void*,const uint8_t*,size_t,uint8_t,int8_t);
  IOReturn setPEER_CACHE_CONTROL(apple80211_peer_cache_control*);
 };
@@ -105,7 +110,7 @@ unsigned cacheCompletions=0;
 void awdlControllerMessage(void*,AirportMtkAwdlInterface*,unsigned id,void*p,unsigned n,bool){
  assert(id==0x33&&n==0x1d0);auto*b=(uint8_t*)p;assert(mtkawdl::le32(b+4)==1||mtkawdl::le32(b+4)==3);++cacheCompletions;
 }
-'''+fn('UInt32 AirportMtkAwdlInterface::output(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_AF_TX_MODE(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_AUTO_REQUEST(')+(fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(') if 'IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(' in s else 'IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*){return kIOReturnUnsupported;}')+fn('IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(')+fn('void AirportMtkAwdlInterface::serviceInGate(')+fn('bool AirportMtkAwdlInterface::receive(')+r'''
+'''+fn('UInt32 AirportMtkAwdlInterface::output(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_AF_TX_MODE(')+fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_AUTO_REQUEST(')+(fn('IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(') if 'IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(' in s else 'IOReturn AirportMtkAwdlInterface::setAWDL_OOB_REQUEST(apple80211_awdl_oob_request*){return kIOReturnUnsupported;}')+fn('IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(')+fn('void AirportMtkAwdlInterface::serviceInGate(')+fn('void AirportMtkAwdlInterface::applySequence(')+fn('void AirportMtkAwdlInterface::updatePresence(')+fn('bool AirportMtkAwdlInterface::receive(')+r'''
 int main(){
  AirportMtkAwdlInterface d;const uint8_t local[]={2,1,2,3,4,5},peer[]={2,1,2,3,4,6};
  d.state.init(local,clockUS);
@@ -179,7 +184,7 @@ int main(){
  // Successful submissions, firmware failures, expiry without any grant.
  d.afMode.mode=3;d.miTemplateLength=0;
  const uint64_t life=mtkawdl::dataQueueLifetimeUs(d.state,wire+4);
- auto enqueue=[&](uint64_t time){unsigned tail=(d.queueHead+d.queueCount)%64;
+ auto enqueue=[&](uint64_t time){unsigned tail=(d.queueHead+d.queueCount)%d.kDataQueueSize;
   d.queue[tail]=d.makeFrame(wire,wn);d.queueTime[tail]=time;d.queueDeadline[tail]=time+life;++d.queueCount;};
  d.state.peers[d.state.find(peer)].advertisement.sequence.channels[0]=6;
  memcpy(wire+4,peer,6);enqueue(clockUS);d.serviceInGate();assert(d.dataTxSubmitted==1&&!d.queueCount);
@@ -200,7 +205,19 @@ int main(){
   // DELBA is counted; an unknown sender is dropped without a queued frame.
   addba[25]=2;assert(d.receive(&d,addba,33,6,-40)&&d.delbaReceived==1);
   addba[25]=0;addba[15]^=0x80;assert(d.receive(&d,addba,33,6,-40));d.serviceInGate();
-  assert(d.addbaDropped==1&&d.addbaQueued==1&&!d.queueCount);}
+  assert(d.addbaDropped==1&&d.addbaQueued==1&&!d.queueCount);
+  assert(d.radio.rxBa.size()==1&&d.radio.rxBa[0][3]&&!d.addbaAccepted);
+  // With the firmware recipient session installed the request is accepted
+  // (status 0, A-MSDU+immediate, TID 0, 64); an originator DELBA ends it.
+  addba[15]^=0x80;addba[26]=0x40;addba[31]=0x50;addba[32]=0x02;d.radio.rxBaResult=kIOReturnSuccess;
+  assert(d.receive(&d,addba,33,6,-40));d.serviceInGate();
+  assert(d.addbaAccepted==1&&d.addbaQueued==2&&d.radio.rxBa.size()==2);
+  assert(d.radio.rxBa[1]==(std::array<unsigned,4>{0,0x25,64,1}));
+  {const auto &a=d.radio.frames.back();assert(a[25]==1&&a[26]==0x40&&!a[27]&&!a[28]&&a[29]==0x03&&a[30]==0x10);}
+  addba[25]=2;addba[26]=0x00;addba[27]=0x58;sent=d.radio.transmitted;
+  assert(d.receive(&d,addba,30,6,-40)&&d.delbaReceived==2);d.serviceInGate();
+  assert(d.radio.rxBa.size()==3&&d.radio.rxBa[2]==(std::array<unsigned,4>{5,0,0,0}));
+  assert(d.radio.transmitted==sent&&d.addbaQueued==2);}
  // Native cache owns the station after discovery; remove it only once all
  // membership expires. An unknown queued MAC cannot create a new station.
  assert(d.dataPeers.setCached(peer,true,clockUS));
@@ -242,7 +259,7 @@ int main(){
  d.enabled=false;assert(d.setAWDL_OOB_REQUEST(&umi)==kIOReturnNotReady);d.enabled=true;
  auto role=d.state.syncRole;d.state.syncRole=2;d.state.synchronized=false;
  assert(d.setAWDL_OOB_REQUEST(&umi)==kIOReturnNotReady);d.state.syncRole=role;
- d.queueCount=64;assert(d.setAWDL_OOB_REQUEST(&umi)==kIOReturnNoResources);d.queueCount=0;
+ d.queueCount=d.kDataQueueSize;assert(d.setAWDL_OOB_REQUEST(&umi)==kIOReturnNoResources);d.queueCount=0;
  assert(!d.setAWDL_OOB_REQUEST(&umi));d.queueDeadline[d.queueHead]=clockUS;
  d.radio.grant=false;d.serviceInGate();assert(!d.queueCount&&d.umiExpired==1);d.radio.grant=true;
  // Independently exercise delayed UMI against schedule/election changes,
@@ -308,9 +325,9 @@ int main(){
  assert(d.dataTxSubmitted==submitted&&!d.queueCount);
  // Shared ring pressure retains FIFO and never refreshes the original age.
  d.radio.txResult=kIOReturnNoResources;enqueue(clockUS);enqueue(clockUS);
- auto first=d.queue[d.queueHead],second=d.queue[(d.queueHead+1)%64];
+ auto first=d.queue[d.queueHead],second=d.queue[(d.queueHead+1)%d.kDataQueueSize];
  unsigned attemptsBefore=d.radio.transmitted;d.serviceInGate();
- assert(d.queueCount==2&&d.queue[d.queueHead]==first&&d.queue[(d.queueHead+1)%64]==second);
+ assert(d.queueCount==2&&d.queue[d.queueHead]==first&&d.queue[(d.queueHead+1)%d.kDataQueueSize]==second);
  d.radio.txResult=0;d.serviceInGate();submitted+=2;
  assert(!d.queueCount&&d.dataTxSubmitted==submitted&&d.radio.transmitted==attemptsBefore+2);
  d.radio.txResult=kIOReturnNotReady;enqueue(clockUS-life+500);d.serviceInGate();
@@ -324,7 +341,7 @@ int main(){
  // A full queue with alternating expired/live packets preserves live order.
  for(unsigned i=0;i<64;++i){wire[wn-1]=i;enqueue(clockUS-(i%2 ? 0 : life));}
  d.serviceInGate();assert(d.queueCount==32&&d.dataTxExpired==33);
- for(unsigned i=0;i<32;++i)assert(d.queue[(d.queueHead+i)%64]->bytes.back()==i*2+1);
+ for(unsigned i=0;i<32;++i)assert(d.queue[(d.queueHead+i)%d.kDataQueueSize]->bytes.back()==i*2+1);
  clockUS+=life;d.serviceInGate();assert(!d.queueCount&&d.dataTxExpired==65);
  // Cache membership outlives the host's 3-second synchronization schedule.
  apple80211_peer_cache_control cache{};mtkawdl::put32(cache.bytes,1);memcpy(cache.bytes+8,peer,6);
@@ -383,7 +400,7 @@ int main(){
  queued.state.presence=queued.state.ownPresence=64;
  assert(mtkawdl::dataQueueLifetimeUs(queued.state,eth)==20785216);
  assert(queued.output(queued.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
- uint64_t secondExpiry=queued.queueDeadline[(queued.queueHead+1)%64];
+ uint64_t secondExpiry=queued.queueDeadline[(queued.queueHead+1)%queued.kDataQueueSize];
  assert(secondExpiry==clockUS+20785216);
  clockUS=originalExpiry-1;queued.serviceInGate();assert(queued.queueCount==2&&!queued.dataTxExpired);
  assert(queued.queueDeadline[queued.queueHead]==originalExpiry);

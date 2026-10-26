@@ -49,6 +49,8 @@ struct Hal{
   if(onReserve)onReserve();return 0;}
  IOReturn peerDeleteResult=0;
  IOReturn awdlPeer(const uint8_t*,bool add){if(onPeer)onPeer(add);return add?0:peerDeleteResult;}
+ IOReturn awdlRxBlockAck(const uint8_t*,uint8_t,uint16_t,uint16_t,bool enable){return enable?kIOReturnUnsupported:0;}
+ bool dense=false;bool awdlDensePresenceAllowed(uint8_t){return dense;}
  IOReturn awdlTransmit(mbuf_t m,unsigned){++transmits;delete m;return 0;}
  IOReturn awdlTryTransmit(mbuf_t *m,unsigned c){auto result=awdlTransmit(*m,c);*m=nullptr;return result;}
  void give(uint8_t token,uint8_t c,uint32_t ms){grant.request(token,c,clockUS);
@@ -59,7 +61,7 @@ struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;
  bool enabled=true,stopping=false,trafficActive=false,trafficPeerInstalled=false;
  uint8_t trafficPeer[6]{},installedTrafficPeer[6]{};
- uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;
+ uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0,addbaAccepted=0;
  mtkawdl::DataPeers dataPeers;mtkawdl::State state;mtkawdl::Timeline awTimeline;mtkawdl::Window requestedWindow{};
  apple80211_awdl_sync_state syncState{};
  struct NativePeerSample{mtkawdl::Advertisement advertisement;uint8_t peer[6];uint64_t received;bool valid;};
@@ -80,7 +82,7 @@ struct AirportMtkAwdlInterface{
  uint16_t miCounter=0;bool miCounterValid=false;
  uint64_t umiSubmitted=0,umiFailed=0,umiExpired=0,umiDeferred=0;
  IOReturn umiStatus=0;
- mbuf_t queue[64]{};uint64_t queueTime[64]{},queueDeadline[64]{};unsigned queueCount=0,queueHead=0;
+ static constexpr unsigned kDataQueueSize=256;mbuf_t queue[kDataQueueSize]{};uint64_t queueTime[kDataQueueSize]{},queueDeadline[kDataQueueSize]{};unsigned queueCount=0,queueHead=0;
  std::vector<Event> events;std::function<void()> onStart,onEnd;
  void setProperty(const char*,uint64_t,unsigned){}void setProperty(const char*,bool){}
  void setProperty(const char*,const void*,unsigned){}void setProperty(const char*,const char*){}
@@ -91,6 +93,7 @@ struct AirportMtkAwdlInterface{
   if(id==41&&onStart)onStart();if(id==43&&onEnd)onEnd();
  }
  void notifyAvailabilityWindowStart(uint8_t,uint64_t);
+ uint64_t dataRxDecoded=0;mtkawdl::Sequence hostSequence{};bool hostSequenceValid=false,densePresence=false;uint64_t presenceSampleAt=0,presenceFrames=0,presenceActiveAt=0,presenceTransitions=0;void applySequence(uint64_t);void updatePresence(uint64_t);
  void notifyAvailabilityWindowEnd(uint64_t);void serviceInGate();
  IOReturn setSync(bool value){enabled=value;return 0;}
  IOReturn setAWDL_SYNC_STATE(apple80211_awdl_sync_state*);
@@ -113,6 +116,8 @@ code=code.replace('struct awdl_peer_advert_add', '\n'.join(structs)+'\nstruct aw
 for sig in ['void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(',
             'void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(',
             'void AirportMtkAwdlInterface::serviceInGate(',
+            'void AirportMtkAwdlInterface::applySequence(',
+            'void AirportMtkAwdlInterface::updatePresence(',
             'IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(',
             'IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_PARAMS(',
             'IOReturn AirportMtkAwdlInterface::setAWDL_PRESENCE_MODE(',
@@ -1474,6 +1479,29 @@ int main(){
  assert(mtkawdl::be32(wrap.events[0].bytes.data()+20)==1000000);
  clockUS=wrap.awTimeline.radioEnd;wrap.serviceInGate();
  assert(mtkawdl::be32(wrap.events[1].bytes.data()+4)==1065536);
+ // Transfers densify awdld's sparse sequence with its data channel (idle
+ // EAWs only), when the HAL allows it; 2 s without data restores it.
+ {AirportMtkAwdlInterface dense;init(dense);clockUS=5000000;dense.radio.thirdChannel=true;
+  apple80211_awdl_sync_channel_sequence seq{};seq.version=1;seq.length=16;seq.step_count=3;
+  seq.seqs[0].channel=6;seq.seqs[2].channel=149;seq.seqs[8].channel=6;seq.seqs[10].channel=149;
+  assert(!dense.setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(&seq));
+  auto sparse=dense.state.sequence;assert(sparse.channels[1]==0&&sparse.channels[2]==149);
+  dense.trafficActive=true;dense.updatePresence(clockUS);
+  assert(!dense.densePresence&&!memcmp(&dense.state.sequence,&sparse,sizeof(sparse))); // HAL refuses
+  dense.radio.dense=true;dense.updatePresence(clockUS);
+  assert(dense.densePresence&&dense.presenceTransitions==1);
+  for(unsigned i=0;i<16;++i) assert(dense.state.sequence.channels[i]==(i==0||i==8?6:149));
+  // awdld's new sequence is densified while the transfer lasts.
+  seq.seqs[2].channel=44;seq.seqs[10].channel=44;
+  assert(!dense.setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE(&seq));
+  assert(dense.state.sequence.channels[5]==44&&dense.state.sequence.channels[8]==6);
+  // Without registration, >=10 data frames per 250 ms keep it; 2 s idle ends it.
+  dense.trafficActive=false;
+  for(unsigned i=0;i<8;++i){clockUS+=250000;dense.dataRxDecoded+=12;dense.updatePresence(clockUS);assert(dense.densePresence);}
+  clockUS+=250000;dense.updatePresence(clockUS);clockUS+=1700000;dense.updatePresence(clockUS);assert(dense.densePresence);
+  clockUS+=200000;dense.updatePresence(clockUS);
+  assert(!dense.densePresence&&dense.presenceTransitions==2);
+  assert(dense.state.sequence.channels[5]==0&&dense.state.sequence.channels[2]==44);}
  puts("PASS production AW start/end: ABI, matched grants, short dwell tolerance, delayed end, reset/revoke pairing, counter/clock wrap, duplicate suppression, reentrant callbacks and schedule revalidation/preparation.");
 }
 '''

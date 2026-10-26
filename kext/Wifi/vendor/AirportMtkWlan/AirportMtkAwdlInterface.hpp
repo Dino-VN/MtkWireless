@@ -165,7 +165,7 @@ private:
     DataRxSample dataRxTrace[64] = {}, dataRxLastRejected = {};
     uint64_t dataRxTraceCount = 0, dataRxDuplicate = 0, dataRxTooOld = 0;
     void recordDataRx(const uint8_t*,const mtkawdl::DataView&,uint64_t,
-                      uint8_t,int8_t,uint16_t,uint64_t,bool);
+        uint8_t,int8_t,uint16_t,uint64_t,bool,uint16_t=0xffff);
     // Rejected frames never reach awdl0 BPF. Keep bounded prefixes so a
     // structural rejection can be distinguished from a harmless QoS Null.
     struct __attribute__((packed)) InvalidDataRxSample {
@@ -198,9 +198,15 @@ private:
     uint64_t umiSubmitted = 0, umiFailed = 0, umiExpired = 0, umiDeferred = 0;
     uint64_t umiRequests = 0, umiQueued = 0;
     IOReturn umiStatus = kIOReturnNotReady;
-    // Peer ADDBA requests, declined by the service loop through the queue.
+    // Peer ADDBA requests (answered by the service loop through the queue)
+    // and DELBAs (firmware session teardown).
+    // awdld's sequence; densified with the data channel during transfers.
+    mtkawdl::Sequence hostSequence = {}; bool hostSequenceValid = false, densePresence = false;
+    uint64_t presenceSampleAt = 0, presenceFrames = 0, presenceActiveAt = 0, presenceTransitions = 0;
+    void applySequence(uint64_t);
+    void updatePresence(uint64_t);
     struct AddbaDecline { uint8_t request[24+9]; bool valid; } addbaPending[4] = {};
-    uint64_t addbaRequests = 0, addbaQueued = 0, addbaSubmitted = 0, addbaFailed = 0;
+    uint64_t addbaRequests = 0, addbaQueued = 0, addbaSubmitted = 0, addbaFailed = 0, addbaAccepted = 0;
     uint64_t addbaExpired = 0, addbaDeferred = 0, addbaDropped = 0, delbaReceived = 0;
     uint16_t miCounter = 0; bool miCounterValid = false;
     mtkawdl::Timeline awTimeline;
@@ -225,7 +231,12 @@ private:
     mtkawdl::DataPeers dataPeers;
     uint8_t requestedChannel = 0, grantedChannel = 0; uint64_t nextAction = 0, requestDeadline = 0;
     uint8_t syncTemplate[2048]; size_t templateLength = 0;
-    mbuf_t queue[64] = {}; uint64_t queueTime[64], queueDeadline[64]; unsigned queueHead = 0, queueCount = 0;
+    // 64 frames is ~15 ms at 54 Mbps; an off-channel AWDL slot lasts
+    // ~220 ms, so a full-rate sender overflowed it once per period.
+    static constexpr unsigned kDataQueueSize = 256;
+    mbuf_t queue[kDataQueueSize] = {};
+    uint64_t queueTime[kDataQueueSize], queueDeadline[kDataQueueSize];
+    unsigned queueHead = 0, queueCount = 0;
     apple80211_awdl_sync_params syncParams;
     apple80211_awdl_extension_state_machine_parameter extension;
     apple80211_awdl_election_id electionId;

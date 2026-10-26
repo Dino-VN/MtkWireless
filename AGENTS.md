@@ -184,6 +184,25 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   successful transfer waited ~8 s in macOS's open/move UI after receipt;
   do not confuse that with a stalled QUIC upload lacking receive completion.
 
+- 1.0.3 large-file AirDrop (2026-10-26): the live 32 MB iPhone -> Mac
+  upload advances the TID 0 AWDL counter to 4095, then packets below 4096
+  are rejected continuously with the high-water mark pinned at 4095.
+  This supplies the rollover evidence absent from the 0.1.10 trace above.
+  Each stream learns 12-bit rollover near that boundary; observing upper
+  bits selects full 16-bit arithmetic. Keep per-TID/non-QoS separation,
+  the 64-MSDU duplicate window and idle restart. Mac -> iPhone was also
+  forced to 6 Mbps. ACK feedback now climbs OFDM 6..54 Mbps then HT MCS 7
+  per unicast WCID (`amtk_awdl_ht=0` caps at 54); one isolated failure does
+  not step down (peer off channel, ~1/2000). Multicast/actions stay at 6
+  Mbps. The AWDL data queue is 256 frames (64 overflowed off channel).
+  iPhone ADDBA is accepted (window <= 64) once `awdlRxBlockAck` installs
+  the firmware recipient session; declining it forced one MPDU per ACK.
+  `amtk_awdl_rxba=0` declines again. During transfers the data channel
+  fills awdld's idle EAWs (dense presence, `amtk_awdl_dense=0` off):
+  awdld's sequence offered it in 2 of 16. Measured ~4 MB/s iPhone -> Mac.
+  ioreg exposes `MTKAWDLDataRx{12,16}BitStreams` and
+  `MTKAWDLTXPeer{0,1,2}RateMbps`. See docs/AIRDROP-PERFORMANCE.md.
+
 ## How macOS uses the Bluetooth controller (do not regress)
 
 - `bluetoothd` (bm3_usb) talks to the USB device from user space; the kernel

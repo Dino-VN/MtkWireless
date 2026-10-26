@@ -83,6 +83,8 @@ public:
     // MtkWireless: the AP's channel while associated, else 0. Leaving it
     // unannounced gets us disassociated; see awdlInfraSleep.
     uint8_t awdlInfraChannel();
+    // Whether AWDL may offer `channel` in every idle EAW during a transfer.
+    bool awdlDensePresenceAllowed(uint8_t channel);
     // The only channel AWDL may use, or 0 for any: the AP's channel while
     // associated if boot-arg amtk_awdl_offchan=0, else 0.
     uint8_t awdlOnlyChannel();
@@ -94,6 +96,10 @@ public:
     void awdlInfraSleep(uint8_t channel);
     void awdlInfraWakeIfIdle();
     IOReturn awdlPeer(const uint8_t *address, bool add);
+    // RX Block Ack recipient session for an installed AWDL peer station.
+    // kIOReturnNotFound: no station; kIOReturnUnsupported: amtk_awdl_rxba=0.
+    IOReturn awdlRxBlockAck(const uint8_t *address, uint8_t tid, uint16_t ssn,
+                            uint16_t window, bool enable);
     unsigned awdlPeerCapacity() const { return 3; }
 
 private:

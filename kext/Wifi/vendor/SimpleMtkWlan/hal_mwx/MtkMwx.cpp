@@ -430,6 +430,7 @@ struct mwx_softc {
     uint64_t sc_awdl_tx_submitted, sc_awdl_tx_bad_frame, sc_awdl_tx_no_grant;
     uint64_t sc_awdl_tx_busy, sc_awdl_tx_no_peer, sc_awdl_tx_backpressure;
     uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
+    uint64_t sc_awdl_rx_ba_started, sc_awdl_rx_ba_stopped, sc_awdl_rx_ba_failed;
     mtkawdl::TxStatusCounters sc_awdl_tx_status;
     int sc_awdl_tx_errno;
     void *sc_awdl_context;
@@ -6728,8 +6729,12 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
 		if (ni == &sc->sc_awdl_vif.vif_mn.ni ||
             ni == &sc->sc_awdl_peers[0].ni || ni == &sc->sc_awdl_peers[1].ni ||
             ni == &sc->sc_awdl_peers[2].ni) {
-            uint32_t hw=mt76_rates[4].hw_value;
-            rate=(hw & 0xff) | ((hw>>8)<<MT_TX_RATE_MODE_SHIFT);
+            // MtkWireless: only unicast data uses the per-peer ACK-driven
+            // ladder (OFDM 6..54 Mbps, then HT MCS 7; mtkawdl TX_RATES).
+            // Discovery, BA actions and multicast keep 6 Mbps.
+            rate=0x4b;
+            if(!multicast && type==(IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT))
+                rate=sc->sc_awdl_tx_status.rate(((mwx_node *)ni)->wcid);
         } else rate = mt7921_mac_tx_rate_val(sc);
 
 		val6 = MT_TXD6_FIXED_BW;
@@ -6920,7 +6925,7 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 #endif
 		mt7921_mac_write_txwi_80211(sc, m, ni, txp);
     if (awdl) {
-        // AWDL starts with legacy OFDM at 6 Mbps on either band. Keep the
+        // AWDL uses legacy OFDM on either band. Keep the
         // supplied sequence number and never use the infrastructure key/RA.
         // The common 802.11 builder applies the complete fixed-rate setup
         // even when infrastructure RA is enabled (as in the MT76 rate fix).
@@ -9169,6 +9174,31 @@ static bool mwx_awdl_offchan_enabled()
     return enabled;
 }
 
+// MtkWireless: boot-arg amtk_awdl_ht=0 caps AWDL unicast at 54 Mbps OFDM.
+static bool mwx_awdl_ht_enabled()
+{
+    int value = 1;
+    if (!PE_parse_boot_argn("amtk_awdl_ht", &value, sizeof(value)))
+        value = 1;
+    return value != 0;
+}
+
+// MtkWireless: boot-arg amtk_awdl_dense=0 keeps awdld's sparse AWDL
+// sequence during transfers. Dense presence never pulls the radio off an AP
+// on another channel (that would cost a PM handshake per EAW).
+bool MtkMwx::awdlDensePresenceAllowed(uint8_t channel)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        int value = 1;
+        if (!PE_parse_boot_argn("amtk_awdl_dense", &value, sizeof(value)))
+            value = 1;
+        enabled = value != 0;
+    }
+    uint8_t infra = awdlInfraChannel();
+    return enabled && channel && (!infra || infra == channel);
+}
+
 uint8_t MtkMwx::awdlOnlyChannel()
 {
     return mwx_awdl_offchan_enabled() ? 0 : awdlInfraChannel();
@@ -9489,6 +9519,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
         IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
     }
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
+    sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
     sc->sc_awdl_enabled=true;
     IOLockUnlock(sc->sc_awdl_lock);
     mwxController()->setProperty("MTKAWDLFirmwareStage","enabled");
@@ -9762,6 +9793,9 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLTXCopyFailed",com->sc_awdl_tx_copy_failed,64);
     mwxController()->setProperty("MTKAWDLTXDMAFailed",com->sc_awdl_tx_dma_failed,64);
     mwxController()->setProperty("MTKAWDLTXLastErrno",static_cast<uint64_t>(com->sc_awdl_tx_errno),32);
+    mwxController()->setProperty("MTKAWDLRxBAStarted",com->sc_awdl_rx_ba_started,64);
+    mwxController()->setProperty("MTKAWDLRxBAStopped",com->sc_awdl_rx_ba_stopped,64);
+    mwxController()->setProperty("MTKAWDLRxBAFailed",com->sc_awdl_rx_ba_failed,64);
     const auto &tx=com->sc_awdl_tx_status;
     mwxController()->setProperty("MTKAWDLTXDataAcked",tx.dataAcked,64);
     mwxController()->setProperty("MTKAWDLTXDataFailed",tx.dataFailed,64);
@@ -9773,6 +9807,10 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLTXLastSequence",static_cast<uint64_t>(tx.lastSequence),32);
     mwxController()->setProperty("MTKAWDLTXLastWcid",static_cast<uint64_t>(tx.lastWcid),32);
     mwxController()->setProperty("MTKAWDLTXLastPid",static_cast<uint64_t>(tx.lastPid),32);
+    for(unsigned i=0;i<3;++i) {
+        char property[40]; snprintf(property,sizeof(property),"MTKAWDLTXPeer%uRateMbps",i);
+        mwxController()->setProperty(property,static_cast<uint64_t>(tx.rateMbps(i)),32);
+    }
     // Firmware owns RFCR; a nonzero AWDL-mask value means it reapplied drops.
     if(com->sc_awdl_enabled && !com->sc_resetting && !com->sc_detaching &&
        (com->sc_ic.ic_if.if_flags & IFF_RUNNING))
@@ -9832,6 +9870,86 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
     if(rv) { ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources; }
     ++com->sc_awdl_tx_submitted;
     mbuf_freem(frame); *packet=NULL; return kIOReturnSuccess;
+}
+
+// MtkWireless: boot-arg amtk_awdl_rxba=0 declines every AWDL ADDBA (as
+// before 1.0.3), so peers send one MPDU per ACK.
+static bool mwx_awdl_rxba_enabled()
+{
+    int value = 1;
+    if (!PE_parse_boot_argn("amtk_awdl_rxba", &value, sizeof(value)))
+        value = 1;
+    return value != 0;
+}
+
+static int mwx_awdl_sta_rec(mwx_softc *sc,uint32_t epoch,mbuf_t m)
+{
+    int seq=0; uint32_t status=0;
+    int rv=m ? mwx_mcu_send_mbuf(sc,MCU_UNI_CMD_STA_REC_UPDATE,m,&seq) : ENOBUFS;
+    if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
+    if(!rv) rv=mwx_mcu_wait_resp_int(sc,MCU_UNI_CMD_STA_REC_UPDATE,seq,&status);
+    if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
+    return rv ? rv : status ? EIO : 0;
+}
+
+// mt7921_mcu_sta_rx_ba() for an AWDL peer station: WTBL_BA, then STA_REC_BA,
+// on the AWDL BSS. Without it the MAC answers A-MPDUs with no Block Ack.
+static int mwx_awdl_rx_ba(mwx_softc *sc,uint32_t epoch,unsigned index,uint8_t tid,
+    uint16_t ssn,uint16_t winsize,bool enable)
+{
+    uint16_t wcid=MWX_WTBL_STA+index;
+    if(!enable) { ssn=0; winsize=0; }
+    mbuf_t m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return ENOBUFS;
+    uint16_t count=0, wcount=0;
+    auto wtbl=(sta_rec_wtbl *)mwx_append_tlv(m,&count,STA_REC_WTBL,sizeof(sta_rec_wtbl));
+    wtbl->wlan_idx_lo=wcid & 0xff; wtbl->wlan_idx_hi=wcid>>8; wtbl->operation=WTBL_SET;
+    auto wba=(wtbl_ba *)mwx_append_tlv(m,&wcount,WTBL_BA,sizeof(wtbl_ba));
+    wba->tid=tid; wba->ba_type=MT_BA_TYPE_RECIPIENT; wba->ba_winsize=htole16(winsize);
+    memcpy(wba->peer_addr,sc->sc_awdl_peers[index].ni.ni_macaddr,6);
+    wba->rst_ba_tid=tid; wba->rst_ba_sel=RST_BA_MAC_TID_MATCH; wba->rst_ba_sb=1;
+    wtbl->tlv_num=htole16(wcount);
+    wtbl->len=htole16(le16toh(wtbl->len)+sizeof(*wba));
+    m=mwx_fill_sta_req_hdr(m,&sc->sc_awdl_vif,sc->sc_awdl_vif.omac_idx,wcid,count);
+    int rv=mwx_awdl_sta_rec(sc,epoch,m);
+    if(rv) return rv;
+    m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return ENOBUFS;
+    count=0;
+    auto sba=(sta_rec_ba *)mwx_append_tlv(m,&count,STA_REC_BA,sizeof(sta_rec_ba));
+    sba->tid=tid; sba->ba_type=MT_BA_TYPE_RECIPIENT; sba->amsdu=0;
+    sba->ba_en=(enable ? 1 : 0)<<tid;
+    sba->ssn=htole16(ssn); sba->winsize=htole16(winsize);
+    m=mwx_fill_sta_req_hdr(m,&sc->sc_awdl_vif,sc->sc_awdl_vif.omac_idx,wcid,count);
+    return mwx_awdl_sta_rec(sc,epoch,m);
+}
+
+IOReturn MtkMwx::awdlRxBlockAck(const uint8_t *address,uint8_t tid,uint16_t ssn,
+    uint16_t window,bool enable)
+{
+    MwxAwdlCall call(com);
+    if(!call.valid()) return kIOReturnNotReady;
+    if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
+        return kIOReturnNotReady;
+    if(!address || !mtkawdl::unicast(address) || tid>7 ||
+       (enable && (!window || window>mtkawdl::rxBlockAckWindow)))
+        return kIOReturnBadArgument;
+    if(enable && !mwx_awdl_rxba_enabled()) return kIOReturnUnsupported;
+    uint8_t peer[6]; memcpy(peer,address,6);
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) return kIOReturnNotReady;
+    int index=-1;
+    for(unsigned i=0;i<3;++i) if(com->sc_awdl_peer_used[i] &&
+        !memcmp(peer,com->sc_awdl_peers[i].ni.ni_macaddr,6)) { index=i; break; }
+    if(index<0) return kIOReturnNotFound;
+    int rv=mwx_awdl_rx_ba(com,operation.epoch,index,tid,ssn,window,enable);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv) ++com->sc_awdl_rx_ba_failed;
+    else if(enable) ++com->sc_awdl_rx_ba_started;
+    else ++com->sc_awdl_rx_ba_stopped;
+    MWX_DEV_LOG(com,"AWDL rx ba %s WCID=%u tid=%u ssn=%u win=%u rv=%d\n",enable ? "start" : "stop",
+        MWX_WTBL_STA+index,tid,ssn,window,rv);
+    return rv ? kIOReturnIOError : kIOReturnSuccess;
 }
 
 IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
@@ -9903,6 +10021,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
         IOLockUnlock(com->sc_awdl_lock); return kIOReturnAborted;
     }
     memset(&node,0,sizeof(node)); node.wcid=wcid;
+    com->sc_awdl_tx_status.rates[index]={};
     if(add) memcpy(node.ni.ni_macaddr,address,6);
     com->sc_awdl_peer_used[index]=add;
     com->sc_awdl_station_pending[index]=add;

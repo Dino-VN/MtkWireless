@@ -5,7 +5,7 @@
 use mtk_wlan::awdl::advertisers::{AdvertiserRecord, decode_advertiser_record};
 use mtk_wlan::awdl::protocol::{
     self as p, Advertisement, DataPeerEntry, DataPeers, DataReplayWindow, Peer, Reservation, RocGrant, RocResult,
-    Sequence, State, TxStatusCounters,
+    Sequence, State, TxRate, TxStatusCounters,
 };
 use mtk_wlan::awdl::timeline::{
     self as t, RadioPlan, RocChannelTiming, RocLeadTiming, Timeline, Window,
@@ -133,6 +133,37 @@ export! {
     fn mtk_awdl_block_ack_action(f: *const u8, n: usize, own: *const u8) -> bool {
         !f.is_null() && mac(own).is_some_and(|m| p::block_ack_action(bytes(f, n), m))
     }
+    fn mtk_awdl_data_channel(s: *const Sequence) -> u8 {
+        s.as_ref().map_or(0, p::data_channel)
+    }
+    fn mtk_awdl_dense_sequence(s: *const Sequence, channel: u8, out: *mut Sequence) {
+        if let (Some(s), Some(out)) = (s.as_ref(), out.as_mut()) { *out = p::dense_sequence(s, channel) }
+    }
+    fn mtk_awdl_addba_request(own: *const u8, request: *const u8, n: usize, tid: *mut u8, ssn: *mut u16,
+                              window: *mut u16) -> bool {
+        let Some(own) = mac(own) else { return false };
+        if tid.is_null() || ssn.is_null() || window.is_null() {
+            return false;
+        }
+        match p::addba_request(own, bytes(request, n)) {
+            Some(r) => { *tid = r.tid; *ssn = r.ssn; *window = r.window; true }
+            None => false,
+        }
+    }
+    fn mtk_awdl_delba_rx_tid(own: *const u8, f: *const u8, n: usize, tid: *mut u8) -> bool {
+        let Some(own) = mac(own) else { return false };
+        if tid.is_null() {
+            return false;
+        }
+        match p::delba_rx_tid(own, bytes(f, n)) {
+            Some(t) => { *tid = t; true }
+            None => false,
+        }
+    }
+    fn mtk_awdl_build_addba_accept(s: *mut State, request: *const u8, n: usize, window: u16, f: *mut u8,
+                                   capacity: usize) -> usize {
+        s.as_mut().map_or(0, |s| p::build_addba_accept(s, bytes(request, n), window, bytes_mut(f, capacity)))
+    }
     fn mtk_awdl_build_addba_decline(s: *mut State, request: *const u8, n: usize, f: *mut u8, capacity: usize) -> usize {
         s.as_mut().map_or(0, |s| p::build_addba_decline(s, bytes(request, n), bytes_mut(f, capacity)))
     }
@@ -176,6 +207,12 @@ export! {
     }
     fn mtk_awdl_tx_status_observe(c: *mut TxStatusCounters, data: *const u8, n: usize) -> bool {
         !data.is_null() && c.as_mut().is_some_and(|c| c.observe(bytes(data, n)))
+    }
+    fn mtk_awdl_tx_rate(c: *const TxStatusCounters, wcid: u16) -> u16 {
+        c.as_ref().map_or(p::TX_RATES[0], |c| c.rate(wcid))
+    }
+    fn mtk_awdl_tx_rate_mbps(c: *const TxStatusCounters, peer: usize) -> u16 {
+        c.as_ref().map_or(0, |c| c.rate_mbps(peer))
     }
     fn mtk_awdl_reservation_request(r: *mut Reservation, token: u8, channel: u8, now: u64) {
         if let Some(r) = r.as_mut() { r.request(token, channel, now) }
@@ -277,7 +314,7 @@ static LAYOUT: &[usize] = layout! {
     Sequence { channels, count, step }
     Advertisement { sequence, master, sync, period, counter, down, presence, metric, distance, master_counter, self_counter }
     Peer { mac, advertisement, seen, epoch, base_counter, last_data, replay, used, has_data }
-    DataReplayWindow { bitmap, last_rx, sequence, active }
+    DataReplayWindow { bitmap, last_rx, sequence, active, sequence_bits }
     DataPeerEntry { replay_state, windows, seen, cached, traffic }
     DataPeers { entries }
     State { mac, master, sync, forced_sync, sequence, own_sequence, peers, epoch, base_counter, data_counter,
@@ -288,8 +325,9 @@ static LAYOUT: &[usize] = layout! {
         controls_dirty, native_clock_holdover, native_clock_validated, native_clock_acquisition_pending,
         clock_sample_rejected, native_holdover_transitions, native_clock_acquisitions, clock_parent, clock_root,
         acquisition_parent, acquisition_root, acquisition_root_known, controls_deferred, pending_controls }
+    TxRate { index, successes, failed, probing, backoff, stale, probe_after }
     TxStatusCounters { data_acked, data_failed, multicast_completed, multicast_failed, action_completed,
-        action_failed, last_status, last_sequence, last_wcid, last_pid }
+        action_failed, last_status, last_sequence, last_wcid, last_pid, rates, ofdm_only }
     Reservation { deadline, grant_observed_at, requested_at, token, channel, pending, granted, response_delay_us }
     RocGrant { bss, token, status, channel, request_type, duration_ms }
     DataView { destination, source, payload, length, sequence }

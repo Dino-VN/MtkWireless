@@ -66,6 +66,31 @@ pub fn valid_sequence(s: &Sequence) -> bool {
     s.channels[..s.count as usize].iter().all(|&c| c <= 165)
 }
 
+/// The 5 GHz channel of a host sequence: where AWDL data flows.
+pub fn data_channel(s: &Sequence) -> u8 {
+    if !valid_sequence(s) {
+        return 0;
+    }
+    s.channels[..s.count as usize].iter().copied().find(|&c| c > 14).unwrap_or(0)
+}
+
+/// awdld's idle sequence (2026-10-26: 6,-,149,-,-,-,-,-,6,-,149,...) is
+/// present on the data channel in 2 of 16 EAWs, and peers send us data only
+/// there. During a transfer, offer the data channel in every idle EAW; the
+/// host's channel-6 and other slots stay exactly as they are.
+pub fn dense_sequence(s: &Sequence, channel: u8) -> Sequence {
+    let mut d = *s;
+    if !valid_sequence(s) || channel == 0 || channel > 165 {
+        return d;
+    }
+    for c in &mut d.channels[..s.count as usize] {
+        if *c == 0 {
+            *c = channel;
+        }
+    }
+    d
+}
+
 pub fn parse_sequence(p: &[u8]) -> Option<Sequence> {
     let n = p.len();
     if n < 6
@@ -351,6 +376,8 @@ pub struct DataReplayWindow {
     pub last_rx: u64,
     pub sequence: u16,
     pub active: bool,
+    // 0: no rollover observed, 12: observed 4095 -> 0, 16: upper bits seen.
+    pub sequence_bits: u8,
 }
 
 impl DataReplayWindow {
@@ -360,16 +387,29 @@ impl DataReplayWindow {
             self.sequence = seq;
             self.bitmap = 1;
             self.last_rx = now;
+            self.sequence_bits = if seq > 0xfff { 16 } else { 0 };
             return true;
         }
         self.last_rx = now;
-        let delta = seq.wrapping_sub(self.sequence) as i16;
+        // The 2026-10-26 large-upload trace reaches 4095, then resumes at
+        // zero within the same active QoS stream. Treating it as a 16-bit
+        // counter pins the high-water mark and drops every later datagram.
+        // Learn this only at the boundary; streams using upper bits retain
+        // full 16-bit arithmetic (including the captured TID 1 at 4096).
+        if seq > 0xfff {
+            self.sequence_bits = 16;
+        } else if self.sequence_bits == 0 && self.sequence >= 0xfc0 && seq < 0x800 {
+            self.sequence_bits = 12;
+        }
+        let mask = if self.sequence_bits == 12 { 0xfff } else { u16::MAX };
+        let forward = seq.wrapping_sub(self.sequence) & mask;
+        let delta = if forward <= mask / 2 { forward as i32 } else { forward as i32 - (mask as i32 + 1) };
         if delta > 0 {
             self.bitmap = if delta >= 64 { 1 } else { (self.bitmap << delta) | 1 };
             self.sequence = seq;
             return true;
         }
-        let back = self.sequence.wrapping_sub(seq) as u32;
+        let back = (self.sequence.wrapping_sub(seq) & mask) as u32;
         if back >= 64 || self.bitmap & (1u64 << back) != 0 {
             return false;
         }
@@ -1371,16 +1411,47 @@ pub fn block_ack_action(f: &[u8], own: &[u8; 6]) -> bool {
         && f[24] == BLOCK_ACK_CATEGORY
 }
 
-/// Declines an ADDBA request (no firmware BA session for AWDL peers).
-pub fn build_addba_decline(s: &mut State, request: &[u8], f: &mut [u8]) -> usize {
-    const SIZE: usize = 24 + 9;
-    if f.len() < SIZE
-        || !block_ack_action(request, &s.mac)
-        || request[25] != ADDBA_REQUEST
-        || request.len() < SIZE
-    {
-        return 0;
+/// Largest RX Block Ack window offered to AWDL peers (MSDU replay window).
+pub const RX_BA_WINDOW: u16 = 64;
+
+/// An immediate-policy ADDBA request: TID, starting sequence number and
+/// the requested window (0 means the peer leaves it to us).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddbaRequest {
+    pub tid: u8,
+    pub ssn: u16,
+    pub window: u16,
+}
+
+pub fn addba_request(own: &[u8; 6], request: &[u8]) -> Option<AddbaRequest> {
+    if request.len() < 24 + 9 || !block_ack_action(request, own) || request[25] != ADDBA_REQUEST {
+        return None;
     }
+    let params = le16(request, 27);
+    // Delayed Block Ack (policy bit clear) is not supported by MT7921.
+    if params & 2 == 0 {
+        return None;
+    }
+    let tid = ((params >> 2) & 0xf) as u8;
+    if tid > 7 {
+        return None;
+    }
+    let requested = params >> 6;
+    let window = if requested == 0 { RX_BA_WINDOW } else { requested.min(RX_BA_WINDOW) };
+    Some(AddbaRequest { tid, ssn: le16(request, 31) >> 4, window })
+}
+
+/// A DELBA from the peer as originator ends our RX session for its TID.
+pub fn delba_rx_tid(own: &[u8; 6], f: &[u8]) -> Option<u8> {
+    if f.len() < 24 + 6 || !block_ack_action(f, own) || f[25] != DELBA {
+        return None;
+    }
+    let params = le16(f, 26);
+    (params & 0x0800 != 0).then_some((params >> 12) as u8 & 7)
+}
+
+fn build_addba_response(s: &mut State, request: &[u8], f: &mut [u8], status: u16, params: u16) -> usize {
+    const SIZE: usize = 24 + 9;
     let f = &mut f[..SIZE];
     f.fill(0);
     f[0] = 0xd0;
@@ -1392,10 +1463,36 @@ pub fn build_addba_decline(s: &mut State, request: &[u8], f: &mut [u8]) -> usize
     f[24] = BLOCK_ACK_CATEGORY;
     f[25] = ADDBA_RESPONSE;
     f[26] = request[26];
-    put16(f, 27, STATUS_REQUEST_DECLINED);
-    f[29..31].copy_from_slice(&request[27..29]);
+    put16(f, 27, status);
+    put16(f, 29, params);
     f[31..33].copy_from_slice(&request[29..31]);
     SIZE
+}
+
+/// Declines an ADDBA request (firmware BA session unavailable or disabled).
+pub fn build_addba_decline(s: &mut State, request: &[u8], f: &mut [u8]) -> usize {
+    if f.len() < 24 + 9
+        || !block_ack_action(request, &s.mac)
+        || request[25] != ADDBA_REQUEST
+        || request.len() < 24 + 9
+    {
+        return 0;
+    }
+    let params = le16(request, 27);
+    build_addba_response(s, request, f, STATUS_REQUEST_DECLINED, params)
+}
+
+/// Accepts an immediate ADDBA request with at most `window` MSDUs, after the
+/// firmware recipient session is installed. Keeps the A-MSDU bit: A-MSDU
+/// subframes inside A-MPDUs are decoded (1.0.2).
+pub fn build_addba_accept(s: &mut State, request: &[u8], window: u16, f: &mut [u8]) -> usize {
+    let Some(r) = addba_request(&s.mac, request) else { return 0 };
+    if f.len() < 24 + 9 || window == 0 {
+        return 0;
+    }
+    let window = window.min(r.window);
+    let params = (le16(request, 27) & 0x3f) | (window << 6);
+    build_addba_response(s, request, f, 0, params)
 }
 
 /// Refreshes a native action-frame template in place: our sync/sequence/
@@ -1718,6 +1815,102 @@ pub const TX_PID_UNICAST: u8 = 125;
 pub const TX_PID_MULTICAST: u8 = 126;
 pub const TX_PID_ACTION: u8 = 127;
 
+/// ACK-driven unicast rate ladder, 20 MHz long GI, single stream:
+/// OFDM 6/12/24/36/48/54 Mbps, then HT MCS 7 (65 Mbps). Every AWDL peer is
+/// an 802.11n device; a rung it cannot receive fails, which steps back down.
+/// MT7921 TX_RATE: mode at bit 6 (OFDM 1, HT 2), rate/MCS index below.
+pub const TX_RATES: [u16; 7] = [0x4b, 0x4a, 0x49, 0x4d, 0x48, 0x4c, 0x87];
+pub const TX_RATE_MBPS: [u16; 7] = [6, 12, 24, 36, 48, 54, 65];
+const TX_RATE_OFDM_TOP: usize = 5;
+const TX_PROBE_ACKS: u8 = 32;
+const TX_CLEAN_ACKS: u8 = 128;
+const TX_HOLD: u16 = 256;
+const TX_STALE_LIMIT: u8 = 128;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxRate {
+    pub index: u8,
+    /// ACKs at this rate since it was selected or last failed.
+    pub successes: u8,
+    /// A failure within the last 128 ACKs. Single losses are usually the
+    /// peer being off channel (1.0.3: ~1 in 2000), not the rate.
+    pub failed: bool,
+    /// Promoted and not yet confirmed by 32 ACKs.
+    pub probing: bool,
+    /// Failed probes in a row; the hold doubles with each, up to 16x.
+    pub backoff: u8,
+    /// Reports at another rate since the last matching one.
+    pub stale: u8,
+    pub probe_after: u16,
+}
+
+impl TxRate {
+    fn top(ofdm_only: bool) -> usize {
+        if ofdm_only { TX_RATE_OFDM_TOP } else { TX_RATES.len() - 1 }
+    }
+
+    pub fn current(&self, ofdm_only: bool) -> usize {
+        (self.index as usize).min(Self::top(ofdm_only))
+    }
+
+    pub fn rate(&self, ofdm_only: bool) -> u16 {
+        TX_RATES[self.current(ofdm_only)]
+    }
+
+    fn step_down(&mut self, ofdm_only: bool) {
+        self.index = self.current(ofdm_only).saturating_sub(1) as u8;
+        self.successes = 0;
+        self.failed = false;
+        self.probing = false;
+        self.stale = 0;
+        self.probe_after = TX_HOLD << self.backoff;
+    }
+
+    pub fn observe(&mut self, status: u32, ofdm_only: bool) {
+        // Queued completions at the previous rate cannot promote or demote
+        // the new one. Compare mode and index only (not NSS/STBC/BW bits).
+        // If nothing matches for long, the firmware is not reporting this
+        // rung as sent: step down rather than fly blind.
+        if status & 0x3ff != self.rate(ofdm_only) as u32 & 0x3ff {
+            self.stale = self.stale.saturating_add(1);
+            if self.stale >= TX_STALE_LIMIT && self.current(ofdm_only) > 0 {
+                self.step_down(ofdm_only);
+            }
+            return;
+        }
+        self.stale = 0;
+        if status & 0x0007_0000 != 0 {
+            if self.failed || self.probing {
+                if self.probing {
+                    self.backoff = (self.backoff + 1).min(4);
+                }
+                self.step_down(ofdm_only);
+            } else {
+                self.failed = true;
+                self.successes = 0;
+            }
+            return;
+        }
+        self.successes = self.successes.saturating_add(1);
+        if self.probing && self.successes >= TX_PROBE_ACKS {
+            self.probing = false;
+            self.backoff = 0;
+        }
+        if self.successes >= TX_CLEAN_ACKS {
+            self.failed = false;
+        }
+        if self.probe_after != 0 {
+            self.probe_after -= 1;
+        } else if !self.failed && self.successes >= TX_PROBE_ACKS
+            && self.current(ofdm_only) < Self::top(ofdm_only) {
+            self.index = self.current(ofdm_only) as u8 + 1;
+            self.successes = 0;
+            self.probing = true;
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxStatusCounters {
@@ -1731,9 +1924,21 @@ pub struct TxStatusCounters {
     pub last_sequence: u16,
     pub last_wcid: u16,
     pub last_pid: u8,
+    pub rates: [TxRate; 3], // unicast WCIDs 15..17
+    /// Boot-arg amtk_awdl_ht=0: stop the ladder at 54 Mbps OFDM.
+    pub ofdm_only: bool,
 }
 
 impl TxStatusCounters {
+    pub fn rate(&self, wcid: u16) -> u16 {
+        wcid.checked_sub(15).and_then(|i| self.rates.get(i as usize))
+            .map_or(TX_RATES[0], |r| r.rate(self.ofdm_only))
+    }
+
+    pub fn rate_mbps(&self, peer: usize) -> u16 {
+        self.rates.get(peer).map_or(0, |r| TX_RATE_MBPS[r.current(self.ofdm_only)])
+    }
+
     /// Consumes a 32-byte TXS record when it belongs to an AWDL WCID
     /// (15..18). Returns whether it was AWDL's.
     pub fn observe(&mut self, p: &[u8]) -> bool {
@@ -1755,6 +1960,9 @@ impl TxStatusCounters {
         self.last_sequence = (le32(p, 4) >> 20) as u16;
         self.last_wcid = wcid as u16;
         self.last_pid = pid;
+        if pid == TX_PID_UNICAST && wcid < 18 {
+            self.rates[(wcid - 15) as usize].observe(status, self.ofdm_only);
+        }
         let counter = match (pid, failed) {
             (TX_PID_UNICAST, true) => &mut self.data_failed,
             (TX_PID_UNICAST, false) => &mut self.data_acked,
@@ -2179,6 +2387,245 @@ mod tests {
         // A clock restart also cannot pin a window in the old epoch.
         assert!(window.accept(0, 1));
         assert!(!window.accept(0, 1));
+    }
+
+    #[test]
+    fn large_upload_rolls_at_4096_without_idle_or_losing_duplicate_history() {
+        let mut window = DataReplayWindow::default();
+        // A sustained 32 MiB upload crosses this boundary several times.
+        for packet in 0..30_000u64 {
+            let seq = (packet & 0xfff) as u16;
+            assert!(window.accept(seq, 100 + packet * 200), "packet {packet}");
+            assert!(!window.accept(seq, 101 + packet * 200), "duplicate {packet}");
+        }
+        assert_eq!(window.sequence_bits, 12);
+        let mut boundary = DataReplayWindow::default();
+        assert!(boundary.accept(4094, 1));
+        assert!(boundary.accept(0, 2));
+        assert!(boundary.accept(4095, 3)); // reordered across rollover
+        assert!(!boundary.accept(4095, 4));
+        assert!(!boundary.accept(4094, 5));
+        assert!(!boundary.accept(4032, 6)); // outside the 64-MSDU window
+        // A channel switch can lose the first packets after rollover.
+        let mut missed = DataReplayWindow::default();
+        assert!(missed.accept(4095, 1));
+        assert!(missed.accept(447, 2)); // first retained live rejection
+        assert!(!missed.accept(447, 3));
+    }
+
+    #[test]
+    fn sixteen_bit_streams_and_unrelated_backwards_jumps_stay_supported() {
+        let mut window = DataReplayWindow::default();
+        for packet in 0..70_000u64 {
+            let seq = packet as u16;
+            assert!(window.accept(seq, 100 + packet * 10));
+            assert!(!window.accept(seq, 101 + packet * 10));
+        }
+        assert_eq!(window.sequence_bits, 16);
+        let mut window = DataReplayWindow::default();
+        assert!(window.accept(4000, 1));
+        assert!(!window.accept(2000, 2));
+        assert!(!window.accept(0, 3));
+        assert_eq!(window.sequence_bits, 0);
+        assert!(window.accept(4095, 4));
+        assert!(window.accept(4096, 5));
+        assert!(!window.accept(0, 6));
+        assert_eq!(window.sequence_bits, 16);
+    }
+
+    #[test]
+    fn dense_sequence_fills_only_idle_slots_with_the_data_channel() {
+        let mut host = Sequence { count: 16, step: 3, ..Default::default() };
+        for (i, c) in [(0, 6), (2, 149), (8, 6), (10, 149)] {
+            host.channels[i] = c;
+        }
+        assert_eq!(data_channel(&host), 149);
+        let d = dense_sequence(&host, 149);
+        assert_eq!((d.count, d.step), (16, 3));
+        for i in 0..16 {
+            let want = if i == 0 || i == 8 { 6 } else { 149 };
+            assert_eq!(d.channels[i], want, "slot {i}");
+        }
+        assert!(valid_sequence(&d));
+        // Slots beyond count, 2.4 GHz-only and invalid sequences are untouched.
+        let mut short = host;
+        short.count = 4;
+        assert_eq!(&dense_sequence(&short, 149).channels[4..], &host.channels[4..]);
+        let mut social = Sequence { count: 16, step: 3, ..Default::default() };
+        social.channels[0] = 6;
+        assert_eq!(data_channel(&social), 0);
+        assert_eq!(dense_sequence(&social, 0), social);
+        assert_eq!(dense_sequence(&host, 200), host);
+        let bad = Sequence { count: 17, ..host };
+        assert_eq!(data_channel(&bad), 0);
+        assert_eq!(dense_sequence(&bad, 149), bad);
+    }
+
+    fn txs(rate: u16, failed: bool, wcid: u16, pid: u8) -> [u8; 32] {
+        let mut data = [0u8; 32];
+        let status = 0x8000_8000 | rate as u32 | if failed { 0x10000 } else { 0 };
+        data[..4].copy_from_slice(&status.to_le_bytes());
+        data[8..12].copy_from_slice(&((wcid as u32) << 16).to_le_bytes());
+        data[12..16].copy_from_slice(&((pid as u32) << 24).to_le_bytes());
+        data
+    }
+
+    fn acks(c: &mut TxStatusCounters, wcid: u16, n: usize) {
+        for _ in 0..n {
+            let rate = c.rate(wcid);
+            assert!(c.observe(&txs(rate, false, wcid, TX_PID_UNICAST)));
+        }
+    }
+
+    #[test]
+    fn unicast_rates_climb_to_ht_and_ignore_isolated_losses() {
+        let mut c = TxStatusCounters::default();
+        assert_eq!(c.rate(15), 0x4b); // 6 Mbps
+        acks(&mut c, 15, 32 * 6);
+        assert_eq!(c.rate(15), 0x87); // HT MCS 7
+        assert_eq!(c.rate_mbps(0), 65);
+        assert_eq!(c.rate(16), 0x4b); // independent peer
+        for wcid in [0, 14, 18, u16::MAX] {
+            assert_eq!(c.rate(wcid), 0x4b);
+        }
+        // The 1.0.3 capture: one loss per ~2000 ACKs must not cost a rung.
+        for _ in 0..20 {
+            c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
+            acks(&mut c, 15, 2000);
+            assert_eq!(c.rate(15), 0x87);
+        }
+        // Two losses within 128 ACKs do.
+        c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
+        acks(&mut c, 15, 100);
+        c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rate(15), 0x4c); // 54 Mbps
+        assert_eq!(c.rates[0].probe_after, 256);
+    }
+
+    #[test]
+    fn unicast_rate_probe_failures_back_off_exponentially() {
+        let mut c = TxStatusCounters { ofdm_only: true, ..Default::default() };
+        acks(&mut c, 15, 32 * 4);
+        assert_eq!(c.rate(15), 0x48); // 48 Mbps
+        acks(&mut c, 15, 32);
+        assert_eq!(c.rate(15), 0x4c); // 54: probing
+        c.observe(&txs(0x4c, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rate(15), 0x48);
+        assert_eq!(c.rates[0].probe_after, 512);
+        acks(&mut c, 15, 512 + 32);
+        assert_eq!(c.rate(15), 0x4c);
+        c.observe(&txs(0x4c, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rates[0].probe_after, 1024);
+        // A confirmed probe resets the backoff.
+        acks(&mut c, 15, 1024 + 32 + 32);
+        assert_eq!(c.rate(15), 0x4c);
+        assert_eq!(c.rates[0].backoff, 0);
+        // ofdm_only never offers HT.
+        acks(&mut c, 15, 4096);
+        assert_eq!(c.rate(15), 0x4c);
+        assert_eq!(c.rate_mbps(0), 54);
+    }
+
+    #[test]
+    fn unicast_rate_ignores_stale_and_foreign_reports() {
+        let mut c = TxStatusCounters::default();
+        acks(&mut c, 15, 64);
+        assert_eq!(c.rate(15), 0x49); // 24 Mbps
+        let before = c.rates[0];
+        // Late completions at older rates, other frame classes and PPDU
+        // summaries must not change the 24 Mbps history.
+        for _ in 0..64 {
+            c.observe(&txs(0x4a, true, 15, TX_PID_UNICAST));
+            c.observe(&txs(0x49, true, 15, TX_PID_ACTION));
+            c.observe(&txs(0x49, true, 15, TX_PID_MULTICAST));
+            let mut ppdu = txs(0x49, true, 15, TX_PID_UNICAST);
+            ppdu[2] |= 1; ppdu[3] |= 1; // format 2
+            c.observe(&ppdu);
+        }
+        assert_eq!(c.rates[0].index, before.index);
+        assert_eq!(c.rates[0].successes, before.successes);
+        assert!(!c.rates[0].failed);
+        // Firmware that never reports the selected rung: step down.
+        for _ in 0..64 {
+            c.observe(&txs(0x4a, false, 15, TX_PID_UNICAST));
+        }
+        assert_eq!(c.rate(15), 0x4a);
+        // NSS/STBC bits above the mode field still match.
+        acks(&mut c, 15, 256 + 1);
+        assert_eq!(c.rate(15), 0x49); // hold over: probing 24 again
+        c.observe(&txs(0x49 | 0x2000, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rate(15), 0x4a);
+        let snapshot = c;
+        for n in 0..32 {
+            assert!(!c.observe(&[0u8; 32][..n]));
+        }
+        assert!(!c.observe(&txs(0x49, true, 14, TX_PID_UNICAST)));
+        assert_eq!(c, snapshot);
+    }
+
+    fn addba(state: &State, params: u16, ssc: u16) -> [u8; 33] {
+        let mut f = [0u8; 33];
+        f[0] = 0xd0;
+        f[4..10].copy_from_slice(&state.mac);
+        f[10..16].copy_from_slice(&[0x02, 1, 2, 3, 4, 5]);
+        f[16..22].copy_from_slice(&BSSID);
+        f[24] = BLOCK_ACK_CATEGORY;
+        f[25] = ADDBA_REQUEST;
+        f[26] = 9;
+        f[27..29].copy_from_slice(&params.to_le_bytes());
+        f[29..31].copy_from_slice(&5000u16.to_le_bytes());
+        f[31..33].copy_from_slice(&ssc.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn addba_requests_are_accepted_with_a_bounded_window() {
+        let mut s = State::default();
+        s.mac = [0x02, 9, 9, 9, 9, 9];
+        // A-MSDU, immediate, TID 5, 256 MSDUs, SSN 1234.
+        let req = addba(&s, 1 | 2 | 5 << 2 | 256 << 6, 1234 << 4);
+        assert_eq!(addba_request(&s.mac, &req), Some(AddbaRequest { tid: 5, ssn: 1234, window: 64 }));
+        let mut f = [0u8; 40];
+        assert_eq!(build_addba_accept(&mut s, &req, 64, &mut f), 33);
+        assert_eq!(&f[4..10], &req[10..16]);
+        assert_eq!(&f[10..16], &s.mac);
+        assert_eq!((f[24], f[25], f[26]), (BLOCK_ACK_CATEGORY, ADDBA_RESPONSE, 9));
+        assert_eq!(le16(&f, 27), 0);
+        assert_eq!(le16(&f, 29), 1 | 2 | 5 << 2 | 64 << 6);
+        assert_eq!(le16(&f, 31), 5000);
+        // Smaller requests are honoured; 0 means ours.
+        let req = addba(&s, 2 | 32 << 6, 0);
+        assert_eq!(addba_request(&s.mac, &req).unwrap().window, 32);
+        assert_eq!(addba_request(&s.mac, &addba(&s, 2, 0)).unwrap().window, 64);
+        // Delayed BA, foreign destinations and short frames are refused.
+        assert_eq!(addba_request(&s.mac, &addba(&s, 0, 0)), None);
+        let delayed = addba(&s, 0, 0);
+        assert_eq!(build_addba_accept(&mut s, &delayed, 64, &mut f), 0);
+        let mut other = addba(&s, 2, 0);
+        other[4] ^= 1;
+        assert_eq!(addba_request(&s.mac, &other), None);
+        for n in 0..33 {
+            assert_eq!(addba_request(&s.mac, &req[..n]), None);
+            assert_eq!(build_addba_accept(&mut s, &req[..n], 64, &mut f), 0);
+        }
+        assert_eq!(build_addba_accept(&mut s, &req, 64, &mut f[..32]), 0);
+        // Decline keeps the peer's parameters and status 37.
+        assert_eq!(build_addba_decline(&mut s, &req, &mut f), 33);
+        assert_eq!(le16(&f, 27), STATUS_REQUEST_DECLINED);
+        assert_eq!(le16(&f, 29), 2 | 32 << 6);
+    }
+
+    #[test]
+    fn delba_from_the_originator_names_the_rx_tid() {
+        let mut s = State::default();
+        s.mac = [0x02, 9, 9, 9, 9, 9];
+        let mut f = addba(&s, 0, 0);
+        f[25] = DELBA;
+        f[26..28].copy_from_slice(&(0x0800u16 | 6 << 12).to_le_bytes());
+        assert_eq!(delba_rx_tid(&s.mac, &f[..30]), Some(6));
+        f[26..28].copy_from_slice(&(6u16 << 12).to_le_bytes()); // recipient
+        assert_eq!(delba_rx_tid(&s.mac, &f[..30]), None);
+        assert_eq!(delba_rx_tid(&s.mac, &f[..29]), None);
     }
 
     fn fixture(name: &str) -> Vec<u8> {

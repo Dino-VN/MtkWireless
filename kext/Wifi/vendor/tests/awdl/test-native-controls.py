@@ -11,6 +11,8 @@ for name in ['setAWDL_SYNC_FRAME_TEMPLATE', 'getAWDL_AF_SECONDARY_PAYLOAD_CAPABI
              'setAWDL_SYNC_PARAMS', 'setAWDL_SECONDARY_MASTER_CHANNEL']:
     start = source.index('IOReturn AirportMtkAwdlInterface::' + name + '(')
     functions.append(source[start:source.index('\n}\n', start) + 3])
+start = source.index('void AirportMtkAwdlInterface::applySequence(')
+functions.append(source[start:source.index('\n}\n', start) + 3])
 header = (root / 'include/Airport/apple80211_ioctl.h').read_text()
 structs = []
 for name in ['apple80211_awdl_sync_channel_sequence', 'apple80211_awdl_sync_params',
@@ -51,6 +53,8 @@ struct AirportMtkAwdlInterface {
     uint64_t nextAction = 0; uint32_t secondaryMasterChannel = 0;
     uint8_t syncTemplate[2048]{}, trafficPeer[6]{};
     unsigned templateLength = 0; bool enabled = true, trafficActive = false;
+    mtkawdl::Sequence hostSequence{};bool hostSequenceValid=false,densePresence=false;uint64_t presenceSampleAt=0,presenceFrames=0,presenceActiveAt=0,presenceTransitions=0;void applySequence(uint64_t);void updatePresence(uint64_t);
+
     Timer clock; Timer *timer = &clock;
     void setProperty(const char*,uint64_t,unsigned) {}
     void setProperty(const char*,const void*,unsigned) {}

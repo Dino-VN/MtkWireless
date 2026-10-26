@@ -50,6 +50,9 @@ int main() {
     view.sequence=0;
     recorder.recordDataRx(frame,view,202,6,-50,65535,1,true);
     assert(recorder.dataRxTooOld==1 && recorder.dataRxLastRejected.timeUS==201);
+    view.sequence=4095;
+    recorder.recordDataRx(frame,view,203,6,-50,0,3,false,0xfff);
+    assert(recorder.dataRxDuplicate==2 && recorder.dataRxLastRejected.result==2);
     // Invalid frames may be shorter than a data header or larger than MTU.
     // Only the supplied bytes are read; ring wrap retains the original size.
     uint8_t shortFrame[1]={0xc4};

@@ -57,7 +57,7 @@ struct AirportMtkAwdlInterface:OSObject{
  uint64_t syncRequests=0,syncWaits=0,syncFailures=0;
  struct{uint8_t mac[6]={2,1,2,3,4,5};void holdClock(uint64_t){}void discardControls(){}}state;
  uint64_t nextAction=0,requestDeadline=0;unsigned requestedChannel=0,grantedChannel=0,queueCount=0,queueHead=0;
- mbuf_t queue[64]{};std::atomic<unsigned> refs{1};
+ static constexpr unsigned kDataQueueSize=256;mbuf_t queue[kDataQueueSize]{};std::atomic<unsigned> refs{1};
  void retain(){++refs;}void release(){--refs;}void drainCompletions(){}
  uint64_t endedAt=0;unsigned ends=0;
  void notifyAvailabilityWindowEnd(uint64_t now){endedAt=now>awTimeline.radioEnd?awTimeline.radioEnd:now;++ends;awTimeline.close();}
