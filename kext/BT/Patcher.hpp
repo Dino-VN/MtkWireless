@@ -15,6 +15,7 @@
 namespace Patcher {
 
 void init(uint32_t rustSelfTestFailed);
+void observeMsbcController(bool supported);
 
 } // namespace Patcher
 

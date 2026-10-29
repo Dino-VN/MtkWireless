@@ -14,8 +14,10 @@
 
 #include "EmbeddedFirmware.hpp"
 #include "Log.h"
+#include "Patcher.hpp"
 #include "USBDeviceController.hpp"
 #include "mtk_bt.h"
+#include "msbc/UsbMsbcScope.hpp"
 
 #define super IOService
 OSDefineMetaClassAndStructors(MtkWirelessBTLoader, IOService)
@@ -117,6 +119,9 @@ IOService *MtkWirelessBTLoader::probe(IOService *provider, SInt32 *score)
     auto *device = OSDynamicCast(IOUSBHostDevice, provider);
     if (!device)
         return nullptr;
+    // Use the exact predicate used by USB pipe binding, before bluetoothd
+    // can negotiate wideband on this controller. No USB request is sent.
+    Patcher::observeMsbcController(msbcCachedMtkDevice(device));
     BTLog("probe %s vendor=0x%04x product=0x%04x\n", device->getName(),
           USBToHost16(device->getDeviceDescriptor()->idVendor),
           USBToHost16(device->getDeviceDescriptor()->idProduct));

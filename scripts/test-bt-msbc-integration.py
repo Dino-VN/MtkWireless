@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Execute Dino's actual mSBC route/gate wrappers against a small USB mock."""
 from pathlib import Path
+import argparse
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--no-sanitize", action="store_true", help="run without ASan/UBSan when unavailable on the host")
+args = parser.parse_args()
 source = (ROOT / "kext/BT/Patcher.cpp").read_text()
 
 
@@ -348,6 +352,7 @@ with tempfile.TemporaryDirectory(prefix="dino-msbc-test-") as directory:
     cpp = Path(directory) / "integration.cpp"
     cpp.write_text(mock + wrappers + tests)
     binary = Path(directory) / "integration"
+    sanitizer = [] if args.no_sanitize else ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
     subprocess.run(["xcrun", "clang++", "-std=c++17", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", str(cpp), "-o", str(binary)], check=True)
+                    *sanitizer, str(cpp), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

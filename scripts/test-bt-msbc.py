@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Host-only mSBC tests: no driver loading, Bluetooth control or audio capture."""
 from pathlib import Path
+import argparse
 import shutil
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-FLAGS = ["-O1", "-g", "-Wall", "-Wextra", "-Werror",
-         "-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--no-sanitize", action="store_true", help="run without ASan/UBSan when unavailable on the host")
+args = parser.parse_args()
+FLAGS = ["-O1", "-g", "-Wall", "-Wextra", "-Werror"]
+if not args.no_sanitize:
+    FLAGS += ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 
 with tempfile.TemporaryDirectory(prefix="mtkwireless-msbc-") as temporary:
     build = Path(temporary)
@@ -23,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix="mtkwireless-msbc-") as temporary:
                         str(source / "vendor/google-libsbc/src" / (name + ".c")),
                         "-o", str(obj)], check=True, timeout=120)
         codec.append(obj)
-    for name in ("stream-tests", "transport-tests", "test-usb-msbc", "test-usb-real-stream"):
+    for name in ("controller-scope-tests", "stream-tests", "transport-tests", "test-usb-msbc", "test-usb-real-stream"):
         flags = ["-std=c++17", *FLAGS, *includes]
         sources = [source / "tests" / (name + ".cpp")]
         if name.startswith("test-usb"):
@@ -31,7 +36,7 @@ with tempfile.TemporaryDirectory(prefix="mtkwireless-msbc-") as temporary:
             sources.append(source / "UsbMsbcBridge.cpp")
         if name == "test-usb-real-stream":
             flags.append("-DUSB_MSBC_BRIDGE_REAL_STREAM_TEST")
-        if name != "test-usb-msbc":
+        if name not in ("test-usb-msbc", "controller-scope-tests"):
             sources.extend(codec)
         binary = build / name
         subprocess.run(["xcrun", "clang++", *flags, *map(str, sources), "-o", str(binary)],

@@ -63,6 +63,21 @@ duplex test, the usual calling-app/input test, and an ordinary reconnect.
 The F1 USB mouse receiver and native Wi-Fi continued working. Multi-hour
 stability and other headsets remain untested.
 
+The firmware loader now qualifies each probed controller with the same
+USB-ID predicate as the bridge. The global bluetoothd wideband/HFP patches
+stay off until a supported controller is known, and an unsupported probe
+vetoes them for the boot. This preserves CVSD on MT7922 `0489:e0d8`, which
+previously negotiated mSBC even though its USB pipes bypassed the bridge.
+This is a scope repair, not new E0D8 wideband support. CVSD uses narrowband
+call audio. Since the page patches are global and persist in the file cache,
+switching controller hardware after they have been installed still requires
+a fresh boot; this change does not add dynamic patch rollback.
+
+`MtkWirelessBT` on IOResources publishes `MsbcScopeFix = 1`,
+`MsbcControllerScope` (0 unknown, 1 supported, 2 unsupported, 3 mixed), and
+`MsbcWidebandAllowed`. E0D8 should report scope 2, allowed false and zero
+`BluetoothdWbsPatched`/`BluetoothdHfpFillPatched` after a fresh boot.
+
 The bridge encodes and decodes mSBC in software. It uses the controller's
 USB alternate setting 6 with complete 63-byte HCI packets, while preserving
 bluetoothd's 33-byte PCM view and timing. The two bluetoothd page patches
