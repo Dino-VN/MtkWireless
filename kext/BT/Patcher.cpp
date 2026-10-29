@@ -19,6 +19,7 @@
 #include <IOKit/usb/IOUSBHostPipe.h>
 
 #include "mtk_bt.h"
+#include "msbc/MsbcControllerScope.hpp"
 #include "msbc/UsbMsbcBridge.hpp"
 #include "msbc/UsbMsbcScope.hpp"
 
@@ -30,6 +31,7 @@ mach_vm_address_t orgFindQueuedRequest, orgDeviceRequest, orgPipeIo, orgPipeIoSy
 mach_vm_address_t orgIsoIo, orgSelectAlternateSetting, orgInterfaceClose, orgGetPipeProperties;
 UsbMsbcBridge *msbcBridge;
 bool msbcReady;
+MsbcControllerScope msbcControllerScope;
 
 bool isMsbcReady()
 {
@@ -81,6 +83,10 @@ void publishCounters()
     number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
     number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);
     number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);
+    number("MsbcScopeFix", 1);
+    number("MsbcControllerScope", msbcControllerScope.observed());
+    d->setObject("MsbcWidebandAllowed",
+        msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband() ? kOSBooleanTrue : kOSBooleanFalse);
     d->setObject("BluetoothdVerifyFixRouted", verifyFixRouted ? kOSBooleanTrue : kOSBooleanFalse);
     number("BluetoothdPatchRanges", __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE));
     number("BluetoothdPatchRangeOverflow", (uint32_t)patchRangeOverflow);
@@ -837,7 +843,7 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
 
 void patchBluetoothdPage(const void *data)
 {
-    if (msbcPatchEnabled && isMsbcReady()) {
+    if (msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband()) {
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, wbsFind, sizeof(wbsFind),
                                           wbsReplace, sizeof(wbsReplace))) {
             OSIncrementAtomic(&bluetoothdWbsPatched);
@@ -888,6 +894,12 @@ void processPatcher(void *, KernelPatcher &patcher)
 }
 
 } // namespace
+
+void Patcher::observeMsbcController(bool supported)
+{
+    msbcControllerScope.observe(supported);
+    publishCounters();
+}
 
 void Patcher::init(uint32_t rustSelfTestFailed)
 {

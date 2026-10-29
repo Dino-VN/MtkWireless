@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "kext/BT/Patcher.cpp").read_text()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path, help="optional Tahoe x86_64 bluetoothd to check, without modifying it")
+parser.add_argument("--no-sanitize", action="store_true", help="run without ASan/UBSan when unavailable on the host")
 args = parser.parse_args()
 
 
@@ -73,6 +74,7 @@ constexpr size_t PAGE_SIZE = 4096;
 namespace KernelVersion { enum { Monterey = 21, Tahoe = 25 }; }
 int kernel;
 bool flag, noExtAdv, noVerifyFix, msbcReady, extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
+MsbcControllerScope msbcControllerScope;
 int32_t bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 int32_t bluetoothdWbsPatched, bluetoothdHfpFillPatched;
 uint32_t rustFailed;
@@ -155,7 +157,7 @@ struct Lilu {
         ++pageRegistrations; callback(nullptr, patcher);
     }
 } lilu;
-namespace Patcher { void init(uint32_t); }
+namespace Patcher { void init(uint32_t); void observeMsbcController(bool); }
 '''
 
 tests = r'''
@@ -178,6 +180,7 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     patchRangeOverflow = verifyRestored = verifyRestoreFailed = verifies = 0;
     free(pageSnapshot); pageSnapshot = nullptr; pageLock = nullptr; lilu.patcher.verifyRouteFails = false;
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
+    msbcControllerScope = {};
     bluetoothdPages = bluetoothdPatched = bluetoothdAddressPatched = bluetoothdAddressRetryPatched = 0;
     bluetoothdWbsPatched = bluetoothdHfpFillPatched = 0;
     pathError = validations = searches = 0;
@@ -254,10 +257,13 @@ void verifyTests() {
 }
 int main() {
     for (int version : {20, 21, 24, 25, 26}) for (bool enabled : {false, true})
-    for (bool disableAdv : {false, true}) for (bool ready : {false, true}) {
+    for (bool disableAdv : {false, true}) for (bool ready : {false, true})
+    for (unsigned scope : {0u, 1u, 2u, 3u}) {
         reset(version, enabled, disableAdv); Patcher::init(0); msbcReady = ready;
+        if (scope & MsbcControllerScope::Supported) Patcher::observeMsbcController(true);
+        if (scope & MsbcControllerScope::Unsupported) Patcher::observeMsbcController(false);
         const bool adv = version >= 21 && !disableAdv;
-        const bool wideband = version == 25 && enabled && ready;
+        const bool wideband = version == 25 && enabled && ready && scope == MsbcControllerScope::Supported;
         assert(lilu.pageRegistrations == int(version >= 21));
         assert(verifyFixRouted == (version >= 21));
         assert(extAdvPatchEnabled == adv && msbcPatchEnabled == (version == 25 && enabled));
@@ -285,6 +291,7 @@ int main() {
         assert(searches == previous);
     }
     reset(25, true, true); Patcher::init(0); msbcReady = true;
+    Patcher::observeMsbcController(true);
     for (bool fill : {false, true}) {
         const uint8_t *find = fill ? hfpFillFind : wbsFind;
         const uint8_t *replace = fill ? hfpFillReplace : wbsReplace;
@@ -304,8 +311,13 @@ int main() {
     }
     reset(25, true, true); lilu.patcher.routeFails = true; Patcher::init(0);
     assert(!extAdvPatchRouted);
+    // A later supported probe must never undo an unsupported controller's veto.
+    reset(25, true, true); Patcher::init(0); msbcReady = true;
+    Patcher::observeMsbcController(false); Patcher::observeMsbcController(true);
+    Page blocked = originals(); apply(blocked);
+    assert(blocked == originals() && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
     verifyTests();
-    puts("PASS: actual init/page hook opt-in, Tahoe/readiness gates, foreign paths, exact bytes, page limits, idempotency and advertising opt-out");
+    puts("PASS: actual page hook gates unknown/unsupported/mixed controllers; supported IDs retain WBS; verification and advertising checks pass");
 }
 '''
 
@@ -315,15 +327,17 @@ state = source[state_start:source.index("\n", source.index("vnode_t bluetoothdVn
 wrappers = "\n\n".join(function(name) for name in (
     "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "bool isBluetoothd(",
     "errno_t vnopVerify(", "void patchBluetoothdPage(const void *data)\n{", "void csValidatePage(", "void processPatcher(",
-    "void Patcher::init("))
+    "void Patcher::observeMsbcController(", "void Patcher::init("))
 compiler = shutil.which("clang++")
 assert compiler, "clang++ is required"
 with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     directory = Path(directory)
     cpp, binary = directory / "pages.cpp", directory / "pages"
-    cpp.write_text(mock + declarations + state + "\n" + wrappers + tests)
+    scope_include = '#include "' + str(ROOT / "kext/BT/msbc/MsbcControllerScope.hpp") + '"\n'
+    cpp.write_text(scope_include + mock + declarations + state + "\n" + wrappers + tests)
+    sanitizer = [] if args.no_sanitize else ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
     subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", str(cpp), "-o", str(binary)], check=True)
+                    *sanitizer, str(cpp), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
     if platform.machine() == "x86_64":
