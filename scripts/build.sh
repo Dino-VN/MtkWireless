@@ -45,6 +45,7 @@ TARGET=(-target x86_64-apple-macos10.12 -isysroot "$SDK")
 # Mirrors Xcode's kernel-extension settings (-mkernel: static relocation,
 # no red zone, no implicit float).
 CFLAGS=(-nostdinc -mkernel -fno-builtin -fno-common -fstrict-aliasing -g "${OPT[@]}"
+        -mno-sse -mno-sse2 -mno-mmx -fno-vectorize -fno-slp-vectorize -fno-jump-tables
         -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT "-DMODULE_VERSION=$VERSION"
         -Wall -Wno-unused-parameter -I "$ROOT/kext/include")
 # Header order decides which IOKit class layouts (vtables) the code is built
@@ -56,7 +57,10 @@ CXXFLAGS=(-std=gnu++17 -fapple-kext -fno-rtti -fno-exceptions)
 # rust_lib <feature>: build the Rust core for one kext, print the archive path.
 rust_lib() {
     local dir="$ROOT/build/rust-$1"
-    (cd rust && MACOSX_DEPLOYMENT_TARGET=10.12 "$CARGO" build -p mtk-ffi --features "$1" --profile "$PROFILE" \
+    # Keep inline jump-table bytes out of __text so the linear FPU scan can
+    # distinguish instructions from data (relative entries can look like fdiv).
+    (cd rust && MACOSX_DEPLOYMENT_TARGET=10.12 RUSTFLAGS="${RUSTFLAGS:-} -C jump-tables=no" \
+        "$CARGO" build -p mtk-ffi --features "$1" --profile "$PROFILE" \
         --target targets/x86_64-apple-kext.json -Z build-std=core,alloc \
         -Z json-target-spec --target-dir "$dir") >&2 || exit 1  # fails the $(...) caller
     echo "$dir/x86_64-apple-kext/$PROFILE_DIR/libmtk_ffi.a"

@@ -33,8 +33,11 @@ for name in MtkWirelessWifi MtkWirelessBT; do
     else
         echo "$name: all $(nm -u "$bin" | wc -l | tr -d ' ') undefined symbols resolve"
     fi
-    if xcrun otool -tV "$bin" | grep -qE '%[xy]mm[0-9]|[[:space:]]f(ld|st|add|mul|div)'; then
-        echo "$name: SSE/x87 instructions found" >&2
+    # Do not pipe otool to grep -q under pipefail: an early match can give
+    # otool SIGPIPE, making the pipeline false and silently accepting SSE.
+    assembly="$(xcrun otool -tV "$bin")"
+    if grep -qE '%[xyz]mm[0-9]|[[:space:]]f(ld|st|add|mul|div)' <<< "$assembly"; then
+        echo "$name: SSE/AVX/x87 instructions found" >&2
         status=1
     fi
 done
