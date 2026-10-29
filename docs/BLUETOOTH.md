@@ -85,6 +85,20 @@ python3 scripts/test-bt-msbc-integration.py
 python3 scripts/test-bt-msbc-page-patches.py
 ```
 
+## Page patches and the sealed volume
+
+bluetoothd's page patches (MtkWirelessBT's and BlueToolFixup's) modify pages
+in the shared file cache. macOS verifies compressed system files in 16 KB
+blocks and hashes resident pages together with the ones it reads, so a
+patched page left in memory made every later page-in of its neighbours fail:
+bluetoothd crashed about 20 seconds after each launch, with
+`apfs_announce_hash_mismatch ... (bluetoothd)` in the kernel log, until
+reboot. MtkWirelessBT now records the original bytes of every patched
+bluetoothd range and lets the verification hash a copy with them restored.
+`-mtkbtnoverifyfix` disables this. `BluetoothdPatchRanges` should count
+both kexts' patches (about six on 25G241) and `BluetoothdVerifyRestored` how
+often a block needed it.
+
 ## Checking
 
 ```sh

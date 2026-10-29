@@ -186,6 +186,20 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   `BluetoothdExtAdvRouted`/`BluetoothdPages`/`BluetoothdExtAdvPatched`.
   Unverified on hardware. Lilu DEBUG + `-liludbg liludump=120` writes
   `/var/log/Lilu_*.txt`, the only way to see Lilu/plugin SYSLOG here.
+- bluetoothd page patches (ours and BlueToolFixup's) live in the shared file
+  cache. The sealed volume hashes compressed files per 16 KB block, and
+  `decmpfs_pagein_compressed` hashes absent pages together with resident
+  ones in place, so a resident patched page breaks every later page-in of a
+  neighbour: bluetoothd SIGBUS ~20 s after each launch, kernel log
+  `apfs_announce_hash_mismatch ... (bluetoothd)` (2026-10-27/29,
+  BlueToolFixup's 15.4 chipset patch at 0x1e3737, fault 0x1e2327).
+  `csValidatePage` snapshots each bluetoothd page before any patcher runs
+  and records the changed ranges; the `_VNOP_VERIFY` route hashes a copy of
+  the block with those ranges restored (only where the block holds exactly
+  the patched bytes). Our route must be installed after BlueToolFixup's to
+  see its patches (Lilu plugin order). `-mtkbtnoverifyfix` off. ioreg
+  `BluetoothdVerifyFixRouted`/`BluetoothdPatchRanges`/`BluetoothdVerifyRestored`.
+  Test: `scripts/test-bt-msbc-page-patches.py`. Unverified on hardware.
 - HFP wideband (Tahoe, on unless `-mtkbtnomsbc`; USB `13d3:3610` and
   `0489:e0cd` only, `UsbMsbcScope.hpp`; `kext/BT/msbc`):
   bluetoothd keeps a 33-byte PCM SCO view; `UsbMsbcBridge` maps interface 1

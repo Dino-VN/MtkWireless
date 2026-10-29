@@ -45,6 +45,9 @@ volatile SInt32 leCommands, leCompletions, leErrors;
 bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 volatile SInt32 bluetoothdWbsPatched, bluetoothdHfpFillPatched;
+uint32_t patchRangeCount; // bluetoothd patch ranges, stored with release after each entry is filled
+volatile SInt32 patchRangeOverflow, verifyRestored, verifyRestoreFailed;
+bool verifyFixEnabled, verifyFixRouted;
 
 void publishCounters()
 {
@@ -78,6 +81,11 @@ void publishCounters()
     number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
     number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);
     number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);
+    d->setObject("BluetoothdVerifyFixRouted", verifyFixRouted ? kOSBooleanTrue : kOSBooleanFalse);
+    number("BluetoothdPatchRanges", __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE));
+    number("BluetoothdPatchRangeOverflow", (uint32_t)patchRangeOverflow);
+    number("BluetoothdVerifyRestored", (uint32_t)verifyRestored);
+    number("BluetoothdVerifyRestoreFailed", (uint32_t)verifyRestoreFailed);
     res->setProperty("MtkWirelessBT", d);
     d->release();
 }
@@ -686,7 +694,120 @@ const uint8_t hfpFillReplace[] {
     0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
 static_assert(sizeof(hfpFillFind) == sizeof(hfpFillReplace), "HFP fill patch size");
 
-mach_vm_address_t orgCsValidatePage;
+mach_vm_address_t orgCsValidatePage, orgVnopVerify;
+
+/*
+ * Page patches live in the shared file cache, and the sealed system volume
+ * hashes compressed files per verify block (16 KB for bluetoothd, 4 pages).
+ * decmpfs_pagein_compressed fills only the absent pages of a block and then
+ * hashes the whole block in place, resident pages included (xnu decmpfs.c,
+ * "valid_pages"). Once a patched page stays resident while a neighbour is
+ * evicted, every later fault on that neighbour fails with EBADMSG and
+ * bluetoothd dies with SIGBUS (2026-10-27/29: BlueToolFixup's 15.4 chipset
+ * patch at 0x1e3737, fault at 0x1e2327, crash ~20 s after every launch).
+ *
+ * Record what each validated bluetoothd page looked like before ANY
+ * cs_validate_page patcher touched it (ours wraps BlueToolFixup's route when
+ * it is installed later, as with Lilu plugin order today), and hand
+ * VNOP_VERIFY a copy of the block with those bytes restored. A range is
+ * restored only while the block still holds exactly the patched bytes.
+ * -mtkbtnoverifyfix disables it.
+ */
+constexpr size_t kPatchRangeMax = 96;
+constexpr uint32_t kPatchRanges = 32;
+struct PatchRange {
+    uint64_t fileOffset;
+    uint32_t length;
+    uint8_t original[kPatchRangeMax];
+    uint8_t patched[kPatchRangeMax];
+};
+PatchRange patchRanges[kPatchRanges];
+IOLock *pageLock;
+uint8_t *pageSnapshot;
+vnode_t bluetoothdVnode;
+
+// Caller holds pageLock.
+void recordPatchRange(uint64_t fileOffset, const uint8_t *original, const uint8_t *patched, uint32_t length)
+{
+    uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < count; i++) {
+        const PatchRange &r = patchRanges[i];
+        if (r.fileOffset == fileOffset && r.length == length && memcmp(r.patched, patched, length) == 0)
+            return;
+    }
+    if (count == kPatchRanges) {
+        OSIncrementAtomic(&patchRangeOverflow);
+        return;
+    }
+    PatchRange &r = patchRanges[count];
+    r.fileOffset = fileOffset;
+    r.length = length;
+    memcpy(r.original, original, length);
+    memcpy(r.patched, patched, length);
+    __atomic_store_n(&patchRangeCount, count + 1, __ATOMIC_RELEASE);
+}
+
+// Caller holds pageLock. Differences closer than 8 bytes share a range.
+void recordPageDiff(uint64_t pageOffset, const uint8_t *before, const uint8_t *after)
+{
+    size_t i = 0;
+    while (i < PAGE_SIZE) {
+        if (before[i] == after[i]) {
+            i++;
+            continue;
+        }
+        size_t start = i, end = i + 1;
+        for (size_t j = end; j < PAGE_SIZE && j < end + 8 && j - start < kPatchRangeMax; j++)
+            if (before[j] != after[j])
+                end = j + 1;
+        recordPatchRange(pageOffset + start, before + start, after + start, (uint32_t)(end - start));
+        i = end;
+    }
+}
+
+bool isBluetoothd(vnode_t vp)
+{
+    static constexpr char bluetoothd[] = "/usr/sbin/bluetoothd";
+    char path[PATH_MAX];
+    int pathLength = PATH_MAX;
+    return vn_getpath(vp, path, &pathLength) == 0 && UNLIKELY(strcmp(path, bluetoothd) == 0);
+}
+
+errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *blockSize, void **context,
+                   uint32_t flags, vfs_context_t ctx, void *kind)
+{
+    auto org = FunctionCast(vnopVerify, orgVnopVerify);
+    if (LIKELY(!buf || vp != __atomic_load_n(&bluetoothdVnode, __ATOMIC_ACQUIRE)) || flags != 0 || offset < 0)
+        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    const uint64_t start = (uint64_t)offset;
+    const uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE);
+    auto patchedInBlock = [&](const PatchRange &r) {
+        return r.fileOffset >= start && r.fileOffset - start <= size && r.length <= size - (r.fileOffset - start) &&
+               memcmp(buf + (r.fileOffset - start), r.patched, r.length) == 0;
+    };
+    bool restore = false;
+    for (uint32_t i = 0; i < count && !restore; i++)
+        restore = patchedInBlock(patchRanges[i]);
+    if (!restore)
+        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    auto copy = static_cast<uint8_t *>(IOMalloc(size));
+    if (!copy) {
+        OSIncrementAtomic(&verifyRestoreFailed);
+        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    }
+    memcpy(copy, buf, size);
+    for (uint32_t i = 0; i < count; i++) {
+        const PatchRange &r = patchRanges[i];
+        if (patchedInBlock(r))
+            memcpy(copy + (r.fileOffset - start), r.original, r.length);
+    }
+    errno_t err = org(vp, offset, copy, size, blockSize, context, flags, ctx, kind);
+    IOFree(copy, size);
+    OSIncrementAtomic(err ? &verifyRestoreFailed : &verifyRestored);
+    return err;
+}
+
+void patchBluetoothdPage(const void *data);
 
 // Lilu's user patcher is off on Big Sur and later (kern_start.cpp), so
 // onProcLoad never fires there. Patch bluetoothd's pages as the kernel
@@ -694,14 +815,28 @@ mach_vm_address_t orgCsValidatePage;
 void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pageOffset, const void *data,
                     int *validated, int *tainted, int *nx)
 {
-    FunctionCast(csValidatePage, orgCsValidatePage)(vp, pager, pageOffset, data, validated, tainted, nx);
-    static constexpr char bluetoothd[] = "/usr/sbin/bluetoothd";
-    char path[PATH_MAX];
-    int pathLength = PATH_MAX;
-    if (!data || vn_getpath(vp, path, &pathLength) != 0 || LIKELY(strcmp(path, bluetoothd) != 0))
-        return;
+    auto org = FunctionCast(csValidatePage, orgCsValidatePage);
+    if (!data || !isBluetoothd(vp))
+        return org(vp, pager, pageOffset, data, validated, tainted, nx);
     // Page-in path: count only; the next publishCounters() reports it.
     OSIncrementAtomic(&bluetoothdPages);
+    if (!verifyFixRouted) {
+        org(vp, pager, pageOffset, data, validated, tainted, nx);
+        patchBluetoothdPage(data);
+        return;
+    }
+    IOLockLock(pageLock);
+    memcpy(pageSnapshot, data, PAGE_SIZE);
+    org(vp, pager, pageOffset, data, validated, tainted, nx);
+    patchBluetoothdPage(data);
+    if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0)
+        recordPageDiff(pageOffset, pageSnapshot, static_cast<const uint8_t *>(data));
+    IOLockUnlock(pageLock);
+    __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+}
+
+void patchBluetoothdPage(const void *data)
+{
     if (msbcPatchEnabled && isMsbcReady()) {
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, wbsFind, sizeof(wbsFind),
                                           wbsReplace, sizeof(wbsReplace))) {
@@ -736,6 +871,14 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
 
 void processPatcher(void *, KernelPatcher &patcher)
 {
+    // Route VNOP_VERIFY first: csValidatePage records ranges only once it is in.
+    if (verifyFixEnabled && pageLock && pageSnapshot) {
+        KernelPatcher::RouteRequest verify {"_VNOP_VERIFY", vnopVerify, orgVnopVerify};
+        verifyFixRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &verify, 1);
+        if (!verifyFixRouted)
+            patcher.clearError();
+        SYSLOG(DRV_NAME, "bluetoothd verify-block fix %s", verifyFixRouted ? "routed" : "failed to route");
+    }
     KernelPatcher::RouteRequest route {"_cs_validate_page", csValidatePage, orgCsValidatePage};
     extAdvPatchRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
     if (!extAdvPatchRouted)
@@ -755,8 +898,13 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         leLock = IOLockAlloc();
         extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
         msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && !checkKernelArgument("-mtkbtnomsbc");
+        verifyFixEnabled = !checkKernelArgument("-mtkbtnoverifyfix");
+        if (verifyFixEnabled) {
+            pageLock = IOLockAlloc();
+            pageSnapshot = static_cast<uint8_t *>(IOMalloc(PAGE_SIZE));
+        }
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
-        if (extAdvPatchEnabled || msbcPatchEnabled)
+        if (extAdvPatchEnabled || msbcPatchEnabled || verifyFixEnabled)
             lilu.onPatcherLoadForce(processPatcher);
     }
     publishCounters();

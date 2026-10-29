@@ -51,31 +51,47 @@ mock = r'''
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <vector>
 using mach_vm_address_t = uintptr_t;
 using vnode_t = const char *;
 using memory_object_t = void *;
 using memory_object_offset_t = uint64_t;
+using errno_t = int;
+using vfs_context_t = void *;
+typedef void IOLock;
+using SInt32 = int32_t;
 constexpr size_t PAGE_SIZE = 4096;
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
 #define FunctionCast(fn, original) reinterpret_cast<decltype(&fn)>(original)
 #define LIKELY(value) (value)
+#define UNLIKELY(value) (value)
 #define SYSLOG(...) do {} while (0)
 namespace KernelVersion { enum { Monterey = 21, Tahoe = 25 }; }
 int kernel;
-bool flag, noExtAdv, msbcReady, extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
+bool flag, noExtAdv, noVerifyFix, msbcReady, extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 int32_t bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 int32_t bluetoothdWbsPatched, bluetoothdHfpFillPatched;
 uint32_t rustFailed;
+uint32_t patchRangeCount;
+int32_t patchRangeOverflow, verifyRestored, verifyRestoreFailed;
+bool verifyFixEnabled, verifyFixRouted;
 void *leLock;
 int getKernelVersion() { return kernel; }
 bool checkKernelArgument(const char *name) {
     if (!strcmp(name, "-mtkbtnomsbc")) return !flag;
+    if (!strcmp(name, "-mtkbtnoverifyfix")) return noVerifyFix;
     assert(!strcmp(name, "-mtkbtnoextadv")); return noExtAdv;
 }
 void *IOLockAlloc() { return reinterpret_cast<void *>(1); }
+int lockDepth;
+void IOLockLock(IOLock *) { assert(!lockDepth++); }
+void IOLockUnlock(IOLock *) { assert(lockDepth-- == 1); }
+void *IOMalloc(size_t size) { return malloc(size); }
+void IOFree(void *p, size_t) { free(p); }
 void OSIncrementAtomic(int32_t *value) { ++*value; }
 void publishCounters() {}
 int pathError, validations, searches;
@@ -83,10 +99,23 @@ int vn_getpath(vnode_t path, char *out, int *length) {
     if (pathError) return pathError;
     assert(strlen(path) + 1 <= size_t(*length)); strcpy(out, path); return 0;
 }
-void originalValidate(vnode_t, memory_object_t, memory_object_offset_t, const void *, int *, int *, int *) {
+// Another cs_validate_page patcher wrapped by ours (BlueToolFixup's 15.4 chipset patch).
+const uint8_t foreignFind[8] {0x81, 0xf9, 0x6f, 0x17, 0x00, 0x00, 0x77, 0x30};
+const uint8_t foreignReplace[8] {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+void originalValidate(vnode_t, memory_object_t, memory_object_offset_t, const void *data, int *, int *, int *) {
     ++validations;
+    if (!data) return;
+    auto *bytes = static_cast<uint8_t *>(const_cast<void *>(data));
+    auto *hit = std::search(bytes, bytes + PAGE_SIZE, foreignFind, foreignFind + sizeof(foreignFind));
+    if (hit != bytes + PAGE_SIZE) memcpy(hit, foreignReplace, sizeof(foreignReplace));
 }
-mach_vm_address_t orgCsValidatePage;
+const uint8_t *pristine; // the file as stored; the verify mock hashes against it
+int verifies;
+errno_t originalVerify(vnode_t, off_t offset, uint8_t *buf, size_t size, size_t *, void **, uint32_t, vfs_context_t, void *) {
+    ++verifies;
+    return buf && memcmp(buf, pristine + offset, size) ? 94 : 0;
+}
+mach_vm_address_t orgCsValidatePage, orgVnopVerify;
 struct KernelPatcher {
     static constexpr int KernelID = 0;
     struct RouteRequest {
@@ -94,16 +123,21 @@ struct KernelPatcher {
         mach_vm_address_t *original;
         template<class Fn> RouteRequest(const char *s, Fn, mach_vm_address_t &o) : symbol(s), original(&o) {}
     };
-    bool routeFails = false;
+    bool routeFails = false, verifyRouteFails = false;
     bool routeMultipleLong(int id, RouteRequest *routes, size_t count) {
-        assert(id == KernelID && count == 1 && !strcmp(routes[0].symbol, "_cs_validate_page"));
+        assert(id == KernelID && count == 1);
+        if (!strcmp(routes[0].symbol, "_VNOP_VERIFY")) {
+            if (verifyRouteFails) return false;
+            *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalVerify); return true;
+        }
+        assert(!strcmp(routes[0].symbol, "_cs_validate_page"));
         if (routeFails) return false;
         *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalValidate); return true;
     }
     void clearError() {}
     static bool findAndReplace(void *data, size_t size, const void *find, size_t findSize,
                                const void *replace, size_t replaceSize) {
-        assert(validations && findSize == replaceSize && size == PAGE_SIZE); ++searches;
+        assert(validations && findSize == replaceSize && size == PAGE_SIZE && lockDepth == verifyFixRouted); ++searches;
         auto *bytes = static_cast<uint8_t *>(data);
         const auto *needle = static_cast<const uint8_t *>(find);
         auto *hit = std::search(bytes, bytes + size, needle, needle + findSize);
@@ -138,8 +172,11 @@ Page originals() {
     memcpy(page.data() + 410, advAddressRetryFind, sizeof(advAddressRetryFind));
     return page;
 }
-void reset(int version, bool enabled, bool disableAdv) {
-    kernel = version; flag = enabled; noExtAdv = disableAdv;
+void reset(int version, bool enabled, bool disableAdv, bool disableVerify = false) {
+    kernel = version; flag = enabled; noExtAdv = disableAdv; noVerifyFix = disableVerify;
+    verifyFixEnabled = verifyFixRouted = false; patchRangeCount = 0; bluetoothdVnode = nullptr;
+    patchRangeOverflow = verifyRestored = verifyRestoreFailed = verifies = 0;
+    free(pageSnapshot); pageSnapshot = nullptr; pageLock = nullptr; lilu.patcher.verifyRouteFails = false;
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
     bluetoothdPages = bluetoothdPatched = bluetoothdAddressPatched = bluetoothdAddressRetryPatched = 0;
     bluetoothdWbsPatched = bluetoothdHfpFillPatched = 0;
@@ -147,13 +184,82 @@ void reset(int version, bool enabled, bool disableAdv) {
     orgCsValidatePage = reinterpret_cast<mach_vm_address_t>(originalValidate);
     lilu.pageRegistrations = 0; lilu.patcher.routeFails = false;
 }
+// One 16 KB verify block: page 1 holds our and a foreign patch site, page 0 none.
+void verifyTests() {
+    const char *btd = "/usr/sbin/bluetoothd", *other = "/usr/sbin/BlueTool";
+    std::vector<uint8_t> file(PAGE_SIZE * 4, 0x5a);
+    memcpy(file.data() + PAGE_SIZE + 210, extAdvFind, sizeof(extAdvFind));
+    memcpy(file.data() + PAGE_SIZE + 3000, foreignFind, sizeof(foreignFind));
+    pristine = file.data();
+    size_t blockSize = 16384;
+    auto verify = [&](vnode_t vp, off_t offset, uint8_t *buf, size_t size, uint32_t flags = 0) {
+        return vnopVerify(vp, offset, buf, size, &blockSize, nullptr, flags, nullptr, nullptr);
+    };
+
+    reset(25, true, false); Patcher::init(0);
+    assert(verifyFixRouted && extAdvPatchRouted);
+    std::vector<uint8_t> cache = file; // the file cache: page 1 resident and patched
+    csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
+    assert(bluetoothdPatched == 1 && patchRangeCount == 2 && bluetoothdVnode == btd && !lockDepth);
+    assert(!memcmp(cache.data() + PAGE_SIZE + 3000, foreignReplace, sizeof(foreignReplace)));
+    const std::vector<uint8_t> patched = cache;
+    // Same page validated again after eviction: no duplicate ranges.
+    std::vector<uint8_t> again(file.begin() + PAGE_SIZE, file.begin() + 2 * PAGE_SIZE);
+    csValidatePage(btd, nullptr, PAGE_SIZE, again.data(), nullptr, nullptr, nullptr);
+    assert(patchRangeCount == 2 && !memcmp(again.data(), patched.data() + PAGE_SIZE, PAGE_SIZE));
+
+    // Page-in of a neighbour hashes the block with the resident patched page.
+    assert(verify(btd, 0, cache.data(), cache.size()) == 0 && verifyRestored == 1 && cache == patched);
+    assert(verify(btd, PAGE_SIZE, cache.data() + PAGE_SIZE, PAGE_SIZE) == 0 && verifyRestored == 2);
+    // Untouched page, other vnode, non-default flags, digest-only call: pass through unchanged.
+    assert(verify(btd, 0, cache.data(), PAGE_SIZE) == 0 && verifyRestored == 2);
+    assert(verify(other, 0, cache.data(), cache.size()) == 94);
+    assert(verify(btd, 0, cache.data(), cache.size(), 8) == 94);
+    assert(verify(btd, 0, nullptr, 0) == 0 && verifyRestored == 2);
+    // Range not wholly in the buffer: no restore.
+    assert(verify(btd, PAGE_SIZE + 216, cache.data() + PAGE_SIZE + 216, 100) == 94 && verifyRestored == 2);
+    // Restored only while the block holds exactly the patched bytes.
+    std::vector<uint8_t> altered = cache; altered[PAGE_SIZE + 3001] ^= 1;
+    assert(verify(btd, 0, altered.data(), altered.size()) == 94 && verifyRestored == 2 && verifyRestoreFailed == 1);
+    // Freshly read block: nothing patched, nothing restored.
+    std::vector<uint8_t> fresh = file;
+    assert(verify(btd, 0, fresh.data(), fresh.size()) == 0 && verifyRestored == 2 && fresh == file);
+
+    // Range table full: later ranges are counted, not stored.
+    reset(25, true, true); Patcher::init(0);
+    for (int round = 0; round < 40; ++round) {
+        std::vector<uint8_t> page(PAGE_SIZE, 0);
+        memcpy(page.data() + round * 100, foreignFind, sizeof(foreignFind));
+        csValidatePage(btd, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
+    }
+    assert(patchRangeCount == 32 && patchRangeOverflow == 8);
+
+    // Long differences split into ranges of at most kPatchRangeMax bytes.
+    reset(25, true, true); Patcher::init(0);
+    Page before {}, after {}; for (size_t i = 0; i < 200; ++i) after[100 + i] = 0xcc;
+    recordPageDiff(0, before.data(), after.data());
+    assert(patchRangeCount == 3 && patchRanges[0].length == 96 && patchRanges[2].length == 8);
+    assert(patchRanges[0].fileOffset == 100 && patchRanges[2].fileOffset == 292);
+
+    // Opt-out and route failure leave the plain page hook.
+    reset(25, true, false, true); Patcher::init(0);
+    assert(!verifyFixRouted && extAdvPatchRouted && !pageSnapshot);
+    cache = file; csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
+    assert(bluetoothdPatched == 1 && patchRangeCount == 0 && !bluetoothdVnode);
+    reset(25, true, false); lilu.patcher.verifyRouteFails = true; Patcher::init(0);
+    assert(!verifyFixRouted && extAdvPatchRouted);
+    cache = file; csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
+    assert(patchRangeCount == 0 && verify(btd, 0, cache.data(), cache.size()) == 94);
+    puts("PASS: VNOP_VERIFY restores recorded patch ranges (ours and a wrapped foreign patcher) only in bluetoothd blocks");
+}
 int main() {
     for (int version : {20, 21, 24, 25, 26}) for (bool enabled : {false, true})
     for (bool disableAdv : {false, true}) for (bool ready : {false, true}) {
         reset(version, enabled, disableAdv); Patcher::init(0); msbcReady = ready;
         const bool adv = version >= 21 && !disableAdv;
         const bool wideband = version == 25 && enabled && ready;
-        assert(lilu.pageRegistrations == int(adv || (version == 25 && enabled)));
+        assert(lilu.pageRegistrations == int(version >= 21));
+        assert(verifyFixRouted == (version >= 21));
         assert(extAdvPatchEnabled == adv && msbcPatchEnabled == (version == 25 && enabled));
         Page page = originals(), expected = page;
         if (wideband) {
@@ -198,19 +304,24 @@ int main() {
     }
     reset(25, true, true); lilu.patcher.routeFails = true; Patcher::init(0);
     assert(!extAdvPatchRouted);
+    verifyTests();
     puts("PASS: actual init/page hook opt-in, Tahoe/readiness gates, foreign paths, exact bytes, page limits, idempotency and advertising opt-out");
 }
 '''
 
 declarations = "\n".join(array(name)[0] for name in names)
+state_start = source.index("constexpr size_t kPatchRangeMax")
+state = source[state_start:source.index("\n", source.index("vnode_t bluetoothdVnode;"))]
 wrappers = "\n\n".join(function(name) for name in (
-    "bool isMsbcReady()", "void csValidatePage(", "void processPatcher(", "void Patcher::init("))
+    "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "bool isBluetoothd(",
+    "errno_t vnopVerify(", "void patchBluetoothdPage(const void *data)\n{", "void csValidatePage(", "void processPatcher(",
+    "void Patcher::init("))
 compiler = shutil.which("clang++")
 assert compiler, "clang++ is required"
 with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     directory = Path(directory)
     cpp, binary = directory / "pages.cpp", directory / "pages"
-    cpp.write_text(mock + declarations + wrappers + tests)
+    cpp.write_text(mock + declarations + state + "\n" + wrappers + tests)
     subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
                     "-fsanitize=address,undefined", "-fno-sanitize-recover=all", str(cpp), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
