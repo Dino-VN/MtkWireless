@@ -212,6 +212,15 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   `kIOReturnNotResponding` for one missed frame, and dropping the batch
   killed the mic (bluetoothd then resubmits stale frames, `IsoTooOld`).
   Verified on MT7921 `0489:e0cd` (2026-10-26) and MT7922 `13d3:3610`.
+- Sleep on the Mac Pro cuts USB power, so after wake the controller
+  re-enumerates and needs a cold patch download (`PatchUndone`; at boot it is
+  usually `already patched`). After one (2026-10-30, 13:30 and 18:38) MT7961
+  answered every WMT command, FUNC_CTRL included, then timed out every HCI
+  EP0 request: bluetoothd fell back to `BCM_4350C2` and its watchdog aborted
+  it every ~30 s. `mtk_bt::setup` therefore ends with an HCI_Reset probe
+  (event read from the interrupt pipe); unanswered, it resets the subsystem
+  and downloads once more (Linux `BTMTK_FIRMWARE_DL_RETRY`). Still silent is
+  only logged (`MtkBtLog`). Unverified on hardware.
 - `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
   AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
   crashes make launchd throttle it (640–1200 s).

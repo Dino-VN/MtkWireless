@@ -27,6 +27,11 @@ const DEV_ID_MT7663: u32 = 0x7663;
 
 const PATCH_CHUNK: usize = 250;
 const SEMAPHORE_RETRIES: u32 = 20;
+const HCI_RESET: [u8; 3] = [0x03, 0x0c, 0x00];
+const HCI_EV_COMMAND_COMPLETE: u8 = 0x0e;
+/// Events read while waiting for HCI_Reset's Command Complete; anything else
+/// (vendor/WMT leftovers) is skipped.
+const HCI_PROBE_EVENTS: u32 = 8;
 
 /// An IOReturn from the USB stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +49,9 @@ pub trait Transport {
     /// Send an HCI command on EP0 and read the WMT event that answers it.
     /// Returns the event length written to `event`.
     fn wmt(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, IoError>;
+    /// Send an HCI command on EP0 (`command` empty: send nothing) and read one
+    /// HCI event from the interrupt IN endpoint. Returns the event length.
+    fn hci(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, IoError>;
     fn sleep_ms(&mut self, ms: u32);
     /// Decompressed firmware image by file name.
     fn load_firmware(&mut self, name: &str) -> Option<Self::Firmware>;
@@ -93,9 +101,54 @@ fn io<T>(step: &'static str, r: Result<T, IoError>) -> Result<T, SetupError> {
     r.map_err(|IoError(code)| SetupError::Io { step, code })
 }
 
-/// Full bring-up. On a patch download failure the Bluetooth subsystem is reset
-/// so the next attempt (or the next boot) starts clean.
+/// Full bring-up, then an HCI_Reset to prove the controller runs HCI. After a
+/// cold download (USB power lost in sleep) MT7961 has answered every WMT
+/// command, FUNC_CTRL included, and then never completed an HCI command:
+/// bluetoothd's EP0 requests time out and its watchdog aborts it every ~30 s.
+/// Like Linux's `BTMTK_FIRMWARE_DL_RETRY`, reset the subsystem and download
+/// once more. A controller still silent after that is left as it is (logged):
+/// failing the bring-up would not help bluetoothd either.
 pub fn setup<T: Transport>(t: &mut T) -> Result<SetupInfo, SetupError> {
+    let info = setup_once(t)?;
+    if hci_alive(t) {
+        return Ok(info);
+    }
+    tlog!(t, "controller does not answer HCI_Reset, resetting the subsystem");
+    subsystem_reset(t, info.chip)?;
+    let info = setup_once(t)?;
+    if hci_alive(t) {
+        return Ok(info);
+    }
+    tlog!(t, "controller still does not answer HCI_Reset after a subsystem reset");
+    Ok(info)
+}
+
+/// HCI_Reset answered by its Command Complete (any status).
+fn hci_alive<T: Transport>(t: &mut T) -> bool {
+    let mut event = [0u8; 64];
+    let mut command: &[u8] = &HCI_RESET;
+    for _ in 0..HCI_PROBE_EVENTS {
+        let len = match t.hci(command, &mut event) {
+            Ok(len) => len.min(event.len()),
+            Err(IoError(code)) => {
+                tlog!(t, "HCI_Reset probe failed: 0x{:08x}", code as u32);
+                return false;
+            }
+        };
+        command = &[];
+        if let [HCI_EV_COMMAND_COMPLETE, _, _, 0x03, 0x0c, status, ..] = event[..len] {
+            tlog!(t, "HCI_Reset complete, status 0x{status:02x}");
+            return true;
+        }
+        tlog!(t, "HCI_Reset probe skipped event {:02x?}", &event[..len.min(8)]);
+    }
+    false
+}
+
+/// Chip id, patch download, endpoint reset, FUNC_CTRL on. On a patch download
+/// failure the Bluetooth subsystem is reset so the next attempt (or the next
+/// boot) starts clean.
+fn setup_once<T: Transport>(t: &mut T) -> Result<SetupInfo, SetupError> {
     let mut dev_id = io("read initial dev id", t.reg_read(REG_INITIAL_DEV_ID))?;
     let mut fw_version = 0;
     let mut fw_flavor = 0;
@@ -292,6 +345,7 @@ mod tests {
         UhwRead(u32),
         UhwWrite(u32, u32),
         Wmt(Vec<u8>),
+        Hci(Vec<u8>),
         Sleep(u32),
         Load(String),
     }
@@ -304,6 +358,9 @@ mod tests {
         flavor_reg: u32,
         firmware: Option<Vec<u8>>,
         header_replies: VecDeque<u8>,
+        /// Event read per `hci` call (default: HCI_Reset Command Complete);
+        /// `None` is a USB timeout.
+        hci_events: VecDeque<Option<Vec<u8>>>,
         calls: Vec<Call>,
         logs: Vec<String>,
     }
@@ -316,6 +373,7 @@ mod tests {
                 flavor_reg: 0,
                 firmware,
                 header_replies: VecDeque::new(),
+                hci_events: VecDeque::new(),
                 calls: Vec::new(),
                 logs: Vec::new(),
             }
@@ -372,6 +430,17 @@ mod tests {
             let reply = [0xe4, 5, 2, op, 1, 0, flag];
             event[..7].copy_from_slice(&reply);
             Ok(7)
+        }
+
+        fn hci(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, IoError> {
+            self.calls.push(Call::Hci(command.to_vec()));
+            let reply = self
+                .hci_events
+                .pop_front()
+                .unwrap_or(Some(vec![0x0e, 4, 1, 0x03, 0x0c, 0]))
+                .ok_or(IoError(-536870186))?;
+            event[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
         }
 
         fn sleep_ms(&mut self, ms: u32) {
@@ -487,6 +556,62 @@ mod tests {
             setup(&mut Fake::new(0x7925, None)),
             Err(SetupError::Unsupported { dev_id: 0x7925 })
         );
+    }
+
+    fn downloads(t: &Fake) -> usize {
+        t.wmt_commands()
+            .iter()
+            .filter(|c| c[4] == 1 && c[7] == 1)
+            .count()
+    }
+
+    #[test]
+    fn hci_probe_follows_func_ctrl_and_skips_other_events() {
+        let mut t = Fake::new(0x7961, Some(image(&[&[1]])));
+        t.hci_events = [Some(vec![0xe4, 5, 2, 6, 1, 0, 0])].into();
+        setup(&mut t).unwrap();
+        let on = t
+            .calls
+            .iter()
+            .rposition(|c| matches!(c, Call::Wmt(w) if w[4] == 6))
+            .unwrap();
+        let hci: Vec<_> = t.calls[on..]
+            .iter()
+            .filter_map(|c| match c {
+                Call::Hci(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hci, [HCI_RESET.to_vec(), Vec::new()]);
+        assert_eq!(downloads(&t), 1);
+        assert!(!t.calls.contains(&Call::UhwWrite(MTK_BT_SUBSYS_RST, 1)));
+    }
+
+    #[test]
+    fn silent_controller_is_reset_and_downloaded_again() {
+        let mut t = Fake::new(0x7961, Some(image(&[&[1]])));
+        t.hci_events = [None].into();
+        setup(&mut t).unwrap();
+        assert_eq!(downloads(&t), 2);
+        let reset = t
+            .calls
+            .iter()
+            .position(|c| *c == Call::UhwWrite(MTK_BT_SUBSYS_RST, 1))
+            .unwrap();
+        let first_hci = t.calls.iter().position(|c| matches!(c, Call::Hci(_))).unwrap();
+        assert!(first_hci < reset);
+    }
+
+    #[test]
+    fn controller_silent_after_retry_is_retried_once() {
+        let mut t = Fake::new(0x7961, Some(image(&[&[1]])));
+        // First probe times out; the second only ever sees vendor events.
+        t.hci_events = core::iter::once(None)
+            .chain(core::iter::repeat_n(Some(vec![0xff, 1, 0]), HCI_PROBE_EVENTS as usize))
+            .collect();
+        assert!(setup(&mut t).is_ok());
+        assert_eq!(downloads(&t), 2);
+        assert!(t.logs.last().unwrap().contains("still does not answer"));
     }
 
     #[test]

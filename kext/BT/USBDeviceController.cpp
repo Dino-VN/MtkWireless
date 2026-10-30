@@ -5,6 +5,7 @@
 
 #include "USBDeviceController.hpp"
 
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <kern/clock.h>
 
 #include "Log.h"
@@ -214,6 +215,71 @@ IOReturn USBDeviceController::readWMTEvent(void *buf, uint32_t bufSize, uint32_t
             return kIOReturnTimeout;
         IODelay(500);
     }
+}
+
+namespace {
+
+struct EventRead {
+    volatile UInt32 done;
+    IOReturn status;
+    uint32_t length;
+};
+
+void eventReadComplete(void *, void *parameter, IOReturn status, uint32_t bytesTransferred)
+{
+    auto *read = static_cast<EventRead *>(parameter);
+    read->status = status;
+    read->length = bytesTransferred;
+    OSCompareAndSwap(0, 1, &read->done);
+}
+
+} // namespace
+
+IOReturn USBDeviceController::readHCIEvent(void *buf, uint32_t bufSize, uint32_t *size, uint32_t timeout)
+{
+    if (!buf || bufSize == 0 || !m_pInterruptReadPipe)
+        return kIOReturnBadArgument;
+    // HCI event header + 255 parameter bytes; the transfer ends on a short packet.
+    const uint32_t capacity = 260;
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::withCapacity(capacity, kIODirectionIn);
+    if (!md)
+        return kIOReturnNoMemory;
+    IOReturn ret = md->prepare(kIODirectionIn);
+    if (ret != kIOReturnSuccess) {
+        md->release();
+        return ret;
+    }
+    // Interrupt pipes take no completion timeout: wait here, then abort
+    // synchronously so the completion has run before `read` goes away.
+    EventRead read {};
+    IOUSBHostCompletion completion = {
+        .owner = this,
+        .action = eventReadComplete,
+        .parameter = &read,
+    };
+    ret = m_pInterruptReadPipe->io(md, capacity, &completion, 0);
+    if (ret == kIOReturnSuccess) {
+        uint64_t deadline = 0, now = 0;
+        clock_interval_to_deadline(timeout, kMillisecondScale, &deadline);
+        while (!read.done) {
+            clock_get_uptime(&now);
+            if (now >= deadline)
+                break;
+            IOSleep(5);
+        }
+        if (!read.done)
+            m_pInterruptReadPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnTimeout);
+        ret = read.done ? read.status : kIOReturnTimeout;
+    }
+    if (ret == kIOReturnSuccess) {
+        uint32_t n = min(min(read.length, bufSize), capacity);
+        md->readBytes(0, buf, n);
+        if (size)
+            *size = n;
+    }
+    md->complete(kIODirectionIn);
+    md->release();
+    return ret;
 }
 
 const char *USBDeviceController::stringFromReturn(IOReturn code)

@@ -83,6 +83,22 @@ int32_t wmt(void *ctx, const uint8_t *cmd, uint32_t cmdLen, uint8_t *event, uint
     return ret;
 }
 
+int32_t hci(void *ctx, const uint8_t *cmd, uint32_t cmdLen, uint8_t *event, uint32_t eventCap,
+            uint32_t *eventLen)
+{
+    if (cmdLen) {
+        IOReturn ret = usb(ctx)->sendHCICommand(cmd, cmdLen, HCI_PROBE_TIMEOUT);
+        if (ret != kIOReturnSuccess) {
+            BTLog("HCI command failed: %s\n", usb(ctx)->stringFromReturn(ret));
+            return ret;
+        }
+    }
+    IOReturn ret = usb(ctx)->readHCIEvent(event, eventCap, eventLen, HCI_PROBE_TIMEOUT);
+    if (ret != kIOReturnSuccess)
+        BTLog("HCI event read failed: %s\n", usb(ctx)->stringFromReturn(ret));
+    return ret;
+}
+
 void sleepMs(void *, uint32_t ms)
 {
     IOSleep(ms);
@@ -171,6 +187,7 @@ bool MtkWirelessBTLoader::bringUp(char *firmware, size_t len)
         .uhw_read = uhwRead,
         .uhw_write = uhwWrite,
         .wmt = wmt,
+        .hci = hci,
         .sleep_ms = sleepMs,
         .fw_load = fwLoad,
         .fw_release = fwRelease,

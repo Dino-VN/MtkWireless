@@ -26,6 +26,10 @@ typedef struct mtk_bt_transport {
     /* Send an HCI command on EP0, then read the WMT event answering it. */
     int32_t (*wmt)(void *ctx, const uint8_t *cmd, uint32_t cmd_len,
                    uint8_t *event, uint32_t event_cap, uint32_t *event_len);
+    /* Send an HCI command on EP0 (skipped when cmd_len is 0), then read one
+     * HCI event from the interrupt IN endpoint. */
+    int32_t (*hci)(void *ctx, const uint8_t *cmd, uint32_t cmd_len,
+                   uint8_t *event, uint32_t event_cap, uint32_t *event_len);
     void (*sleep_ms)(void *ctx, uint32_t ms);
     /* Decompressed firmware by file name; returns a handle or NULL. */
     const void *(*fw_load)(void *ctx, const char *name, const uint8_t **data, size_t *len);
@@ -39,7 +43,9 @@ typedef struct mtk_bt_setup_info {
     char firmware[49];
 } mtk_bt_setup_info;
 
-/* Chip id, ROM patch download, endpoint reset, FUNC_CTRL on.
+/* Chip id, ROM patch download, endpoint reset, FUNC_CTRL on, then an
+ * HCI_Reset probe (subsystem reset + one more download if it goes unanswered;
+ * still unanswered is only logged).
  * 0 on success, negative on failure (reason logged). */
 int32_t mtk_bt_setup(const mtk_bt_transport *t, mtk_bt_setup_info *info);
 int32_t mtk_bt_enable(const mtk_bt_transport *t, bool enable);

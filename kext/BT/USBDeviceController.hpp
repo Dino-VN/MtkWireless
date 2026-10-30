@@ -16,6 +16,7 @@
 #include <IOKit/usb/USB.h>
 
 #define HCI_INIT_TIMEOUT 10000 /* ms */
+#define HCI_PROBE_TIMEOUT 3000 /* ms, post-setup HCI_Reset */
 
 class USBDeviceController : public OSObject {
     OSDeclareDefaultStructors(USBDeviceController)
@@ -34,6 +35,8 @@ public:
                             void *data, uint16_t length, uint32_t timeout);
     /* MediaTek returns WMT events through vendor request 1, wValue 48. */
     IOReturn readWMTEvent(void *buf, uint32_t bufSize, uint32_t *size, uint32_t timeout);
+    /* One HCI event from the interrupt IN endpoint. */
+    IOReturn readHCIEvent(void *buf, uint32_t bufSize, uint32_t *size, uint32_t timeout);
 
     const char *stringFromReturn(IOReturn code);
 

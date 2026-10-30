@@ -24,6 +24,16 @@ pub struct MtkBtTransport {
         event_cap: u32,
         event_len: *mut u32,
     ) -> i32,
+    /// Send an HCI command on EP0 (skipped when `cmd_len` is 0), then read one
+    /// HCI event from the interrupt IN endpoint.
+    pub hci: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        cmd: *const u8,
+        cmd_len: u32,
+        event: *mut u8,
+        event_cap: u32,
+        event_len: *mut u32,
+    ) -> i32,
     pub sleep_ms: unsafe extern "C" fn(ctx: *mut c_void, ms: u32),
     /// Returns a handle for `fw_release` and the decompressed image, or NULL.
     pub fw_load: unsafe extern "C" fn(
@@ -90,6 +100,21 @@ impl<'a> Transport for CTransport<'a> {
         let mut got = 0u32;
         status(unsafe {
             (self.0.wmt)(
+                self.0.ctx,
+                command.as_ptr(),
+                command.len() as u32,
+                event.as_mut_ptr(),
+                event.len() as u32,
+                &mut got,
+            )
+        })?;
+        Ok((got as usize).min(event.len()))
+    }
+
+    fn hci(&mut self, command: &[u8], event: &mut [u8]) -> Result<usize, IoError> {
+        let mut got = 0u32;
+        status(unsafe {
+            (self.0.hci)(
                 self.0.ctx,
                 command.as_ptr(),
                 command.len() as u32,
