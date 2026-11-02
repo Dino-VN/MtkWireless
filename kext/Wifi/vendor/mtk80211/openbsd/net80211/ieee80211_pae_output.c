@@ -150,13 +150,74 @@ ieee80211_send_eapol_key(struct ieee80211com *ic, mbuf_t m,
         timeout_add_msec(&ni->ni_eapol_to, 100);
 #endif
     
+    mtk_join_eapol(&ic->ic_join_diag, true, info, BE_READ_2(key->paylen),
+        ic->ic_state, ni->ni_rsn_supp_state);
     error = ifq_enqueue(&ifp->if_snd, m);
     if (error) {
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.EapolTxEnqueueErrors;
         XYLog("%s enqueue fail!!\n", __FUNCTION__);
         return (error);
     }
     (*ifp->if_start)(ifp);
     return 0;
+}
+
+/*
+ * MtkWireless: STA side. An iPhone hotspot sometimes associates us and never
+ * delivers no message 1 to this driver (2026-11-01: ~40 stalled joins,
+ * no unicast observed; this is not an over-the-air capture).
+ * IEEE 802.1X lets the supplicant ask the authenticator to (re)start with
+ * EAPOL-Start; hostapd restarts the 4-way handshake for a PSK station.
+ * Sent 300 ms after RUN without any EAPOL, then after 1 s and 2 s more.
+ */
+void
+ieee80211_eapol_start_timeout(void *arg)
+{
+    struct ieee80211com *ic = (struct ieee80211com *)arg;
+    struct _ifnet *ifp = &ic->ic_if;
+    struct ieee80211_node *ni = ic->ic_bss;
+    struct ether_header *eh;
+    u_int8_t *p;
+    mbuf_t m;
+    int s = splnet();
+
+    if (ic->ic_state != IEEE80211_S_RUN || ni == NULL || ni->ni_port_valid ||
+        !(ic->ic_flags & IEEE80211_F_RSNON) ||
+        ic->ic_join_diag.EapolRxAtUS || ic->ic_join_diag.EapolRawAtUS ||
+        ic->ic_eapol_start_tries >= 3) {
+        splx(s);
+        return;
+    }
+    m = ieee80211_get_eapol_key(MBUF_DONTWAIT, MT_DATA, 0);
+    if (m == NULL) {
+        splx(s);
+        return;
+    }
+    mbuf_setlen(m, 4);
+    mbuf_pkthdr_setlen(m, 4);
+    p = mtod(m, u_int8_t *);
+    p[0] = 2;               /* 802.1X-2004, as Apple and wpa_supplicant send */
+    p[1] = EAPOL_START;
+    p[2] = p[3] = 0;
+    mbuf_prepend(&m, sizeof(struct ether_header), MBUF_DONTWAIT);
+    if (m == NULL) {
+        splx(s);
+        return;
+    }
+    eh = mtod(m, struct ether_header *);
+    eh->ether_type = htons(ETHERTYPE_PAE);
+    IEEE80211_ADDR_COPY(eh->ether_shost, ic->ic_myaddr);
+    IEEE80211_ADDR_COPY(eh->ether_dhost, ni->ni_macaddr);
+    if (ifq_enqueue(&ifp->if_snd, m) == 0) {
+        ++ic->ic_join_diag.EapolStartTx;
+        ic->ic_join_diag.EapolStartAtUS = mtk_join_now();
+        (*ifp->if_start)(ifp);
+    }
+    ++ic->ic_eapol_start_tries;
+    if (ic->ic_eapol_start_tries < 3)
+        timeout_add_msec(&ic->ic_eapol_start_to,
+            ic->ic_eapol_start_tries == 1 ? 1000 : 2000);
+    splx(s);
 }
 
 #ifndef IEEE80211_STA_ONLY

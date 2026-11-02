@@ -117,6 +117,7 @@ private:
     void releaseDataPath();
     void drainCompletions();
     void inputNative(const uint8_t*,size_t);
+    void inputNativeView(const mtkawdl::DataView&);
     static unsigned submitNative(OSObject*,IOSkywalkTxSubmissionQueue*,IOSkywalkPacket *const*,unsigned,void*);
     static IOReturn dataPathGated(OSObject*,void*,void*,void*,void*);
     void setDataPathEnabled(bool);

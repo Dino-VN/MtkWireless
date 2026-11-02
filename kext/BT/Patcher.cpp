@@ -13,6 +13,7 @@
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLocks.h>
 #include <sys/syslimits.h>
+#include <sys/sysctl.h>
 #include <sys/vnode.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
@@ -41,12 +42,19 @@ bool isMsbcReady()
 uint32_t rustFailed;
 bool randomAddressHack;
 bool leShimEnabled;
+bool leReadyMaskEnabled;
 IOLock *leLock;
 volatile SInt32 readClockRewritten, aclPbRewritten;
 volatile SInt32 leCommands, leCompletions, leErrors;
 bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
+bool rpaPatchEnabled, rpaHelpersReady;
+// kern.osversion is written by launchd after the kext starts: 0 unknown, 1 25G332, -1 other.
+volatile SInt32 rpaBuildState;
 volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 volatile SInt32 bluetoothdWbsPatched, bluetoothdHfpFillPatched;
+volatile SInt32 bluetoothdRpaHelpersPatched, bluetoothdRpaLegacyPatched, bluetoothdRpaScanPatched;
+volatile SInt32 bluetoothdRpaDecodePatched, bluetoothdRpaDevicePatched;
+volatile SInt32 bluetoothdRpaConnectPatched, bluetoothdRpaUpdatePatched;
 uint32_t patchRangeCount; // bluetoothd patch ranges, stored with release after each entry is filled
 volatile SInt32 patchRangeOverflow, verifyRestored, verifyRestoreFailed;
 bool verifyFixEnabled, verifyFixRouted;
@@ -54,7 +62,7 @@ bool verifyFixEnabled, verifyFixRouted;
 void publishCounters()
 {
     IOService *res = IOService::getResourceService();
-    OSDictionary *d = OSDictionary::withCapacity(8);
+    OSDictionary *d = OSDictionary::withCapacity(160);
     if (!res || !d) {
         OSSafeReleaseNULL(d);
         return;
@@ -76,11 +84,79 @@ void publishCounters()
     number("LeFeaturesCommands", (uint32_t)leCommands);
     number("LeFeaturesCompletions", (uint32_t)leCompletions);
     number("LeFeaturesErrors", (uint32_t)leErrors);
+    d->setObject("LeReadyDiagnosticsRouted", leShimEnabled ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("LeReadyMaskEnabled", leReadyMaskEnabled && leShimEnabled ? kOSBooleanTrue : kOSBooleanFalse);
+    mtk_bt_le_ready_diagnostics ready {};
+    if (leLock) {
+        IOLockLock(leLock);
+        mtk_bt_le_ready_snapshot(&ready);
+        IOLockUnlock(leLock);
+    }
+    auto number64 = [d](const char *key, uint64_t value) {
+        if (OSNumber *n = OSNumber::withNumber(value, 64)) {
+            d->setObject(key, n);
+            n->release();
+        }
+    };
+    number64("LeReadyControllerID", ready.controller_id);
+    number64("LeEventMaskRequested", ready.mask_before);
+    number64("LeEventMaskSent", ready.mask_after);
+    number("LeEventMaskRewritten", ready.mask_rewrites);
+    number("LeEventMaskWriteErrors", ready.mask_write_errors);
+    number("LeEventMaskDleEnabled", (ready.mask_after & 0x40) != 0);
+    number("LeEventMaskPhyEnabled", (ready.mask_after & 0x800) != 0);
+    number("LeReadyMalformedEvents", ready.malformed);
+    number("LeReadySerial", ready.serial);
+    const char *commandNames[] {"LeSetEventMask", "LeSetDataLength", "LeSetPhy", "LeReadPhy"};
+    const char *eventNames[] {"LeDataLengthChange", "LePhyUpdateComplete", "LeChannelSelection", "LeRemoteFeatures"};
+    char key[80];
+    for (size_t i = 0; i < 4; ++i) {
+        const auto &c = ready.commands[i];
+        auto commandNumber = [&](const char *suffix, uint32_t value) {
+            snprintf(key, sizeof(key), "%s%s", commandNames[i], suffix);
+            number(key, value);
+        };
+        commandNumber("Commands", c.count);
+        commandNumber("UsbErrors", c.usb_errors);
+        commandNumber("LastUsbStatus", c.last_usb_status);
+        commandNumber("StatusEvents", c.status_events);
+        commandNumber("CompleteEvents", c.complete_events);
+        commandNumber("LastStatus", c.last_status);
+        commandNumber("LastResponseKind", c.last_kind);
+        commandNumber("LastHandle", c.last_handle);
+        commandNumber("LastArg0", c.arg0);
+        commandNumber("LastArg1", c.arg1);
+        commandNumber("Serial", c.serial);
+        commandNumber("ResponseSerial", c.response_serial);
+        const auto &e = ready.meta[i];
+        auto eventNumber = [&](const char *suffix, uint32_t value) {
+            snprintf(key, sizeof(key), "%s%s", eventNames[i], suffix);
+            number(key, value);
+        };
+        eventNumber("Events", e.count);
+        eventNumber("LastHandle", e.last_handle);
+        eventNumber("LastStatus", e.last_status);
+        eventNumber("LastValue0", e.value0);
+        eventNumber("LastValue1", e.value1);
+        eventNumber("LastValue2", e.value2);
+        eventNumber("LastValue3", e.value3);
+        eventNumber("Serial", e.serial);
+    }
     d->setObject("BluetoothdExtAdvRouted", extAdvPatchEnabled && extAdvPatchRouted ? kOSBooleanTrue : kOSBooleanFalse);
     number("BluetoothdPages", (uint32_t)bluetoothdPages);
     number("BluetoothdExtAdvPatched", (uint32_t)bluetoothdPatched);
     number("BluetoothdAdvAddressPatched", (uint32_t)bluetoothdAddressPatched);
     number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
+    d->setObject("BluetoothdRpaEnabled", rpaPatchEnabled && verifyFixRouted && rpaBuildState > 0 ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdRpaHelpersReady",
+        __atomic_load_n(&rpaHelpersReady, __ATOMIC_ACQUIRE) ? kOSBooleanTrue : kOSBooleanFalse);
+    number("BluetoothdRpaHelpersPatched", (uint32_t)bluetoothdRpaHelpersPatched);
+    number("BluetoothdRpaLegacyPatched", (uint32_t)bluetoothdRpaLegacyPatched);
+    number("BluetoothdRpaScanPatched", (uint32_t)bluetoothdRpaScanPatched);
+    number("BluetoothdRpaDecodePatched", (uint32_t)bluetoothdRpaDecodePatched);
+    number("BluetoothdRpaDevicePatched", (uint32_t)bluetoothdRpaDevicePatched);
+    number("BluetoothdRpaConnectPatched", (uint32_t)bluetoothdRpaConnectPatched);
+    number("BluetoothdRpaUpdatePatched", (uint32_t)bluetoothdRpaUpdatePatched);
     number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);
     number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);
     number("MsbcScopeFix", 1);
@@ -165,6 +241,58 @@ void fixAclFlush(IOUSBHostPipe *pipe, IOMemoryDescriptor *buffer, uint32_t lengt
 
 #pragma mark - LE feature-mask compatibility
 
+/* Loaded MediaTek only. Rust validates HCI framing; C++ moves the eight
+ * mask bytes. An explicit zero mask remains zero. No added USB transaction. */
+uint32_t leReadyCommand(IOUSBHostDevice *device, StandardUSB::DeviceRequest &request, void *data,
+                        IOMemoryDescriptor *descriptor)
+{
+    // Pure request filter first: it rejects almost every EP0 request without
+    // the two registry property lookups.
+    if (!leShimEnabled ||
+        !mtk_bt_le_ready_candidate_request(request.bmRequestType, request.bRequest, request.wValue,
+                                           request.wIndex, request.wLength) ||
+        !isLoadedMediaTek(device))
+        return 0;
+    uint8_t command[16];
+    if (request.wLength > sizeof(command) || !readRequestBytes(data, descriptor, command, request.wLength))
+        return 0;
+    IOLockLock(leLock);
+    uint32_t observed = mtk_bt_le_ready_command(device->getRegistryEntryID(), command, request.wLength,
+                                               leReadyMaskEnabled);
+    IOLockUnlock(leLock);
+    if (observed & 0x100) {
+        bool ok = false;
+        if (data) {
+            memcpy(static_cast<uint8_t *>(data) + 3, command + 3, 8);
+            ok = true;
+        } else if (descriptor && descriptor->prepare(kIODirectionInOut) == kIOReturnSuccess) {
+            uint8_t original[8];
+            if (descriptor->readBytes(3, original, sizeof(original)) == sizeof(original)) {
+                ok = descriptor->writeBytes(3, command + 3, 8) == 8;
+                if (!ok)
+                    descriptor->writeBytes(3, original, sizeof(original));
+            }
+            descriptor->complete(kIODirectionInOut);
+        }
+        IOLockLock(leLock);
+        mtk_bt_le_ready_mask_written(ok);
+        IOLockUnlock(leLock);
+    }
+    if (observed)
+        publishCounters();
+    return observed & 0xff;
+}
+
+void leReadyUsbStatus(uint32_t command, IOReturn status)
+{
+    if (!command)
+        return;
+    IOLockLock(leLock);
+    mtk_bt_le_ready_usb_status(command, static_cast<uint32_t>(status));
+    IOLockUnlock(leLock);
+    publishCounters();
+}
+
 uint64_t leControllerForPipe(IOUSBHostPipe *pipe)
 {
     if (!leShimEnabled)
@@ -210,8 +338,11 @@ void leReceive(uint64_t id, IOMemoryDescriptor *buffer, uint32_t length)
         buffer->prepare(kIODirectionInOut) != kIOReturnSuccess)
         return;
     mtk_bt_le_received r { MTK_BT_LE_NONE, 0, {} };
+    bool observed = false;
     if (buffer->readBytes(0, events, length) == length) {
         IOLockLock(leLock);
+        // Observe original hardware events, before the separate 0xFD3C shim.
+        observed = mtk_bt_le_ready_events(id, events, length);
         r = mtk_bt_le_receive(id, events, length);
         IOLockUnlock(leLock);
     }
@@ -227,8 +358,9 @@ void leReceive(uint64_t id, IOMemoryDescriptor *buffer, uint32_t length)
     if (rewritten) {
         OSIncrementAtomic(&leCompletions);
         SYSLOG(DRV_NAME, "MediaTek 0xFD3C feature-mask status -> Command Complete, credits preserved");
-        publishCounters();
     }
+    if (rewritten || observed)
+        publishCounters();
 }
 
 /* Wraps a USB completion. Two references: the callback and the submitter,
@@ -239,17 +371,19 @@ struct LeCompletion {
     uint32_t capacity;
     uint64_t registryId;
     uint64_t token;
+    uint32_t readyCommand;
     volatile SInt32 references;
     volatile UInt32 claimed;
 };
 
 LeCompletion *makeLeCompletion(IOUSBHostCompletion *completion, uint64_t id, uint64_t token,
-                               IOMemoryDescriptor *buffer = nullptr, uint32_t capacity = 0)
+                               IOMemoryDescriptor *buffer = nullptr, uint32_t capacity = 0,
+                               uint32_t readyCommand = 0)
 {
     auto *c = static_cast<LeCompletion *>(IOMalloc(sizeof(LeCompletion)));
     if (!c)
         return nullptr;
-    *c = { *completion, buffer, capacity, id, token, 2, 0 };
+    *c = { *completion, buffer, capacity, id, token, readyCommand, 2, 0 };
     if (buffer)
         buffer->retain();
     return c;
@@ -272,9 +406,12 @@ void leUsbCompletion(void *, void *parameter, IOReturn status, uint32_t transfer
     if (c->buffer) {
         if (status == kIOReturnSuccess && transferred <= c->capacity)
             leReceive(c->registryId, c->buffer, transferred);
-    } else if (status != kIOReturnSuccess) {
-        leCancel(c->registryId, c->token);
-        OSIncrementAtomic(&leErrors);
+    } else {
+        leReadyUsbStatus(c->readyCommand, status);
+        if (c->token && status != kIOReturnSuccess) {
+            leCancel(c->registryId, c->token);
+            OSIncrementAtomic(&leErrors);
+        }
     }
     const IOUSBHostCompletion original = c->original;
     original.action(original.owner, original.parameter, status, transferred);
@@ -285,6 +422,7 @@ void finishLeSubmission(LeCompletion *c, IOReturn status)
 {
     // USB promises a callback only for a successful enqueue.
     if (status != kIOReturnSuccess && OSCompareAndSwap(0, 1, &c->claimed)) {
+        leReadyUsbStatus(c->readyCommand, status);
         if (c->token)
             leCancel(c->registryId, c->token);
         OSIncrementAtomic(&leErrors);
@@ -323,15 +461,17 @@ IOReturn deviceRequest(void *that, IOService *provider, StandardUSB::DeviceReque
         randomAddress(that, provider, request, data, descriptor, timeout);
 
     auto *device = static_cast<IOUSBHostDevice *>(that);
+    const uint32_t readyCommand = leReadyCommand(device, request, data, descriptor);
     const uint64_t token = (!completion || completion->action) ? leArm(device, request, data, descriptor) : 0;
     LeCompletion *context = nullptr;
     IOUSBHostCompletion replacement {};
-    if (token && completion) {
-        context = makeLeCompletion(completion, device->getRegistryEntryID(), token);
+    if ((token || readyCommand) && completion && completion->action) {
+        context = makeLeCompletion(completion, device->getRegistryEntryID(), token, nullptr, 0, readyCommand);
         if (context) {
             replacement = { nullptr, leUsbCompletion, context };
         } else {
-            leCancel(device->getRegistryEntryID(), token);
+            if (token)
+                leCancel(device->getRegistryEntryID(), token);
             OSIncrementAtomic(&leErrors);
         }
     }
@@ -339,9 +479,12 @@ IOReturn deviceRequest(void *that, IOService *provider, StandardUSB::DeviceReque
                                                                     context ? &replacement : completion, timeout);
     if (context) {
         finishLeSubmission(context, status);
-    } else if (token && status != kIOReturnSuccess) {
-        leCancel(device->getRegistryEntryID(), token);
-        OSIncrementAtomic(&leErrors);
+    } else {
+        leReadyUsbStatus(readyCommand, status);
+        if (token && status != kIOReturnSuccess) {
+            leCancel(device->getRegistryEntryID(), token);
+            OSIncrementAtomic(&leErrors);
+        }
     }
     return status;
 }
@@ -645,6 +788,14 @@ const uint8_t advAddressReplace[] {
     0xe8, 0xd4, 0x30, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 static_assert(sizeof(advAddressFind) == sizeof(advAddressReplace), "address patch size");
+/* Same sequence in 26.7.2 25G332 at 0x100511239 (call displacements moved). */
+const uint8_t advAddressFind25G332[] {
+    0xe8, 0x34, 0x32, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
+    0x31, 0xff, 0xe8, 0x1e, 0x6c, 0xce, 0xff};
+const uint8_t advAddressReplace25G332[] {
+    0xe8, 0x34, 0x32, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+static_assert(sizeof(advAddressFind25G332) == sizeof(advAddressReplace25G332), "address patch size");
 
 /* 0.1.8 HCI capture: macOS sends 0x2035 for handles 0/2 before
  * 0x2036 creates them. MediaTek returns Unknown Advertising Identifier (42),
@@ -670,6 +821,187 @@ const uint8_t advAddressRetryReplace[] {
     0x08, 0x44, 0x09, 0xc2, 0x74, 0x7a, 0x90, 0x90, 0x90, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
     0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
 static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace), "address retry patch size");
+/* 25G332 at 0x1001fa68d: only the gate's RIP-relative offset differs, and
+ * the replacement guard overwrites it, so advAddressRetryReplace applies. */
+const uint8_t advAddressRetryFind25G332[] {
+    0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
+    0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0x44, 0x09, 0xc2, 0x0f, 0x84, 0x80, 0x00, 0x00, 0x00,
+    0x80, 0x3d, 0x4c, 0x26, 0x92, 0x00, 0x00, 0x74, 0x77, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
+    0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
+static_assert(sizeof(advAddressRetryFind25G332) == sizeof(advAddressRetryReplace), "address retry patch size");
+
+/* Instant Hotspot / outgoing BLE, x86_64 26.7.2 (25G332).
+ * The host AH resolver replaces a peer RPA with its identity in scan reports,
+ * but chip 0 has no initialized BCM/ACI/SRS privacy backend. Its accept list
+ * therefore contains a public identity that cannot match the on-air RPA.
+ * Keep the verified legacy ADV_IND RPA separately, update LeDevice's last
+ * advertised address under its existing mutex, and use that address only at
+ * the two initiating/accept-list call sites. UUID, identity, IRK and security
+ * logic remain native; all HCI commands wait for real controller completions.
+ *
+ * Five leaf helpers occupy 261 bytes of the zero padding at the end of the
+ * executable __TEXT segment, after __eh_frame (anchor: its last 16 bytes plus
+ * the padding). They must stay off the header/load-command pages: exec checks
+ * those against the code signature, so helpers at 0x1000026c8 (right after
+ * the load commands) made every re-exec of bluetoothd fail (OS_REASON_EXEC,
+ * 2026-10-31). Helpers (unslid VA): legacy 0x100aa2c00, retain 0x100aa2c0d,
+ * device 0x100aa2c57, address 0x100aa2cca, paired 0x100aa2ce8.
+ * Assembly source: tests/bt-page-patches/rpa-25G332.S.
+ *
+ * The internal direct-address type 0x81 exists only on resolved undirected
+ * legacy reports, whose original field is zero. It is cleared before cache
+ * merge/listeners. Clear exactly seven descriptor bytes between reports;
+ * the following flag is live. Extended/directed reports keep their meaning.
+ * The device helper checks the exact native caller before reading its frame;
+ * it keeps the bool ABI and does not change the public paired-test function.
+ *
+ * Disabled by -mtkbtnorpa or -mtkbtnoextadv, and requires the verify-block
+ * route. Other builds keep their advertising patches; no RPA patch for 25G241.
+ * The helper page is not touched at launch, so child sites cannot wait for
+ * it: a page validated before it would stay native forever (1.0.10 patched
+ * only 2 of 7 sites). Children are patched whenever their page is validated
+ * on 25G332 (kern.osversion); their first call faults the helper page in,
+ * and validation installs the helpers before that call executes.
+ */
+const uint8_t rpaHelpersFind25G332[] {
+    0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+const uint8_t rpaHelpersReplace25G332[] {
+    0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0xc0, 0x89, 0x47, 0x33, 0x89, 0x47, 0x36,
+    0xe9, 0x17, 0x08, 0x78, 0xff, 0x48, 0x8d, 0x15, 0xdd, 0x97, 0x76, 0xff, 0x48, 0x39, 0x55, 0x08,
+    0x75, 0x2d, 0x80, 0x3b, 0x00, 0x75, 0x28, 0x48, 0x8b, 0x15, 0x8a, 0x7f, 0x09, 0x00, 0x48, 0x85,
+    0xd2, 0x74, 0x1c, 0x83, 0xba, 0x34, 0x03, 0x00, 0x00, 0x00, 0x75, 0x13, 0x41, 0x8b, 0x04, 0x24,
+    0x41, 0x8b, 0x4c, 0x24, 0x03, 0x89, 0x43, 0x33, 0x89, 0x4b, 0x36, 0xc6, 0x43, 0x33, 0x81, 0x8b,
+    0x45, 0xb8, 0x8b, 0x4d, 0xbb, 0x41, 0x89, 0x4c, 0x24, 0x03, 0x41, 0x89, 0x04, 0x24, 0xc3, 0x48,
+    0x8d, 0x0d, 0x1e, 0x8c, 0xc9, 0xff, 0x48, 0x39, 0x4d, 0x08, 0x75, 0x5c, 0x48, 0x8b, 0x4d, 0x00,
+    0x48, 0x8b, 0x89, 0x80, 0xfb, 0xff, 0xff, 0x48, 0x8b, 0x49, 0x08, 0x80, 0xb9, 0xd6, 0x00, 0x00,
+    0x00, 0x81, 0x75, 0x44, 0x48, 0x8b, 0x91, 0xd0, 0x00, 0x00, 0x00, 0x48, 0xc7, 0x81, 0xd0, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x36, 0x48, 0x8b, 0x0d, 0x16, 0x7f,
+    0x09, 0x00, 0x48, 0x85, 0xc9, 0x74, 0x21, 0x83, 0xb9, 0x34, 0x03, 0x00, 0x00, 0x00, 0x75, 0x18,
+    0x48, 0x83, 0x78, 0x18, 0x00, 0x75, 0x08, 0x48, 0x8b, 0x48, 0x10, 0x48, 0x89, 0x48, 0x18, 0x48,
+    0x0f, 0xba, 0xf2, 0x37, 0x48, 0x89, 0x50, 0x10, 0x48, 0x85, 0xc0, 0x74, 0x04, 0x44, 0x88, 0x70,
+    0x61, 0xc3, 0x31, 0xd2, 0x48, 0x8b, 0x05, 0xdd, 0x7e, 0x09, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x0b,
+    0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x00, 0x75, 0x02, 0xff, 0xc2, 0xe9, 0x08, 0x3c, 0xc6, 0xff,
+    0x48, 0x8b, 0x05, 0xc1, 0x7e, 0x09, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x0c, 0x83, 0xb8, 0x34, 0x03,
+    0x00, 0x00, 0x00, 0x75, 0x03, 0x31, 0xc0, 0xc3, 0xe9, 0x51, 0x14, 0xc7, 0xff, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static_assert(sizeof(rpaHelpersFind25G332) == sizeof(rpaHelpersReplace25G332), "RPA patch size");
+
+const uint8_t rpaLegacyFind25G332[] {
+    0xc6, 0x45, 0xac, 0x00, 0xc7, 0x45, 0xaf, 0x00, 0x01, 0x00, 0x00, 0x48, 0x8d, 0x7d, 0x80, 0xe8,
+    0x33, 0x70, 0x01, 0x00, 0x48, 0x8b, 0x7d, 0x90, 0xe8, 0xcb, 0x6e, 0xee, 0xff};
+const uint8_t rpaLegacyReplace25G332[] {
+    0xc6, 0x45, 0xac, 0x00, 0xc7, 0x45, 0xaf, 0x00, 0x01, 0x00, 0x00, 0x48, 0x8d, 0x7d, 0x80, 0xe8,
+    0x0f, 0x68, 0x89, 0x00, 0x48, 0x8b, 0x7d, 0x90, 0xe8, 0xcb, 0x6e, 0xee, 0xff};
+static_assert(sizeof(rpaLegacyFind25G332) == sizeof(rpaLegacyReplace25G332), "RPA patch size");
+
+const uint8_t rpaScanFind25G332[] {
+    0xe8, 0xa3, 0x41, 0x00, 0x00, 0x85, 0xc0, 0x75, 0x15, 0x80, 0x7d, 0xd7, 0x00, 0x74, 0x0f, 0x8b,
+    0x45, 0xb8, 0x8b, 0x4d, 0xbb, 0x41, 0x89, 0x4c, 0x24, 0x03, 0x41, 0x89, 0x04, 0x24};
+const uint8_t rpaScanReplace25G332[] {
+    0xe8, 0xa3, 0x41, 0x00, 0x00, 0x85, 0xc0, 0x75, 0x15, 0x80, 0x7d, 0xd7, 0x00, 0x74, 0x0f, 0xe8,
+    0x36, 0xf7, 0x87, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+static_assert(sizeof(rpaScanFind25G332) == sizeof(rpaScanReplace25G332), "RPA patch size");
+
+const uint8_t rpaDecodeFind25G332[] {
+    0x49, 0x8b, 0xb6, 0x68, 0x17, 0x00, 0x00, 0x0f, 0xb6, 0x06, 0x48, 0x83, 0xf8, 0x01, 0x77, 0x48,
+    0x0f, 0xb6, 0x7e, 0x01, 0x48, 0xc1, 0xe7, 0x28, 0x44, 0x0f, 0xb6, 0x46, 0x02, 0x49, 0xc1, 0xe0,
+    0x20, 0x44, 0x0f, 0xb6, 0x4e, 0x03, 0x41, 0xc1, 0xe1, 0x18, 0x44, 0x0f, 0xb6, 0x56, 0x04, 0x41,
+    0xc1, 0xe2, 0x10, 0x44, 0x0f, 0xb6, 0x5e, 0x05, 0x41, 0xc1, 0xe3, 0x08, 0x0f, 0xb6, 0x76, 0x06,
+    0x48, 0xc1, 0xe0, 0x30, 0x48, 0x09, 0xf8, 0x4c, 0x09, 0xc0, 0x4c, 0x09, 0xc8, 0x4c, 0x09, 0xd0,
+    0x4c, 0x09, 0xd8, 0x48, 0x09, 0xf0, 0xeb, 0x02, 0x31, 0xc0, 0x48, 0x8b, 0x75, 0x88, 0x48, 0x89,
+    0x86, 0xd0, 0x00, 0x00, 0x00, 0x08, 0xca, 0x0f, 0x84, 0x88, 0x00, 0x00, 0x00, 0x48, 0x83, 0x3d,
+    0xaf, 0x04, 0x3f, 0x00, 0xff};
+const uint8_t rpaDecodeReplace25G332[] {
+    0x49, 0x8b, 0xb6, 0x68, 0x17, 0x00, 0x00, 0x0f, 0xb6, 0x06, 0x3c, 0x01, 0x76, 0x1d, 0x3c, 0x81,
+    0x75, 0x25, 0x41, 0x80, 0xbe, 0x56, 0x17, 0x00, 0x00, 0x00, 0x75, 0x1b, 0x41, 0x80, 0x3e, 0x00,
+    0x75, 0x15, 0x8a, 0x46, 0x01, 0x24, 0xc0, 0x3c, 0x40, 0x75, 0x0c, 0x48, 0x8b, 0x06, 0x48, 0x0f,
+    0xc8, 0x48, 0xc1, 0xe8, 0x08, 0xeb, 0x23, 0x31, 0xc0, 0xeb, 0x1f, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8b, 0x75, 0x88, 0x48, 0x89,
+    0x86, 0xd0, 0x00, 0x00, 0x00, 0x08, 0xca, 0x0f, 0x84, 0x88, 0x00, 0x00, 0x00, 0x48, 0x83, 0x3d,
+    0xaf, 0x04, 0x3f, 0x00, 0xff};
+static_assert(sizeof(rpaDecodeFind25G332) == sizeof(rpaDecodeReplace25G332), "RPA patch size");
+
+const uint8_t rpaDeviceFind25G332[] {
+    0xe8, 0xe7, 0x90, 0xfe, 0xff, 0x48, 0x85, 0xc0, 0x74, 0x04, 0x44, 0x88, 0x70, 0x61, 0x48, 0x8d,
+    0x7d, 0xd0, 0xe8, 0xf7, 0x55, 0xba, 0xff, 0x48, 0x89, 0xdf, 0xff, 0x15, 0x7e, 0xd1, 0x38, 0x00};
+const uint8_t rpaDeviceReplace25G332[] {
+    0xe8, 0xe7, 0x90, 0xfe, 0xff, 0xe8, 0x4b, 0xbc, 0x38, 0x00, 0x90, 0x90, 0x90, 0x90, 0x48, 0x8d,
+    0x7d, 0xd0, 0xe8, 0xf7, 0x55, 0xba, 0xff, 0x48, 0x89, 0xdf, 0xff, 0x15, 0x7e, 0xd1, 0x38, 0x00};
+static_assert(sizeof(rpaDeviceFind25G332) == sizeof(rpaDeviceReplace25G332), "RPA patch size");
+
+const uint8_t rpaConnectFind25G332[] {
+    0x4c, 0x89, 0xff, 0x48, 0x89, 0xde, 0xe8, 0x88, 0x00, 0x00, 0x00, 0x84, 0xc0, 0x74, 0x15, 0x4c,
+    0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xb9, 0x02, 0x00, 0x00, 0x00, 0xe8, 0x0b, 0x01,
+    0x00, 0x00, 0xeb, 0x25, 0x4c, 0x89, 0xff, 0x48, 0x89, 0xde, 0x31, 0xd2, 0xe8, 0xfc, 0x27, 0xff,
+    0xff};
+const uint8_t rpaConnectReplace25G332[] {
+    0x4c, 0x89, 0xff, 0x48, 0x89, 0xde, 0xe8, 0x1a, 0xec, 0x38, 0x00, 0x84, 0xc0, 0x74, 0x15, 0x4c,
+    0x89, 0xf7, 0x4c, 0x89, 0xfe, 0x48, 0x89, 0xda, 0xb9, 0x02, 0x00, 0x00, 0x00, 0xe8, 0x0b, 0x01,
+    0x00, 0x00, 0xeb, 0x25, 0x4c, 0x89, 0xff, 0x48, 0x89, 0xde, 0x31, 0xd2, 0xe8, 0xd6, 0xeb, 0x38,
+    0x00};
+static_assert(sizeof(rpaConnectFind25G332) == sizeof(rpaConnectReplace25G332), "RPA patch size");
+
+const uint8_t rpaUpdateFind25G332[] {
+    0x48, 0x8b, 0x3d, 0x2f, 0xbd, 0x44, 0x00, 0x48, 0x8b, 0xb5, 0x78, 0xfd, 0xff, 0xff, 0xe8, 0x69,
+    0x2f, 0x04, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0x86, 0x00, 0x00, 0x00, 0x48, 0x83, 0x3d, 0xa3, 0xc7,
+    0x44, 0x00, 0xff, 0x0f, 0x85, 0x42, 0x07, 0x00, 0x00, 0x48, 0x8b, 0x35, 0x06, 0xbd, 0x44, 0x00,
+    0x4c, 0x89, 0xef, 0x48, 0x8b, 0x95, 0x78, 0xfd, 0xff, 0xff, 0xb9, 0x02, 0x00, 0x00, 0x00, 0xe8,
+    0xd2, 0x2f, 0x04, 0x00, 0x48, 0x8b, 0xb5, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x8d, 0xbd, 0x58, 0xfd,
+    0xff, 0xff, 0xe8, 0x6b, 0x28, 0xba, 0xff, 0x48, 0x8b, 0x45, 0xa0, 0x48, 0x8b, 0x75, 0xa8, 0x48,
+    0x89, 0x85, 0x58, 0xfd, 0xff, 0xff, 0x48, 0x89, 0xb5, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x8b, 0x45,
+    0xb0, 0x48, 0x89, 0x85, 0x68, 0xfd, 0xff, 0xff, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0xe1, 0x00, 0x00,
+    0x00, 0x48, 0x8d, 0x85, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x89, 0x46, 0x10, 0x48, 0x8d, 0x45, 0xa8,
+    0x48, 0x89, 0x45, 0xa0, 0x0f, 0x57, 0xc0, 0x0f, 0x11, 0x00, 0x31, 0xf6, 0xe9, 0xcf, 0x00, 0x00,
+    0x00, 0x48, 0x83, 0x3d, 0x1d, 0xc7, 0x44, 0x00, 0xff, 0x0f, 0x85, 0xc6, 0x06, 0x00, 0x00, 0x48,
+    0x8b, 0x3d, 0x80, 0xbc, 0x44, 0x00, 0x48, 0x8b, 0xb5, 0x78, 0xfd, 0xff, 0xff, 0x31, 0xd2, 0xe8,
+    0x52, 0x56, 0x03, 0x00};
+const uint8_t rpaUpdateReplace25G332[] {
+    0x48, 0x8b, 0x3d, 0x2f, 0xbd, 0x44, 0x00, 0x48, 0x8b, 0xb5, 0x78, 0xfd, 0xff, 0xff, 0xe8, 0xfb,
+    0x1a, 0x3d, 0x00, 0x84, 0xc0, 0x0f, 0x84, 0x86, 0x00, 0x00, 0x00, 0x48, 0x83, 0x3d, 0xa3, 0xc7,
+    0x44, 0x00, 0xff, 0x0f, 0x85, 0x42, 0x07, 0x00, 0x00, 0x48, 0x8b, 0x35, 0x06, 0xbd, 0x44, 0x00,
+    0x4c, 0x89, 0xef, 0x48, 0x8b, 0x95, 0x78, 0xfd, 0xff, 0xff, 0xb9, 0x02, 0x00, 0x00, 0x00, 0xe8,
+    0xd2, 0x2f, 0x04, 0x00, 0x48, 0x8b, 0xb5, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x8d, 0xbd, 0x58, 0xfd,
+    0xff, 0xff, 0xe8, 0x6b, 0x28, 0xba, 0xff, 0x48, 0x8b, 0x45, 0xa0, 0x48, 0x8b, 0x75, 0xa8, 0x48,
+    0x89, 0x85, 0x58, 0xfd, 0xff, 0xff, 0x48, 0x89, 0xb5, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x8b, 0x45,
+    0xb0, 0x48, 0x89, 0x85, 0x68, 0xfd, 0xff, 0xff, 0x48, 0x85, 0xc0, 0x0f, 0x84, 0xe1, 0x00, 0x00,
+    0x00, 0x48, 0x8d, 0x85, 0x60, 0xfd, 0xff, 0xff, 0x48, 0x89, 0x46, 0x10, 0x48, 0x8d, 0x45, 0xa8,
+    0x48, 0x89, 0x45, 0xa0, 0x0f, 0x57, 0xc0, 0x0f, 0x11, 0x00, 0x31, 0xf6, 0xe9, 0xcf, 0x00, 0x00,
+    0x00, 0x48, 0x83, 0x3d, 0x1d, 0xc7, 0x44, 0x00, 0xff, 0x0f, 0x85, 0xc6, 0x06, 0x00, 0x00, 0x48,
+    0x8b, 0x3d, 0x80, 0xbc, 0x44, 0x00, 0x48, 0x8b, 0xb5, 0x78, 0xfd, 0xff, 0xff, 0x31, 0xd2, 0xe8,
+    0x2c, 0x1a, 0x3d, 0x00};
+static_assert(sizeof(rpaUpdateFind25G332) == sizeof(rpaUpdateReplace25G332), "RPA patch size");
 
 /* HFP wideband gate: bluetoothd enables mSBC only for known chip IDs; a
  * THIRD_PARTY_DONGLE (chip 0) is outside the range. Accept chip 0, only while
@@ -699,6 +1031,14 @@ const uint8_t hfpFillReplace[] {
     0x0f, 0x1f, 0x40, 0x00, 0x4c, 0x89, 0xf6, 0xe8, 0x3b, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
     0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
 static_assert(sizeof(hfpFillFind) == sizeof(hfpFillReplace), "HFP fill patch size");
+/* 25G332, 0x100337505: the native PCM-read call displacement differs by eight bytes. */
+const uint8_t hfpFillFind25G332[] {
+    0x48, 0x0f, 0xaf, 0xd0, 0x4c, 0x89, 0xf6, 0xe8, 0x33, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
+    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
+const uint8_t hfpFillReplace25G332[] {
+    0x0f, 0x1f, 0x40, 0x00, 0x4c, 0x89, 0xf6, 0xe8, 0x33, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
+    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
+static_assert(sizeof(hfpFillFind25G332) == sizeof(hfpFillReplace25G332), "HFP fill patch size");
 
 mach_vm_address_t orgCsValidatePage, orgVnopVerify;
 
@@ -771,12 +1111,26 @@ void recordPageDiff(uint64_t pageOffset, const uint8_t *before, const uint8_t *a
     }
 }
 
-bool isBluetoothd(vnode_t vp)
+static __attribute__((noinline)) bool isBluetoothdPath(vnode_t vp)
 {
     static constexpr char bluetoothd[] = "/usr/sbin/bluetoothd";
     char path[PATH_MAX];
     int pathLength = PATH_MAX;
     return vn_getpath(vp, path, &pathLength) == 0 && UNLIKELY(strcmp(path, bluetoothd) == 0);
+}
+
+// Runs for every code page validated system-wide. The cached name check
+// rejects other files without building a full path (and a PATH_MAX buffer).
+bool isBluetoothd(vnode_t vp)
+{
+    const char *name = vnode_getname(vp);
+    if (name) {
+        bool maybe = strcmp(name, "bluetoothd") == 0;
+        vnode_putname(name);
+        if (LIKELY(!maybe))
+            return false;
+    }
+    return isBluetoothdPath(vp);
 }
 
 errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *blockSize, void **context,
@@ -841,8 +1195,73 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
 }
 
+// Empty until launchd sets it, so only call this once bluetoothd runs.
+bool isBluetoothdRpaBuild()
+{
+    SInt32 state = __atomic_load_n(&rpaBuildState, __ATOMIC_ACQUIRE);
+    if (state == 0) {
+        char build[16] {};
+        size_t size = sizeof(build) - 1;
+        if (sysctlbyname("kern.osversion", build, &size, nullptr, 0) != 0 || build[0] == 0)
+            return false;
+        state = strcmp(build, "25G332") == 0 ? 1 : -1;
+        __atomic_store_n(&rpaBuildState, state, __ATOMIC_RELEASE);
+    }
+    return state > 0;
+}
+
+void patchBluetoothdRpaPage(const void *data)
+{
+    if (!rpaPatchEnabled || !verifyFixRouted || !isBluetoothdRpaBuild())
+        return;
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaHelpersFind25G332, sizeof(rpaHelpersFind25G332),
+                                      rpaHelpersReplace25G332, sizeof(rpaHelpersReplace25G332))) {
+        __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
+        OSIncrementAtomic(&bluetoothdRpaHelpersPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA helpers path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaLegacyFind25G332, sizeof(rpaLegacyFind25G332),
+                                      rpaLegacyReplace25G332, sizeof(rpaLegacyReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaLegacyPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA legacy path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaScanFind25G332, sizeof(rpaScanFind25G332),
+                                      rpaScanReplace25G332, sizeof(rpaScanReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaScanPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA scan path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaDecodeFind25G332, sizeof(rpaDecodeFind25G332),
+                                      rpaDecodeReplace25G332, sizeof(rpaDecodeReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaDecodePatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA decode path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaDeviceFind25G332, sizeof(rpaDeviceFind25G332),
+                                      rpaDeviceReplace25G332, sizeof(rpaDeviceReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaDevicePatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA device path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaConnectFind25G332, sizeof(rpaConnectFind25G332),
+                                      rpaConnectReplace25G332, sizeof(rpaConnectReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaConnectPatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA connect path (25G332)");
+    }
+    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
+                                      rpaUpdateFind25G332, sizeof(rpaUpdateFind25G332),
+                                      rpaUpdateReplace25G332, sizeof(rpaUpdateReplace25G332))) {
+        OSIncrementAtomic(&bluetoothdRpaUpdatePatched);
+        SYSLOG(DRV_NAME, "patched bluetoothd RPA update path (25G332)");
+    }
+}
+
 void patchBluetoothdPage(const void *data)
 {
+    patchBluetoothdRpaPage(data);
     if (msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband()) {
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, wbsFind, sizeof(wbsFind),
                                           wbsReplace, sizeof(wbsReplace))) {
@@ -850,7 +1269,10 @@ void patchBluetoothdPage(const void *data)
             SYSLOG(DRV_NAME, "enabled MediaTek HFP wideband with USB mSBC bridge ready");
         }
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, hfpFillFind, sizeof(hfpFillFind),
-                                          hfpFillReplace, sizeof(hfpFillReplace))) {
+                                          hfpFillReplace, sizeof(hfpFillReplace)) ||
+            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, hfpFillFind25G332,
+                                          sizeof(hfpFillFind25G332), hfpFillReplace25G332,
+                                          sizeof(hfpFillReplace25G332))) {
             OSIncrementAtomic(&bluetoothdHfpFillPatched);
             SYSLOG(DRV_NAME, "limited MediaTek HFP sender to complete PCM chunks");
         }
@@ -862,12 +1284,18 @@ void patchBluetoothdPage(const void *data)
             SYSLOG(DRV_NAME, "patched bluetoothd extended-advertising check");
         }
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind,
-                                          sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace))) {
+                                          sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace)) ||
+            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind25G332,
+                                          sizeof(advAddressFind25G332), advAddressReplace25G332,
+                                          sizeof(advAddressReplace25G332))) {
             OSIncrementAtomic(&bluetoothdAddressPatched);
             SYSLOG(DRV_NAME, "patched bluetoothd per-set advertising address gate");
         }
         if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind,
                                           sizeof(advAddressRetryFind), advAddressRetryReplace,
+                                          sizeof(advAddressRetryReplace)) ||
+            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind25G332,
+                                          sizeof(advAddressRetryFind25G332), advAddressRetryReplace,
                                           sizeof(advAddressRetryReplace))) {
             OSIncrementAtomic(&bluetoothdAddressRetryPatched);
             SYSLOG(DRV_NAME, "patched bluetoothd random address initialization before enable");
@@ -908,7 +1336,14 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         lilu.onKextLoadForce(&kextIOBluetoothFamily, 1, processKext);
     } else {
         leLock = IOLockAlloc();
+        leReadyMaskEnabled = getKernelVersion() == KernelVersion::Tahoe &&
+                             !checkKernelArgument("-mtkbtnolereadymask");
         extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
+        // Child sites call into the helper page; some of their signatures also
+        // match 25G241, which has no helpers, so patchBluetoothdRpaPage also
+        // requires the exact build (kern.osversion is still empty here).
+        rpaPatchEnabled = extAdvPatchEnabled && getKernelVersion() == KernelVersion::Tahoe &&
+                          !checkKernelArgument("-mtkbtnorpa");
         msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && !checkKernelArgument("-mtkbtnomsbc");
         verifyFixEnabled = !checkKernelArgument("-mtkbtnoverifyfix");
         if (verifyFixEnabled) {

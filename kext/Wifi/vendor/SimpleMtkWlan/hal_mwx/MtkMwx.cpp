@@ -324,6 +324,8 @@ struct mwx_txwi {
 	u_int				mt_idx;
 	int				mt_busy;
 	int				mt_eapol;	/* log TX status */
+	unsigned			mt_join_kind;
+	uint64_t			mt_join_attempt;
 };
 
 struct mwx_txwi_desc {
@@ -373,6 +375,7 @@ struct mwx_node {
 };
 #define	MWX_NODE_FLAG_HAVE_PAIRWISE_KEY		0x1
 #define	MWX_NODE_FLAG_HAVE_GROUP_KEY		0x2
+#define MWX_NODE_FLAG_KEY_FAILED 0x4
 
 struct mwx_vif {
 	struct mwx_node		vif_mn;
@@ -578,6 +581,7 @@ struct mwx_softc {
 		volatile int	 mcu_done;
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
+	uint64_t		sc_scan_join_attempt;	/* join diag attempt the scan serves */
 
 	/* phy / hw */
 	struct mwx_hw_capa	sc_capa;
@@ -792,7 +796,8 @@ void	mwx_delete_key(struct ieee80211com *, struct ieee80211_node *,
 	    struct ieee80211_key *);
 void	mwx_setkey_task(void *);
 
-int	mwx_tx(struct mwx_softc *, struct mbuf *, struct ieee80211_node *);
+int	mwx_tx(struct mwx_softc *, struct mbuf *, struct ieee80211_node *,
+    unsigned = MTK_JOIN_TX_NONE);
 int	mwx_tx_full(struct mwx_softc *);
 void	mwx_tx_resume(struct mwx_softc *);
 void	mwx_rx(struct mwx_softc *, struct mbuf *, struct mbuf_list *);
@@ -892,6 +897,7 @@ int		mt7921_mcu_rate_txpower_band(struct mwx_softc *, int,
 int		mt7921_mcu_set_rate_txpower(struct mwx_softc *);
 void		mt7921_mac_reset_counters(struct mwx_softc *);
 void		mt7921_mac_set_timing(struct mwx_softc *);
+void		mwx_update_slot(struct ieee80211com *);
 int		mt7921_mcu_uni_add_dev(struct mwx_softc *, struct mwx_vif *,
 		    struct mwx_node *, int);
 int		mt7921_mcu_set_sniffer(struct mwx_softc *, int);
@@ -1090,7 +1096,7 @@ mwx_init_running(struct ifnet *ifp)
 		}
 	}
 	/* WCL assigns a private MAC through setHardwareAddress (ac_enaddr). */
-	IEEE80211_ADDR_COPY(ic->ic_myaddr, ((struct arpcom *)ifp)->ac_enaddr);
+    IEEE80211_ADDR_COPY(ic->ic_myaddr, ((struct arpcom *)ifp)->ac_enaddr);
 	MWX_DEV_LOG(sc, "init mac address=%s\n", ether_sprintf(ic->ic_myaddr));
 
 	MWX_DEV_LOG(sc, "init start opmode=%d flags=0x%x ic_state=%d\n",
@@ -1311,11 +1317,13 @@ mwx_start(struct ifnet *ifp)
 	struct ieee80211_node *ni;
 	struct ether_header *eh;
 	struct mbuf *m;
+    bool eapol = false;
 
 	if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd))
 		return;
 
 	for (;;) {
+        eapol = false;
 		/*
 		 * Stop before a frame would be dropped for lack of a TXWI or
 		 * a ring slot. mwx_tx_resume() restarts output once the
@@ -1330,8 +1338,8 @@ mwx_start(struct ifnet *ifp)
 		/* need to send management frames even if we're not RUNning */
 		m = mq_dequeue(&ic->ic_mgtq);
 		if (m) {
-			ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
-			goto sendit;
+            ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
+            goto sendit;
 		}
 
 		if (ic->ic_state != IEEE80211_S_RUN ||
@@ -1350,17 +1358,23 @@ mwx_start(struct ifnet *ifp)
 		if (ifp->if_bpf != NULL)
 			bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
 #endif
-		if ((m = ieee80211_encap(ifp, m, &ni)) == NULL) {
-			ifp->if_oerrors++;
-			continue;
-		}
+        eapol = mtod(m, struct ether_header *)->ether_type == htons(ETHERTYPE_PAE);
+        if ((m = ieee80211_encap(ifp, m, &ni)) == NULL) {
+            ifp->if_oerrors++;
+            if (eapol && ic->ic_join_diag.Active) ++ic->ic_join_diag.EapolTxDMAErrors;
+            continue;
+        }
 
  sendit:
 #if NBPFILTER > 0
 		if (ic->ic_rawbpf != NULL)
 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
 #endif
-		int rv = mwx_tx(sc, m, ni);
+        const auto wh = mtod(m, const struct ieee80211_frame *);
+        unsigned kind = mtk_join_tx_kind(wh->i_fc[0], eapol,
+            IEEE80211_IS_MULTICAST(wh->i_addr1));
+        int rv = mwx_tx(sc, m, ni, kind);
+        mtk_join_tx_dma(&ic->ic_join_diag, kind, rv);
 		/* mwx_tx copies node metadata into the descriptor; completion uses
 		 * the packet/token only, so release the enqueue reference here. */
 		ieee80211_release_node(ic, ni);
@@ -1559,8 +1573,14 @@ mwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 		/* cancel other tasks here */
 	}
 
-	sc->sc_ns_state = nstate;
-	sc->sc_ns_arg = arg;
+    if (ic->ic_join_diag.Active) {
+        ic->ic_join_diag.RequestedState = nstate;
+        if (nstate == IEEE80211_S_AUTH) ic->ic_join_diag.AuthRequestedAtUS = mtk_join_now();
+        if (nstate == IEEE80211_S_ASSOC) ic->ic_join_diag.AssocRequestedAtUS = mtk_join_now();
+        if (nstate == IEEE80211_S_RUN) ic->ic_join_diag.RunRequestedAtUS = mtk_join_now();
+    }
+    sc->sc_ns_state = nstate;
+    sc->sc_ns_arg = arg;
 
 	task_add(sc->sc_nswq, &sc->sc_newstate_task);
 	return 0;
@@ -1584,7 +1604,24 @@ mwx_newstate_task(void *ptr)
 		break;
 	case IEEE80211_S_SCAN:
 		if (nstate == ostate) {
+			/*
+			 * MtkWireless: a scan left over from the previous join's
+			 * leave (or a WCL scan) must not swallow a new WCL join:
+			 * airportd's retry then never scanned and timed out
+			 * (ScanStartedAtUS 0, 2026-11-01). Restart it for the join.
+			 */
+			if ((sc->sc_flags & MWX_FLAG_SCANNING) &&
+			    ic->ic_wcl_join_requested && ic->ic_join_diag.Active &&
+			    sc->sc_scan_join_attempt != ic->ic_join_diag.Attempt) {
+				timeout_del(&sc->sc_scan_to);
+				++ic->ic_join_diag.ScanRestarted;
+				if (mt7921_mcu_hw_scan_cancel(sc) != 0)
+					sc->sc_flags &= ~(MWX_FLAG_SCANNING |
+					    MWX_FLAG_BGSCAN);
+			}
 			if (sc->sc_flags & MWX_FLAG_SCANNING) {
+				if (ic->ic_join_diag.Active)
+					++ic->ic_join_diag.ScanSkippedBusy;
 				splx(s);
 				return;
 			}
@@ -1618,12 +1655,29 @@ mwx_newstate_task(void *ptr)
 		if (rv)
 			break;
 		break;
-	case IEEE80211_S_AUTH:
-		/*
-		 * MtkWireless: a new (or roamed-to) AP has not seen our PM=1;
+    case IEEE80211_S_AUTH:
+        if (ic->ic_join_diag.Active) {
+            ic->ic_join_diag.AuthTaskAtUS = mtk_join_now();
+        }
+        // MtkWireless: cancel an already granted/pending AWDL visit before
+        // programming the AP channel. sc_ns_state blocks new reservations
+        // while MCU waits temporarily release the gate and ic_state is SCAN.
+        if (sc->sc_awdl_lock) {
+            rv = mwx_awdl_abort(sc);
+            if (ic->ic_join_diag.Active) {
+                ic->ic_join_diag.ROCAbortAtUS = mtk_join_now();
+                ic->ic_join_diag.ROCAbortError = rv;
+            }
+            if (rv) break;
+        }
+        /*
+         * MtkWireless: a new (or roamed-to) AP has not seen our PM=1;
 		 * the next off-channel AWDL ROC must send it again.
 		 */
-		sc->sc_awdl_infra_ps = false;
+        ((struct mwx_node *)ic->ic_bss)->flags &= ~MWX_NODE_FLAG_KEY_FAILED;
+        if (ic->ic_join_diag.Active)
+            ic->ic_join_diag.InfraPSAtStart = sc->sc_awdl_infra_ps;
+        sc->sc_awdl_infra_ps = false;
 		mwx_apply_phy_knobs(sc);
 		rv = mt7921_set_channel(sc);
 		if (rv)
@@ -1646,8 +1700,9 @@ mwx_newstate_task(void *ptr)
 		 * with a JOIN ROC for the whole auth/assoc exchange).
 		 */
 		break;
-	case IEEE80211_S_RUN:
-		if (ic->ic_opmode == IEEE80211_M_MONITOR)
+    case IEEE80211_S_RUN:
+        if (ic->ic_join_diag.Active) ic->ic_join_diag.RunTaskAtUS = mtk_join_now();
+        if (ic->ic_opmode == IEEE80211_M_MONITOR)
 			break;
 
 		mt7921_mcu_hw_scan_cancel(sc);
@@ -1657,6 +1712,12 @@ mwx_newstate_task(void *ptr)
 			rv = mt7921_set_channel(sc);
 			MWX_DEV_LOG(sc, "run channel switch bw=%u center=%u rv=%d\n",
 			    sc->sc_bss_bw, sc->sc_bss_center, rv);
+			if (ic->ic_join_diag.Active) {
+				/* CMD_CBW_*: 0 20, 1 40, 2 80; first switch result. */
+				ic->ic_join_diag.RunBw = sc->sc_bss_bw;
+				ic->ic_join_diag.RunCenter = sc->sc_bss_center;
+				ic->ic_join_diag.RunSwitchError = (uint32_t)rv;
+			}
 			if (rv) {
 				/* Stay usable on the primary channel. */
 				sc->sc_bss_bw = CMD_CBW_20MHZ;
@@ -1671,14 +1732,23 @@ mwx_newstate_task(void *ptr)
 			rv = mt7921_mcu_set_associated_peer(sc);
 		if (rv)
 			break;
+		/* MtkWireless: 20 MHz joins do not switch channel again in RUN.
+		 * Apply the negotiated slot time after firmware BSS/peer setup. */
+		mt7921_mac_set_timing(sc);
 		mt7921_mcu_set_rts_thresh(sc, 0x92b, 0);
 		break;
 	}
 
-	if (rv)
-		mwx_reset(sc);
-	else
-		sc->sc_newstate(ic, nstate, arg);
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.HalError = rv;
+    if (rv)
+        mwx_reset(sc);
+    else {
+        sc->sc_newstate(ic, nstate, arg);
+        if (ic->ic_join_diag.Active) {
+            if (nstate == IEEE80211_S_AUTH) ic->ic_join_diag.AuthCommittedAtUS = mtk_join_now();
+            if (nstate == IEEE80211_S_RUN) ic->ic_join_diag.RunCommittedAtUS = mtk_join_now();
+        }
+    }
 	splx(s);
 }
 
@@ -1790,6 +1860,31 @@ mwx_bgscan_done_task(void *arg)
 	splx(s);
 }
 
+static void mwx_join_key_result(struct ieee80211com *ic, struct ieee80211_key *k, int rv)
+{
+    auto &d = ic->ic_join_diag;
+    if (!d.Active) return;
+    d.KeyLastError = rv; d.KeyCompletedAtUS = mtk_join_now();
+    if (k->k_cipher == IEEE80211_CIPHER_BIP) {
+        if (rv) ++d.IGTKFailed; else ++d.IGTKInstalled;
+    } else if (k->k_flags & IEEE80211_KEY_GROUP) {
+        if (rv) ++d.GTKFailed; else ++d.GTKInstalled;
+    } else {
+        if (rv) ++d.PTKFailed; else ++d.PTKInstalled;
+    }
+}
+
+/* A completed USB/MCU transfer alone does not establish key installation. */
+static int mwx_join_key_command(struct mwx_softc *sc, struct mbuf *m)
+{
+    int seq, rv;
+    uint32_t status = UINT32_MAX;
+    rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
+    if (!rv) rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq, &status);
+    if (sc->sc_ic.ic_join_diag.Active) sc->sc_ic.ic_join_diag.KeyFirmwareStatus = status;
+    return rv ? rv : (status ? EIO : 0);
+}
+
 int
 mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
     struct ieee80211_key *k)
@@ -1800,9 +1895,16 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 	DPRINTF("%s: set_key: ni %p, k_id %d, k_flags %x k_cipher %d\n",
 	    DEVNAME(sc), ni, k->k_id, k->k_flags, k->k_cipher);
 
-	if ((sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg) ==
-	    sc->sc_setkey_tail)
-		return ENOSPC;
+    if (ic->ic_join_diag.Active) {
+        auto &d = ic->ic_join_diag;
+        if (k->k_cipher == IEEE80211_CIPHER_BIP) ++d.IGTKQueued;
+        else if (k->k_flags & IEEE80211_KEY_GROUP) ++d.GTKQueued;
+        else ++d.PTKQueued;
+    }
+    if ((sc->sc_setkey_cur + 1) % nitems(sc->sc_setkey_arg) == sc->sc_setkey_tail) {
+        mwx_join_key_result(ic, k, ENOSPC);
+        return ENOSPC;
+    }
 
 	/*
 	 * MtkWireless: net80211 verifies the MMIE of broadcast robust
@@ -1815,9 +1917,11 @@ mwx_set_key(struct ieee80211com *ic, struct ieee80211_node *ni,
 		if (k->k_flags & IEEE80211_KEY_SWCRYPTO)
 			ieee80211_bip_delete_key(ic, k);
 		err = ieee80211_bip_set_key(ic, k);
-		if (err != 0)
-			return err;
-		k->k_flags |= IEEE80211_KEY_SWCRYPTO;
+        if (err != 0) {
+            mwx_join_key_result(ic, k, err);
+            return err;
+        }
+        k->k_flags |= IEEE80211_KEY_SWCRYPTO;
 	}
 
 	a = &sc->sc_setkey_arg[sc->sc_setkey_cur];
@@ -1855,13 +1959,31 @@ mwx_setkey_task(void *arg)
 
 	while (sc->sc_setkey_tail != sc->sc_setkey_cur) {
 		a = &sc->sc_setkey_arg[sc->sc_setkey_tail];
-		mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+        int rv = mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+        mwx_join_key_result(&sc->sc_ic, a->k, rv);
+        if (rv && a->ni) ((struct mwx_node *)a->ni)->flags |= MWX_NODE_FLAG_KEY_FAILED;
 		a->ni = NULL;
 		a->k = NULL;
 
 		sc->sc_setkey_tail = (sc->sc_setkey_tail + 1) %
 		    nitems(sc->sc_setkey_arg);
 	}
+
+    // MtkWireless: PMF IGTK is queued after GTK. Do not expose an authorized
+    // link until the whole queue drained successfully, including BIP.
+    auto ic = &sc->sc_ic;
+    auto ni = ic->ic_bss;
+    auto mn = (struct mwx_node *)ni;
+    const unsigned want_keymask = MWX_NODE_FLAG_HAVE_PAIRWISE_KEY | MWX_NODE_FLAG_HAVE_GROUP_KEY;
+    if (ni && ic->ic_state == IEEE80211_S_RUN && sc->sc_ns_state == IEEE80211_S_RUN &&
+        !(mn->flags & MWX_NODE_FLAG_KEY_FAILED) &&
+        (mn->flags & want_keymask) == want_keymask && !ni->ni_port_valid) {
+        if (ni->ni_flags & IEEE80211_NODE_MFP)
+            ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT | IEEE80211_NODE_RXMGMTPROT;
+        ni->ni_port_valid = 1;
+        if (ic->ic_join_diag.Active) ic->ic_join_diag.PortValidAtUS = mtk_join_now();
+        ieee80211_set_link_state(ic, LINK_STATE_UP);
+    }
 
 	splx(s);
 }
@@ -1909,6 +2031,7 @@ mwx_eapol_keyinfo(struct mbuf *m, uint16_t *keyinfo)
 	static const uint8_t llc[] = { 0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e };
 	struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
 	uint8_t buf[sizeof(llc) + 7];
+	const uint8_t *p;
 	u_int hdrlen;
 
 	if (mbuf_len(m) < sizeof(*wh) ||
@@ -1916,18 +2039,25 @@ mwx_eapol_keyinfo(struct mbuf *m, uint16_t *keyinfo)
 	    (wh->i_fc[1] & IEEE80211_FC1_PROTECTED))
 		return 0;
 	hdrlen = ieee80211_get_hdrlen(wh);
-	if (mbuf_pkthdr_len(m) < hdrlen + sizeof(buf))
-		return 0;
-	m_copydata(m, hdrlen, sizeof(buf), (caddr_t)buf);
+	/* MtkWireless: called per RX/TX frame; read the first mbuf in place. */
+	if (mbuf_len(m) >= hdrlen + sizeof(buf)) {
+		p = mtod(m, const uint8_t *) + hdrlen;
+	} else {
+		if (mbuf_pkthdr_len(m) < hdrlen + sizeof(buf))
+			return 0;
+		m_copydata(m, hdrlen, sizeof(buf), (caddr_t)buf);
+		p = buf;
+	}
 	/* LLC/SNAP 888e, EAPOL type 3 (Key), then descriptor type + info */
-	if (memcmp(buf, llc, sizeof(llc)) != 0 || buf[sizeof(llc) + 1] != 3)
+	if (memcmp(p, llc, sizeof(llc)) != 0 || p[sizeof(llc) + 1] != 3)
 		return 0;
-	*keyinfo = (buf[sizeof(llc) + 5] << 8) | buf[sizeof(llc) + 6];
+	*keyinfo = (p[sizeof(llc) + 5] << 8) | p[sizeof(llc) + 6];
 	return 1;
 }
 
 int
-mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
+mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
+    unsigned join_kind)
 {
 	struct mwx_node *mn = (struct mwx_node *)ni;
 	struct mwx_txwi *mt;
@@ -1948,8 +2078,18 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	}
 	/* XXX DMA memory access without BUS_DMASYNC_PREWRITE */
 	txp = mt->mt_desc;
-	memset(txp, 0, sizeof(*txp));
-	mt7921_mac_write_txwi(sc, m, ni, txp);
+	/*
+	 * MtkWireless: TXWI memory is mapped uncached; the builder does a
+	 * dozen read-modify-writes. Build in cached stack memory (64 bytes)
+	 * and store it once.
+	 */
+	{
+		struct mt76_txwi tmp;
+
+		memset(&tmp, 0, sizeof(tmp));
+		mt7921_mac_write_txwi(sc, m, ni, &tmp);
+		memcpy(txp, &tmp, sizeof(tmp));
+	}
 
 	rv = mwx_txwi_enqueue(sc, mt, m);
 	if (rv == EFBIG && mbuf_next(m) != NULL) {
@@ -2004,6 +2144,9 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 		tx_log_count++;
 	}
 
+	mt->mt_join_kind = join_kind;
+	mt->mt_join_attempt = sc->sc_ic.ic_join_diag.Active ?
+	    sc->sc_ic.ic_join_diag.Attempt : 0;
 	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
 	if (rv != 0) {
 		sc->sc_tx_ring_full++;
@@ -2035,6 +2178,19 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
 		return;
 	}
 
+    /* MtkWireless: P-RXV rate word of the AP's frames after association
+     * (mode 27:24, nss 9:7, bw 14:12, mcs 6:0). */
+    if (ic->ic_join_diag.Active && ic->ic_join_diag.AssocRxCount &&
+        mbuf_len(m) >= 16 && sc->sc_rx_cur_rate &&
+        IEEE80211_ADDR_EQ(mtod(m, struct ieee80211_frame *)->i_addr2,
+        ic->ic_join_diag.BSSID)) {
+        uint8_t t = mtod(m, struct ieee80211_frame *)->i_fc[0] &
+            IEEE80211_FC0_TYPE_MASK;
+        if (t == IEEE80211_FC0_TYPE_DATA)
+            ic->ic_join_diag.RxBssLastRate = sc->sc_rx_cur_rate;
+        else if (t == IEEE80211_FC0_TYPE_MGT)
+            ic->ic_join_diag.RxBssMgmtRate = sc->sc_rx_cur_rate;
+    }
     if (sc->sc_awdl_enabled && sc->sc_awdl_receive &&
         mbuf_len(m) >= 24 && !memcmp(mtod(m, uint8_t *)+16, mtkawdl::bssid, 6)) {
         sc->sc_awdl_receive(sc->sc_awdl_context, mtod(m, const uint8_t *),
@@ -2584,6 +2740,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_bgscan_done = mwx_bgscan_done;
 	ic->ic_set_key = mwx_set_key;
 	ic->ic_delete_key = mwx_delete_key;
+	ic->ic_updateslot = mwx_update_slot;
 	ic->ic_ampdu_rx_start = mwx_ampdu_rx_start;
 	ic->ic_ampdu_rx_stop = mwx_ampdu_rx_stop;
 	ic->ic_ampdu_tx_start = mwx_ampdu_tx_start;
@@ -2881,6 +3038,9 @@ mwx_txwi_put(struct mwx_softc *sc, struct mwx_txwi *mt)
 
 	memset(mt->mt_desc, 0, sizeof(*mt->mt_desc));
 	mt->mt_busy = 0;
+	mt->mt_join_kind = MTK_JOIN_TX_NONE;
+	mt->mt_join_attempt = 0;
+	mt->mt_eapol = 0;
 
 	if (mt->mt_idx < MT_PACKET_ID_FIRST)
 		return;
@@ -3505,6 +3665,9 @@ mwx_dma_tx_cleanup_locked(struct mwx_softc *sc, struct mwx_queue *q)
 	uint32_t hw;
 
 	idx = q->mq_cons;
+	/* MtkWireless: nothing queued, skip the uncached DMA_IDX read. */
+	if (idx == (int)q->mq_prod)
+		return 0;
 	if (!mtk_wlan_dma_hw_index(mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX),
 	    q->mq_count, &hw))
 		return 0;
@@ -4033,6 +4196,11 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
     ++sc->sc_awdl_roc_reasons[static_cast<unsigned>(result)];
     if(result==mtkawdl::RocResult::Accepted) {
         ++sc->sc_awdl_roc_grants;
+        if(sc->sc_ic.ic_join_diag.Active) {
+            ++sc->sc_ic.ic_join_diag.ROCGrants;
+            if(sc->sc_ns_state >= IEEE80211_S_AUTH && !sc->sc_ic.ic_join_diag.PortValidAtUS)
+                ++sc->sc_ic.ic_join_diag.ROCGrantsDuringHandshake;
+        }
         sc->sc_awdl_roc_grant_delay_us=sc->sc_awdl_roc.responseDelayUS;
         {
             uint32_t ms=sc->sc_awdl_roc.responseDelayUS/1000; unsigned b=0;
@@ -5357,6 +5525,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
     requestedScan=ic->ic_wcl_scan_requested ||
         (ic->ic_wcl_join_requested && sc->sc_ns_state==IEEE80211_S_SCAN);
     if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN && !requestedScan) {
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ScanSuspendedAWDL;
         sc->sc_awdl_scan_suspended=true;
         return 0;
     }
@@ -5369,6 +5538,9 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
 		return ENOMEM;
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.ScanStartedAtUS = mtk_join_now();
+    sc->sc_scan_join_attempt = ic->ic_wcl_join_requested && ic->ic_join_diag.Active ?
+        ic->ic_join_diag.Attempt : 0;
 	req = mtod(m, struct mt76_connac_hw_scan_req *);
 	/* The mbuf payload is not initialized by allocation. */
 	memset(req, 0, sizeof(*req));
@@ -5419,16 +5591,34 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 		    ic->ic_wcl_scan_ssid_length);
 		n_ssids = 1;
 	}
+	/* MtkWireless: joins start their own net80211 scan, without a WCL
+	 * SCAN_REQ. Probe the requested ESS even when the hotspot/hidden AP
+	 * was not retained in the scan cache. Explicit (including passive)
+	 * WCL scans keep their own targets while a join is pending. */
+	if (!ic->ic_wcl_scan_requested && ic->ic_wcl_join_requested &&
+	    ic->ic_des_esslen > 0 && ic->ic_des_esslen <= IEEE80211_NWID_LEN) {
+		req->ssids[0].ssid_len = htole32(ic->ic_des_esslen);
+		memcpy(req->ssids[0].ssid, ic->ic_des_essid, ic->ic_des_esslen);
+		n_ssids = 1;
+	}
 	if (n_ssids) {
 		req->scan_type = 1;
 		req->probe_req_num = 2;
 	}
 
 	req->ssid_type = n_ssids ? 0x4 : 0x1;
-	req->ssid_type_ext = n_ssids && !ic->ic_wcl_scan_targets.wildcard ? 1 : 0;
+	req->ssid_type_ext = n_ssids &&
+	    !(ic->ic_wcl_scan_requested && ic->ic_wcl_scan_targets.wildcard) ? 1 : 0;
 	req->ssids_num = MIN(n_ssids, 4);
 	req->ext_ssids_num = n_ssids > 4 ? n_ssids - 4 : 0;
 
+	/* MtkWireless: the join's first scan visits only WCL's channel. */
+	unsigned join_chan = 0;
+	if (!ic->ic_wcl_scan_requested && ic->ic_wcl_join_requested &&
+	    ic->ic_wcl_join_chan && ic->ic_wcl_join_chan <= IEEE80211_CHAN_MAX &&
+	    ic->ic_channels[ic->ic_wcl_join_chan].ic_flags)
+		join_chan = ic->ic_wcl_join_chan;
+	ic->ic_wcl_join_chan = 0;
 	for (nchan = 0, c = &ic->ic_channels[1];
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] &&
 	    nchan < 64; c++) {
@@ -5437,8 +5627,11 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 
 		if (c->ic_flags == 0)
 			continue;
+		if (join_chan) {
+			if (c != &ic->ic_channels[join_chan])
+				continue;
 		/* Restrict to the channels WCL asked for, if any. */
-		if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
+		} else if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted) {
 			unsigned int chn = ieee80211_chan2idx(ic, c);
 			if (chn > IEEE80211_CHAN_MAX ||
 			    !(ic->ic_wcl_scan_channels[chn / 8] &
@@ -5710,7 +5903,8 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
     event=mtod(m,struct mt76_connac_hw_scan_done *);
     if(event->seq_num!=sc->sc_scan_seq_num) return;
 
-	sc->sc_scan_done_count++;
+    if (sc->sc_ic.ic_join_diag.Active) sc->sc_ic.ic_join_diag.ScanDoneAtUS = mtk_join_now();
+    sc->sc_scan_done_count++;
 	timeout_del(&sc->sc_scan_to);
 	nodes_before = mwx_count_nodes(ic);
 	sc->sc_scan_last_ieee80211_nodes = nodes_before;
@@ -6133,14 +6327,22 @@ mt7921_mac_reset_counters(struct mwx_softc *sc)
 void
 mt7921_mac_set_timing(struct mwx_softc *sc)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_channel *channel = ic->ic_opmode == IEEE80211_M_STA &&
+	    ic->ic_bss != NULL ? ic->ic_bss->ni_chan : ic->ic_ibss_chan;
 	uint16_t coverage_class = 0;		/* XXX */
-	uint32_t val, reg_offset;
+	uint32_t val, reg_offset, icr;
 	uint32_t cck = MT_TIMEOUT_CCK_DEF_VAL;
 	uint32_t ofdm = MT_TIMEOUT_OFDM_DEF_VAL;
 	uint32_t offset;
-	int is_2ghz = 1; /* XXX get from ic_bss node */
+	if (channel == NULL || channel == IEEE80211_CHAN_ANYC)
+		return;
+	/* MtkWireless: match MT76 mt792x_mac_set_timeing's current band.
+	 * The former hard-coded 2 GHz value programmed SIFS=10 on channel 149. */
+	int is_2ghz = IEEE80211_IS_CHAN_2GHZ(channel);
 	uint32_t sifs = is_2ghz ? 10 : 16;
-	uint32_t slottime = IEEE80211_DUR_DS_SHSLOT;	/* XXX get from stack */
+	uint32_t slottime = !is_2ghz || (ic->ic_flags & IEEE80211_F_SHSLOT) ?
+	    IEEE80211_DUR_DS_SHSLOT : IEEE80211_DUR_DS_SLOT;
 
 #ifdef NOTYET
 	if (!test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
@@ -6156,10 +6358,10 @@ mt7921_mac_set_timing(struct mwx_softc *sc)
 
 	mwx_write(sc, MT_TMAC_CDTR(0), cck + reg_offset);
 	mwx_write(sc, MT_TMAC_ODTR(0), ofdm + reg_offset);
-	mwx_write(sc, MT_TMAC_ICR0(0),
-	    MT_IFS_EIFS_DEF | MT_IFS_RIFS_DEF |
+	icr = MT_IFS_EIFS_DEF | MT_IFS_RIFS_DEF |
 	    (sifs << MT_IFS_SIFS_SHIFT) |
-	    (slottime << MT_IFS_SLOT_SHIFT));
+	    (slottime << MT_IFS_SLOT_SHIFT);
+	mwx_write(sc, MT_TMAC_ICR0(0), icr);
 
 	if (slottime < 20 || !is_2ghz)
 		val = MT7921_CFEND_RATE_DEFAULT;
@@ -6169,6 +6371,24 @@ mt7921_mac_set_timing(struct mwx_softc *sc)
 	mwx_rmw(sc, MT_AGG_ACR0(0), val, MT_AGG_ACR_CFEND_RATE_MASK);
 	mwx_clear(sc, MT_ARB_SCR(0),
 	    MT_ARB_SCR_TX_DISABLE | MT_ARB_SCR_RX_DISABLE);
+	if (ic->ic_join_diag.Active) {
+		auto &d = ic->ic_join_diag;
+		d.MacTimingBand = is_2ghz ? 0 : IEEE80211_IS_CHAN_6GHZ(channel) ? 2 : 1;
+		d.MacTimingSIFSUS = sifs;
+		d.MacTimingSlotUS = slottime;
+		d.MacTimingICR0 = icr;
+		d.MacTimingICR0Readback = mwx_read(sc, MT_TMAC_ICR0(0));
+	}
+}
+
+/* Association and ERP beacon updates can change the 2 GHz slot time
+ * without a channel switch. net80211 calls this while holding splnet. */
+void
+mwx_update_slot(struct ieee80211com *ic)
+{
+	if (!(ic->ic_if.if_flags & IFF_RUNNING))
+		return;
+	mt7921_mac_set_timing((struct mwx_softc *)ic->ic_if.if_softc);
 }
 
 int
@@ -6274,9 +6494,21 @@ mt7921_mcu_uni_add_dev(struct mwx_softc *sc, struct mwx_vif *mvif,
 	}
 
 printf("%s: %s cmd %x mvif idx %d omac %d band %d wmm %d\n", DEVNAME(sc), __func__, cmd, mvif->idx, mvif->omac_idx, mvif->band_idx, mvif->wmm_idx);
-	rv = mvif == &sc->sc_awdl_vif ? mwx_send_assoc_status(sc,cmd,data,len) :
+    rv = mvif == &sc->sc_awdl_vif ? mwx_send_assoc_status(sc,cmd,data,len) :
         mwx_mcu_send_wait(sc, cmd, data, len);
-	if (rv != 0)
+    if (enable && mvif == &sc->sc_vif) {
+        // MtkWireless: retain the actual DEV_INFO_UPDATE address bytes,
+        // rather than reconstructing firmware's address from ic_myaddr.
+        auto ic = &sc->sc_ic;
+        memcpy(ic->ic_firmware_mac, dev_req.tlv.omac_addr, 6);
+        ic->ic_firmware_mac_at = mtk_join_now(); ic->ic_firmware_mac_error = rv;
+        if (ic->ic_join_diag.Active) {
+            memcpy(ic->ic_join_diag.FirmwareMAC, ic->ic_firmware_mac, 6);
+            ic->ic_join_diag.FirmwareMacAtUS = ic->ic_firmware_mac_at;
+            ic->ic_join_diag.FirmwareMacError = rv;
+        }
+    }
+    if (rv != 0)
 		return rv;
     if (mvif == &sc->sc_awdl_vif && sc->sc_awdl_epoch != awdlEpoch)
         return ECANCELED;
@@ -6544,6 +6776,20 @@ mt7921_mac_fill_rx(struct mwx_softc *sc, struct mbuf *m,
 			/* report MIC failures to net80211 for TKIP */
 			ic->ic_stats.is_rx_locmicfail++;
 			ieee80211_michael_mic_failure(ic, 0/* XXX */);
+		}
+		/* MtkWireless: unicast-to-me frames the HAL drops after the
+		 * Association Response (RXD3 address type U2M). */
+		if (ic->ic_join_diag.Active && ic->ic_join_diag.AssocRxCount &&
+		    (info.rxd[3] & 0x00030000) == 0x00010000) {
+			auto &d = ic->ic_join_diag;
+			if (drop == MTK_WLAN_RX_AMSDU_ERR) ++d.RxHalDropAmsdu;
+			else if (drop == MTK_WLAN_RX_ICV) ++d.RxHalDropIcv;
+			else ++d.RxHalDropOther;
+			d.RxHalDropLastReason = drop;
+			d.RxHalDropLastRxd1 = info.rxd[1];
+			d.RxHalDropLastRxd2 = info.rxd[2];
+			d.RxHalDropLastRxd3 = info.rxd[3];
+			d.RxHalDropLastAtUS = mtk_join_now();
 		}
 		MWX_RX_DROP_LOG(sc, mtk_wlan_rx_drop_name(drop), rv, info.rxd[0],
 		    info.rxd[1], info.rxd[2], info.rxd[3], info.rxd[4]);
@@ -6961,6 +7207,8 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 		mt = &sc->sc_txwi.mt_data[freed.msdu];
 		if (mt->mt_busy == 0)
 			continue;
+		mtk_join_tx_complete(&sc->sc_ic.ic_join_diag, mt->mt_join_attempt,
+		    mt->mt_join_kind, freed.status, freed.count, freed.raw);
 		if (mt->mt_eapol) {
 			/* status 0 = acked; count = transmissions */
 			MWX_DEV_LOG(sc, "eapol txfree msdu=%u stat=%u count=%u "
@@ -7700,13 +7948,14 @@ mt7921_mcu_sta_bip_update(struct mwx_softc *sc, struct ieee80211_key *k)
 	struct mbuf *m;
 	uint16_t tlvnum = 0;
 
-	if (sc->sc_gtk_kid >= 1 && sc->sc_gtk_kid <= 3)
+	if (sc->sc_gtk_kid >= 0 && sc->sc_gtk_kid <= 3)
 		gtk = &ic->ic_nw_keys[sc->sc_gtk_kid];
 	if (gtk == NULL || gtk->k_cipher != IEEE80211_CIPHER_CCMP ||
 	    !(gtk->k_flags & IEEE80211_KEY_GROUP) || gtk->k_len != 16 ||
 	    k->k_len != 16) {
 		MWX_DEV_LOG(sc, "IGTK id=%d kept in software: no group CCMP key\n",
 		    k->k_id);
+		if (ic->ic_join_diag.Active) ++ic->ic_join_diag.IGTKSoftware;
 		return 0;
 	}
 
@@ -7737,7 +7986,7 @@ mt7921_mcu_sta_bip_update(struct mwx_softc *sc, struct ieee80211_key *k)
 		return ENOBUFS;
 	MWX_DEV_LOG(sc, "IGTK id=%d add with GTK id=%d wcid=%u\n", k->k_id,
 	    gtk->k_id, mvif->vif_mn.wcid);
-	return mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	return mwx_join_key_command(sc, m);
 }
 
 int
@@ -7747,8 +7996,6 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	struct mwx_vif *mvif = &sc->sc_vif;
 	struct mwx_node *mn = (struct mwx_node *)ni;
 	struct mbuf *m;
-	int want_keymask = (MWX_NODE_FLAG_HAVE_PAIRWISE_KEY |
-	    MWX_NODE_FLAG_HAVE_GROUP_KEY);
 	int rv;
 	uint16_t tlvnum = 0, wcid = 0;
 	uint8_t muar_idx = 0;
@@ -7787,7 +8034,7 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	if (m == NULL)
 		return ENOBUFS;
 
-	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	rv = mwx_join_key_command(sc, m);
 	if (rv != 0)
 		return rv;
 	MWX_DEV_LOG(sc,
@@ -7800,20 +8047,6 @@ mt7921_mcu_sta_key_update(struct mwx_softc *sc, struct ieee80211_node *ni,
 	else
 		mn->flags |= MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
 
-	if ((mn->flags & want_keymask) == want_keymask) {
-		DPRINTF("marking port %s valid\n", ether_sprintf(ni->ni_macaddr));
-		MWX_DEV_LOG(sc,
-		    "key add complete port valid mac=%s node_flags=0x%x\n",
-		    ether_sprintf(ni->ni_macaddr), mn->flags);
-		/* MtkWireless: with PMF, robust management frames are
-		 * protected both ways from here on (net80211 never sets
-		 * RXMGMTPROT itself). */
-		if (ni->ni_flags & IEEE80211_NODE_MFP)
-			ni->ni_flags |= IEEE80211_NODE_TXMGMTPROT |
-			    IEEE80211_NODE_RXMGMTPROT;
-		ni->ni_port_valid = 1;
-		ieee80211_set_link_state(&sc->sc_ic, LINK_STATE_UP);
-	}
 
 	return 0;
 }
@@ -7851,7 +8084,7 @@ mt7921_mcu_sta_key_delete(struct mwx_softc *sc, struct ieee80211_node *ni,
 			sc->sc_gtk_kid = 0;
 	} else {
 		wcid = mn->wcid;
-		mn->flags &= ~MWX_NODE_FLAG_HAVE_PAIRWISE_KEY;
+		mn->flags &= ~(MWX_NODE_FLAG_HAVE_PAIRWISE_KEY | MWX_NODE_FLAG_KEY_FAILED);
 	}
 
 	m = mwx_alloc_sta_req_tlv(sizeof(struct sta_req_hdr));
@@ -8653,23 +8886,32 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	uint8_t *he0;
+	uint32_t knobs = sc->sc_knobs;
+
+	/* MtkWireless: WCL hotspot compat level for this join only. */
+	if (ic->ic_wcl_compat_phy >= 1)
+		knobs |= MWX_KNOB_NO_HE;
+	if (ic->ic_wcl_compat_phy >= 2)
+		knobs |= MWX_KNOB_NO_VHT | MWX_KNOB_NO_40;
+	if (ic->ic_wcl_compat_phy >= 3)
+		knobs |= MWX_KNOB_NO_HT;
 
 	ic->ic_flags &= ~(IEEE80211_F_HTON | IEEE80211_F_VHTON |
 	    IEEE80211_F_HEON);
 	ic->ic_htcaps |= IEEE80211_HTCAP_CBW20_40 | IEEE80211_HTCAP_SGI40;
-	if (sc->sc_knobs & MWX_KNOB_NO_40)
+	if (knobs & MWX_KNOB_NO_40)
 		ic->ic_htcaps &= ~(IEEE80211_HTCAP_CBW20_40 |
 		    IEEE80211_HTCAP_SGI40);
 
-	if ((sc->sc_knobs & MWX_KNOB_NO_HT) == 0 &&
+	if ((knobs & MWX_KNOB_NO_HT) == 0 &&
 	    (ic->ic_modecaps & (1 << IEEE80211_MODE_11N))) {
 		ic->ic_flags |= IEEE80211_F_HTON;
 		/* VHT requires 80 MHz support, so NO_40 disables it too. */
-		if ((sc->sc_knobs & (MWX_KNOB_NO_VHT | MWX_KNOB_NO_40)) == 0 &&
+		if ((knobs & (MWX_KNOB_NO_VHT | MWX_KNOB_NO_40)) == 0 &&
 		    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AC)))
 			ic->ic_flags |= IEEE80211_F_VHTON;
 		/* net80211 adds the HE Capabilities element when HEON. */
-		if ((sc->sc_knobs & MWX_KNOB_NO_HE) == 0 &&
+		if ((knobs & MWX_KNOB_NO_HE) == 0 &&
 		    (ic->ic_caps & IEEE80211_C_HE) &&
 		    (ic->ic_modecaps & (1 << IEEE80211_MODE_11AX)))
 			ic->ic_flags |= IEEE80211_F_HEON;
@@ -8678,7 +8920,7 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 	*he0 &= ~(IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G |
 	    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G);
 	if ((ic->ic_flags & IEEE80211_F_HEON) &&
-	    (sc->sc_knobs & MWX_KNOB_NO_40) == 0) {
+	    (knobs & MWX_KNOB_NO_40) == 0) {
 		if (sc->sc_capa.has_2ghz)
 			*he0 |= IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_IN_2G;
 		/* B1 covers 40 and 80 MHz in the 5 and 6 GHz bands. */
@@ -8687,7 +8929,7 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 			    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_40MHZ_80MHZ_IN_5G;
 	}
 	MWX_DEV_LOG(sc, "phy knobs 0x%x: ht=%d vht=%d he=%d htcaps=0x%04x modecaps=0x%x\n",
-	    sc->sc_knobs, (ic->ic_flags & IEEE80211_F_HTON) != 0,
+	    knobs, (ic->ic_flags & IEEE80211_F_HTON) != 0,
 	    (ic->ic_flags & IEEE80211_F_VHTON) != 0,
 	    (ic->ic_flags & IEEE80211_F_HEON) != 0, ic->ic_htcaps,
 	    ic->ic_modecaps);
@@ -9147,7 +9389,10 @@ static bool mwx_awdl_infra_joining(mwx_softc *sc)
     ieee80211com *ic = &sc->sc_ic;
     if (ic->ic_opmode != IEEE80211_M_STA)
         return false;
-    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC ||
+        sc->sc_ns_state == IEEE80211_S_AUTH || sc->sc_ns_state == IEEE80211_S_ASSOC)
+        return true;
+    if (sc->sc_ns_state == IEEE80211_S_RUN && ic->ic_state != IEEE80211_S_RUN)
         return true;
     return ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
         (ic->ic_flags & IEEE80211_F_RSNON) && !ic->ic_bss->ni_port_valid;
@@ -9246,10 +9491,22 @@ void MtkMwx::awdlInfraSleep(uint8_t channel)
     uint8_t infra = awdlInfraChannel();
     if (!infra || channel == infra)
         return;
+    // MtkWireless: never doze during AUTH/ASSOC or before the RSN port is
+    // valid. The AP then buffers M1 for a PS station (only beacons and group
+    // data arrive) and the join stalls; awdlReserve refuses the ROC anyway.
+    // 1.0.19 Instant Hotspot: PS left on (Sleeps 30, Wakes 29), no M1.
+    if (mwx_awdl_infra_joining(com)) {
+        if (com->sc_ic.ic_join_diag.Active) ++com->sc_ic.ic_join_diag.InfraPSRefused;
+        return;
+    }
     if (mwx_awdl_infra_pm(com, true)) { ++com->sc_awdl_infra_ps_failed; return; }
     com->sc_awdl_infra_ps = true;
     com->sc_awdl_infra_ps_at = mwx_awdl_now();
     ++com->sc_awdl_infra_ps_sleeps;
+    if (com->sc_ic.ic_join_diag.Active) {
+        ++com->sc_ic.ic_join_diag.InfraPSSleeps;
+        com->sc_ic.ic_join_diag.InfraPSAtUS = mtk_join_now();
+    }
 }
 
 void MtkMwx::awdlInfraWakeIfIdle()
@@ -9266,12 +9523,17 @@ void MtkMwx::awdlInfraWakeIfIdle()
     // awdlReserve submits the ROC only 2ms after PM=1: do not wake before.
     bool away = now - com->sc_awdl_infra_ps_at < 10000 || (roc.channel != infra &&
         ((roc.pending && now < roc.deadline) || (roc.granted && now < roc.deadline + 1000)));
+    // MtkWireless: AWDL off cancels its ROC and timer; nobody would wake us
+    // later, so wake now. Also never stay dozing while a join is running.
+    if (!com->sc_awdl_enabled || com->sc_awdl_stopping || mwx_awdl_infra_joining(com))
+        away = false;
     IOLockUnlock(com->sc_awdl_lock);
     if (away)
         return;
     if (mwx_awdl_infra_pm(com, false)) { ++com->sc_awdl_infra_ps_failed; return; }
     com->sc_awdl_infra_ps = false;
     ++com->sc_awdl_infra_ps_wakes;
+    if (com->sc_ic.ic_join_diag.Active) ++com->sc_ic.ic_join_diag.InfraPSWakes;
 }
 
 bool MtkMwx::awdlChannelAllowed(uint8_t channel)
@@ -9556,7 +9818,11 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(!operation.valid()) { ++com->sc_awdl_roc_busy_blocked; return kIOReturnNotReady; }
     // MtkWireless: joining an AP owns the radio. AUTH/ASSOC frames and the
     // 4-way handshake are lost if AWDL takes it elsewhere meanwhile.
-    if(mwx_awdl_infra_joining(com)) { ++com->sc_awdl_roc_join_blocked; return kIOReturnNotReady; }
+    if(mwx_awdl_infra_joining(com)) {
+        ++com->sc_awdl_roc_join_blocked;
+        if(com->sc_ic.ic_join_diag.Active) ++com->sc_ic.ic_join_diag.ROCRefused;
+        return kIOReturnNotReady;
+    }
     // MtkWireless: a real scan owns the radio until SCAN_DONE/watchdog.
     // Associated unsolicited scans are suspended before submission; an
     // explicit WCL scan must complete too, or the network list stays empty.

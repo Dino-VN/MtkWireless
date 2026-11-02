@@ -146,21 +146,23 @@ ieee80211_eapol_key_input(struct ieee80211com *ic, mbuf_t m,
     
     info = BE_READ_2(key->info);
     
+    mtk_join_eapol(&ic->ic_join_diag, false, info, paylen,
+        ic->ic_state, ni->ni_rsn_supp_state);
     /* discard EAPOL-Key frames with an unknown descriptor version */
     desc = info & EAPOL_KEY_VERSION_MASK;
     if (ieee80211_is_sae_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
         /* MtkWireless: SAE uses the AKM-defined version 0. */
         if (desc != EAPOL_KEY_DESC_V0)
-            goto done;
+            { if (ic->ic_join_diag.Active) { ++ic->ic_join_diag.EapolDescriptorRejected; ic->ic_join_diag.EapolRejectedDescriptor = desc; } goto done; }
     } else if (desc < EAPOL_KEY_DESC_V1 || desc > EAPOL_KEY_DESC_V3)
-        goto done;
+        { if (ic->ic_join_diag.Active) { ++ic->ic_join_diag.EapolDescriptorRejected; ic->ic_join_diag.EapolRejectedDescriptor = desc; } goto done; }
     else if (ieee80211_is_sha256_akm((enum ieee80211_akm)ni->ni_rsnakms)) {
         if (desc != EAPOL_KEY_DESC_V3)
-            goto done;
+            { if (ic->ic_join_diag.Active) { ++ic->ic_join_diag.EapolDescriptorRejected; ic->ic_join_diag.EapolRejectedDescriptor = desc; } goto done; }
     } else if (ni->ni_rsncipher == IEEE80211_CIPHER_CCMP ||
                ni->ni_rsngroupcipher == IEEE80211_CIPHER_CCMP) {
         if (desc != EAPOL_KEY_DESC_V2)
-            goto done;
+            { if (ic->ic_join_diag.Active) { ++ic->ic_join_diag.EapolDescriptorRejected; ic->ic_join_diag.EapolRejectedDescriptor = desc; } goto done; }
     }
     
     /* make sure the key data field is contiguous */
@@ -236,6 +238,7 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     if (ni->ni_replaycnt_ok &&
         BE_READ_8(key->replaycnt) <= ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     
@@ -288,6 +291,7 @@ ieee80211_recv_4way_msg1(struct ieee80211com *ic,
     /* generate supplicant's nonce (SNonce) */
     arc4random_buf(ic->ic_nonce, EAPOL_KEY_NONCE_LEN);
     
+    if (ic->ic_join_diag.Active) memcpy(ic->ic_join_diag.PTKMAC, ic->ic_myaddr, 6);
     /* TPTK = CalcPTK(PMK, ANonce, SNonce) */
     ieee80211_derive_ptk((enum ieee80211_akm)ni->ni_rsnakms, ni->ni_pmk, ni->ni_macaddr,
                          ic->ic_myaddr, ni->ni_nonce, ic->ic_nonce, &tptk);
@@ -338,6 +342,7 @@ ieee80211_recv_4way_msg2(struct ieee80211com *ic,
     if (ieee80211_eapol_key_check_mic(key, tptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;    /* will timeout.. */
     }
     
@@ -405,24 +410,29 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         ic->ic_opmode != IEEE80211_M_IBSS)
         return;
 #endif
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 1;
     /* discard if we're not expecting this message */
     if (ni->ni_rsn_supp_state != RSNA_SUPP_PTKNEGOTIATING &&
         ni->ni_rsn_supp_state != RNSA_SUPP_PTKDONE) {
         DPRINTF(("unexpected in state: %d\n", ni->ni_rsn_supp_state));
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 2;
     /* enforce monotonicity of key request replay counter */
     if (ni->ni_replaycnt_ok &&
         BE_READ_8(key->replaycnt) <= ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 3;
     /* make sure that a PMK has been selected */
     if (!(ni->ni_flags & IEEE80211_NODE_PMK)) {
         DPRINTF(("no PMK found for %s\n",
                  ether_sprintf(ni->ni_macaddr)));
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 4;
     /* check that ANonce matches that of Message 1 */
     if (memcmp(key->nonce, ni->ni_nonce, EAPOL_KEY_NONCE_LEN) != 0) {
         DPRINTF(("ANonce does not match msg 1/4\n"));
@@ -434,15 +444,18 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
     
     info = BE_READ_2(key->info);
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 5;
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, tptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;
     }
     /* install TPTK as PTK now that MIC is verified */
     memcpy(&ni->ni_ptk, &tptk, sizeof(tptk));
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 6;
     /* if encrypted, decrypt Key Data field using KEK */
     if ((info & EAPOL_KEY_ENCRYPTED) &&
         ieee80211_eapol_key_decrypt(key, ni->ni_ptk.kek) != 0) {
@@ -500,21 +513,26 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         }
         frm += 2 + frm[1];
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 7;
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3KDEs = (rsnie1 ? 1 : 0) | (gtk ? 2 : 0) | (igtk ? 4 : 0);
     /* first WPA/RSN IE is mandatory */
     if (rsnie1 == NULL) {
         DPRINTF(("missing RSN IE\n"));
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 8;
     /* key data must be encrypted if GTK is included */
     if (gtk != NULL && !(info & EAPOL_KEY_ENCRYPTED)) {
         DPRINTF(("GTK not encrypted\n"));
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 9;
     /* GTK KDE must be included if IGTK KDE is present */
     if (igtk != NULL && gtk == NULL) {
         DPRINTF(("IGTK KDE found but GTK KDE missing\n"));
         return;
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 10;
     /* check that the Install bit is set if using pairwise keys */
     if (ni->ni_rsncipher != IEEE80211_CIPHER_USEGROUP &&
         !(info & EAPOL_KEY_INSTALL)) {
@@ -522,6 +540,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         return;
     }
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 11;
     /*
      * Check that first WPA/RSN IE is identical to the one received in
      * the beacon or probe response frame.
@@ -562,10 +581,12 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
               ic->ic_if.if_xname, 3, 4, "4-way",
               ether_sprintf(ni->ni_macaddr));
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 12;
     /* send message 4 to authenticator */
     if (ieee80211_send_4way_msg4(ic, ni) != 0)
         return;    /* ..authenticator will retry */
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 13;
     /*
      * Only install a new pairwise key if we are still expecting a new key,
      * as indicated by the NODE_RSN_NEW_PTK flag. An adversary could be
@@ -614,6 +635,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
         XYLog("%s: unexpected pairwise key update received from %s\n",
               ic->ic_if.if_xname, ether_sprintf(ni->ni_macaddr));
     
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 14;
     if (gtk != NULL) {
         u_int8_t kid;
         
@@ -651,6 +673,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             }
         }
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 15;
     if (igtk != NULL) {    /* implies MFP && gtk != NULL */
         u_int16_t kid;
         
@@ -692,6 +715,7 @@ ieee80211_recv_4way_msg3(struct ieee80211com *ic,
             }
         }
     }
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.M3Reject = 0;
     if (info & EAPOL_KEY_INSTALL)
         ni->ni_flags |= IEEE80211_NODE_TXRXPROT;
     
@@ -746,6 +770,7 @@ ieee80211_recv_4way_msg4(struct ieee80211com *ic,
     if (ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;    /* will timeout.. */
     }
     
@@ -808,6 +833,7 @@ ieee80211_recv_4way_msg2or4(struct ieee80211com *ic,
     
     if (BE_READ_8(key->replaycnt) != ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     
@@ -870,12 +896,14 @@ ieee80211_recv_rsn_group_msg1(struct ieee80211com *ic,
     /* enforce monotonicity of key request replay counter */
     if (BE_READ_8(key->replaycnt) <= ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;
     }
     info = BE_READ_2(key->info);
@@ -1041,12 +1069,14 @@ ieee80211_recv_wpa_group_msg1(struct ieee80211com *ic,
     /* enforce monotonicity of key request replay counter */
     if (BE_READ_8(key->replaycnt) <= ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;
     }
     /*
@@ -1142,12 +1172,14 @@ ieee80211_recv_group_msg2(struct ieee80211com *ic,
     /* enforce monotonicity of key request replay counter */
     if (BE_READ_8(key->replaycnt) != ni->ni_replaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     /* check Key MIC field using KCK */
     if (ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) {
         DPRINTF(("key MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;
     }
     
@@ -1198,6 +1230,7 @@ ieee80211_recv_eapol_key_req(struct ieee80211com *ic,
     if (ni->ni_reqreplaycnt_ok &&
         BE_READ_8(key->replaycnt) <= ni->ni_reqreplaycnt) {
         ic->ic_stats.is_rx_eapol_replay++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ReplayDrops;
         return;
     }
     info = BE_READ_2(key->info);
@@ -1206,6 +1239,7 @@ ieee80211_recv_eapol_key_req(struct ieee80211com *ic,
         ieee80211_eapol_key_check_mic(key, ni->ni_ptk.kck) != 0) {
         DPRINTF(("key request MIC failed\n"));
         ic->ic_stats.is_rx_eapol_badmic++;
+        if (ic->ic_join_diag.Active) ++ic->ic_join_diag.MICFailures;
         return;
     }
     /* update key request replay counter now that MIC is verified */

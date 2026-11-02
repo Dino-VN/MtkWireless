@@ -6,6 +6,7 @@ use core::fmt;
 
 use mtk_bt::hci;
 use mtk_bt::le_features::{self, LeFeatures, Reply};
+use mtk_bt::le_ready::Diagnostics;
 use mtk_bt::setup::{self, IoError, Transport};
 use mtk_kernel::klog;
 
@@ -286,6 +287,80 @@ struct LeState(UnsafeCell<LeFeatures>);
 unsafe impl Sync for LeState {}
 
 static LE: LeState = LeState(UnsafeCell::new(LeFeatures::new()));
+
+struct LeReadyState(UnsafeCell<Diagnostics>);
+// SAFETY: the same C++ LE lock serializes all diagnostic calls.
+unsafe impl Sync for LeReadyState {}
+static LE_READY: LeReadyState = LeReadyState(UnsafeCell::new(Diagnostics::new()));
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mtk_bt_le_ready_candidate_request(
+    bm: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+) -> bool {
+    bm & 0xe0 == 0x20
+        && bm & 0x1f <= 1
+        && request == 0
+        && value == 0
+        && index == 0
+        && matches!(length, 5 | 9 | 10 | 11)
+}
+
+/// # Safety
+/// Caller holds the LE lock; command points to len writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_ready_command(
+    id: u64,
+    command: *mut u8,
+    len: usize,
+    fix: bool,
+) -> u32 {
+    unsafe {
+        (&mut *LE_READY.0.get())
+            .command(id, bytes_mut(command, len), fix)
+            .unwrap_or(0)
+    }
+}
+
+/// # Safety
+/// Caller holds the LE lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_ready_mask_written(ok: bool) {
+    unsafe { (&mut *LE_READY.0.get()).mask_written(ok) }
+}
+
+/// # Safety
+/// Caller holds the LE lock.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_ready_usb_status(command: u32, status: u32) {
+    unsafe { (&mut *LE_READY.0.get()).usb_status(command, status) }
+}
+
+/// # Safety
+/// Caller holds the LE lock; events points to len readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_ready_events(id: u64, events: *const u8, len: usize) -> bool {
+    let d = unsafe { &mut *LE_READY.0.get() };
+    match d.events(id, unsafe { bytes(events, len) }) {
+        Ok(changed) => changed,
+        Err(_) => {
+            d.malformed = d.malformed.wrapping_add(1);
+            true
+        }
+    }
+}
+
+/// # Safety
+/// Caller holds the LE lock; out points to a writable Diagnostics struct.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_ready_snapshot(out: *mut Diagnostics) {
+    if !out.is_null() {
+        unsafe { out.write(*LE_READY.0.get()) }
+    }
+}
 
 unsafe fn le() -> &'static mut LeFeatures {
     unsafe { &mut *LE.0.get() }

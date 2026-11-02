@@ -1641,6 +1641,17 @@ ieee80211_choose_rsnparams(struct ieee80211com *ic)
     struct ieee80211_node *ni = ic->ic_bss;
     struct ieee80211_pmk *pmk;
     
+    if (ic->ic_join_diag.Active) {
+        struct mtk_join_diag *d = &ic->ic_join_diag;
+        d->APProtos = ni->ni_rsnprotos; d->APAKMs = ni->ni_rsnakms;
+        d->APCiphers = ni->ni_rsnciphers; d->APGroupCipher = ni->ni_rsngroupcipher;
+        d->APGroupMgmtCipher = ni->ni_rsngroupmgmtcipher; d->APRSNCaps = ni->ni_rsncaps;
+        memcpy(d->BSSID, ni->ni_bssid, 6);
+        if (ni->ni_rsnie) {
+            d->APRSNLength = 2 + ni->ni_rsnie[1];
+            memcpy(d->APRSN, ni->ni_rsnie, d->APRSNLength);
+        }
+    }
     /* filter out unsupported protocol versions */
     ni->ni_rsnprotos &= ic->ic_rsnprotos;
     /* prefer RSN (aka WPA2) over WPA */

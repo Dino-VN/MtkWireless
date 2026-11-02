@@ -48,6 +48,7 @@ struct Hal{
  bool on=false;unsigned calls=0,status=0,inFlight=0;std::vector<bool> history;
  mtkawdl::Reservation grant{};
  bool awdlGrantSnapshot(mtkawdl::Reservation &out){out=grant;return on;}
+ void awdlInfraWakeIfIdle(){}
  std::function<void()> wait;
  IOReturn awdlEnable(const uint8_t*,bool value){assert(!inFlight++);++calls;history.push_back(value);if(wait)wait();--inFlight;if(!status)on=value;return status;}
 };

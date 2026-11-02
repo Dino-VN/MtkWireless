@@ -1007,7 +1007,12 @@ u_int8_t *
 ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
     const struct ieee80211_node *ni, int wpa)
 {
-	const u_int8_t *oui = wpa ? MICROSOFT_OUI : IEEE80211_OUI;
+    /* MtkWireless: the OUI macros are C compound literals, compiled as
+     * C++ temporaries here. A pointer chosen by ?: outlives their full
+     * expression (ASan stack-use-after-scope). Keep selector bytes alive. */
+    static const u_int8_t rsn_oui[3] = { 0x00, 0x0f, 0xac };
+    static const u_int8_t wpa_oui[3] = { 0x00, 0x50, 0xf2 };
+    const u_int8_t *oui = wpa ? wpa_oui : rsn_oui;
 	u_int8_t *pcount;
     u_int16_t count, rsncaps;
 
@@ -1099,6 +1104,7 @@ ieee80211_add_rsn_body(u_int8_t *frm, struct ieee80211com *ic,
     }
     if (ic->ic_flags & IEEE80211_F_PBAR)
         rsncaps |= IEEE80211_RSNCAP_PBAC;
+    if (ic->ic_join_diag.Active) ic->ic_join_diag.AssocRSNCaps = rsncaps;
     LE_WRITE_2(frm, rsncaps); frm += 2;
 
     if (ni->ni_flags & IEEE80211_NODE_PMKID) {
@@ -1581,6 +1587,22 @@ ieee80211_get_deauth(struct ieee80211com *ic, struct ieee80211_node *ni,
  * [tlv] QoS Capability (802.11e)
  * [tlv] HT Capabilities (802.11n)
  */
+/* dd 0b 00:17:f2 <subtype> 00 01 04 <flag> 00 00 00: IO80211Family
+ * getVendorSpeificIes / AppleBCMWLANCore::setVendorIE wire form. */
+#define IEEE80211_APPLE_IE_LEN 13
+static u_int8_t *
+ieee80211_add_apple_ie(u_int8_t *frm, u_int8_t subtype, u_int8_t flag)
+{
+	*frm++ = IEEE80211_ELEMID_VENDOR;
+	*frm++ = IEEE80211_APPLE_IE_LEN - 2;
+	*frm++ = 0x00; *frm++ = 0x17; *frm++ = 0xf2;
+	*frm++ = subtype;
+	*frm++ = 0x00; *frm++ = 0x01; *frm++ = 0x04;
+	*frm++ = flag;
+	*frm++ = 0; *frm++ = 0; *frm++ = 0;
+	return frm;
+}
+
 mbuf_t
 ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
     int type)
@@ -1607,7 +1629,8 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		2 + IEEE80211_WPAIE_MAXLEN : 0) +
 	    ((ic->ic_flags & IEEE80211_F_HTON) ? sizeof(struct ieee80211_ie_htcap) + sizeof(struct ieee80211_wme_info) : 0) +
         ((ic->ic_flags & IEEE80211_F_VHTON) ? sizeof(struct ieee80211_ie_vhtcap) + 2 : 0) +
-        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN + 2 + 1 + 2) : 0));
+        ((ic->ic_flags & IEEE80211_F_HEON) ? (sizeof(struct ieee80211_he_cap_elem) + 2 + 1 + sizeof(struct ieee80211_he_mcs_nss_supp) + IEEE80211_HE_PPE_THRES_MAX_LEN + 2 + 1 + 2) : 0) +
+        2 * IEEE80211_APPLE_IE_LEN);
 	if (m == NULL)
 		return NULL;
 
@@ -1639,10 +1662,23 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 		}
 		else
 #endif
-		frm = ieee80211_add_rsn(frm, ic, ni);
-	}
-	if (ni->ni_flags & IEEE80211_NODE_QOS)
-		frm = ieee80211_add_qos_capability(frm, ic);
+        {
+            u_int8_t *start = frm;
+            frm = ieee80211_add_rsn(frm, ic, ni);
+            if (ic->ic_join_diag.Active) {
+                auto &d = ic->ic_join_diag;
+                d.AssocRSNLength = frm - start;
+                memcpy(d.AssocRSN, start, d.AssocRSNLength);
+                d.AssocAKMs = ni->ni_rsnakms; d.AssocCipher = ni->ni_rsncipher;
+                d.AssocGroupCipher = ni->ni_rsngroupcipher;
+                d.AssocGroupMgmtCipher = ic->ic_rsngroupmgmtcipher;
+                d.PMF = !!(ni->ni_flags & IEEE80211_NODE_MFP);
+                memcpy(d.AssocMAC, ic->ic_myaddr, 6);
+            }
+        }
+    }
+	/* MtkWireless: no QoS Capability element (46) in the request: like
+	 * Linux mac80211, QoS is signalled by the WMM element alone. */
 	if ((ic->ic_flags & IEEE80211_F_RSNON) &&
 		(ni->ni_rsnprotos & IEEE80211_PROTO_WPA)) {
 #ifdef USE_APPLE_SUPPLICANT
@@ -1659,7 +1695,6 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
 	if (ic->ic_flags & IEEE80211_F_HTON) {
 		if (!IEEE80211_IS_CHAN_6GHZ(ni->ni_chan))
 			frm = ieee80211_add_htcaps(frm, ic);
-		frm = ieee80211_add_wme_info(frm, ic);
 	}
     
     if ((ic->ic_flags & IEEE80211_F_VHTON) &&
@@ -1675,6 +1710,17 @@ ieee80211_get_assoc_req(struct ieee80211com *ic, struct ieee80211_node *ni,
             LE_WRITE_2(frm, ic->ic_he_6ghz_capa); frm += 2;
         }
     }
+    /* MtkWireless: vendor elements (WMM) go last, after HT/VHT/HE, in
+     * element-ID order as mac80211 sends them. With HT off (legacy
+     * compat) the iPhone hotspot worked; WMM sat between HT and VHT. */
+    if (ic->ic_flags & IEEE80211_F_HTON)
+        frm = ieee80211_add_wme_info(frm, ic);
+    /* MtkWireless: Apple device IE (0x0a) and, for an Instant Hotspot join,
+     * the hotspot IE (0x0b), byte for byte as a native Mac sends them. */
+    if (ic->ic_wcl_apple_ie & 1)
+        frm = ieee80211_add_apple_ie(frm, 0x0a, 0);
+    if (ic->ic_wcl_apple_ie & 2)
+        frm = ieee80211_add_apple_ie(frm, 0x0b, ic->ic_wcl_hotspot_flag);
 
     size_t l = frm - mtod(m, u_int8_t *);
     mbuf_pkthdr_setlen(m, l);
@@ -2051,8 +2097,11 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 			senderr(ENOMEM, is_tx_nombuf);
 		break;
 #endif
-	case IEEE80211_FC0_SUBTYPE_AUTH:
-		m = ieee80211_get_auth(ic, ni, arg1 >> 16, arg1 & 0xffff);
+    case IEEE80211_FC0_SUBTYPE_AUTH:
+        if (ic->ic_join_diag.Active) {
+            ++ic->ic_join_diag.AuthTxCount; ic->ic_join_diag.AuthTxAtUS = mtk_join_now();
+        }
+        m = ieee80211_get_auth(ic, ni, arg1 >> 16, arg1 & 0xffff);
 		if (m == NULL)
 			senderr(ENOMEM, is_tx_nombuf);
 
@@ -2060,8 +2109,12 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 			timer = IEEE80211_TRANS_WAIT;
 		break;
 
-	case IEEE80211_FC0_SUBTYPE_DEAUTH:
-		if ((m = ieee80211_get_deauth(ic, ni, arg1)) == NULL)
+    case IEEE80211_FC0_SUBTYPE_DEAUTH:
+        if (ic->ic_join_diag.Active) {
+            ic->ic_join_diag.DeauthTxReason = arg1;
+            ic->ic_join_diag.DeauthTxAtUS = mtk_join_now();
+        }
+        if ((m = ieee80211_get_deauth(ic, ni, arg1)) == NULL)
 			senderr(ENOMEM, is_tx_nombuf);
 #ifndef IEEE80211_STA_ONLY
 		if ((ifp->if_flags & IFF_DEBUG) &&
@@ -2074,8 +2127,11 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		break;
 
 	case IEEE80211_FC0_SUBTYPE_ASSOC_REQ:
-	case IEEE80211_FC0_SUBTYPE_REASSOC_REQ:
-		if ((m = ieee80211_get_assoc_req(ic, ni, type)) == NULL)
+    case IEEE80211_FC0_SUBTYPE_REASSOC_REQ:
+        if (ic->ic_join_diag.Active) {
+            ++ic->ic_join_diag.AssocTxCount; ic->ic_join_diag.AssocTxAtUS = mtk_join_now();
+        }
+        if ((m = ieee80211_get_assoc_req(ic, ni, type)) == NULL)
 			senderr(ENOMEM, is_tx_nombuf);
 
 		timer = IEEE80211_TRANS_WAIT;
@@ -2087,8 +2143,12 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 			senderr(ENOMEM, is_tx_nombuf);
 		break;
 #endif
-	case IEEE80211_FC0_SUBTYPE_DISASSOC:
-		if ((m = ieee80211_get_disassoc(ic, ni, arg1)) == NULL)
+    case IEEE80211_FC0_SUBTYPE_DISASSOC:
+        if (ic->ic_join_diag.Active) {
+            ic->ic_join_diag.DisassocTxReason = arg1;
+            ic->ic_join_diag.DisassocTxAtUS = mtk_join_now();
+        }
+        if ((m = ieee80211_get_disassoc(ic, ni, arg1)) == NULL)
 			senderr(ENOMEM, is_tx_nombuf);
 #ifndef IEEE80211_STA_ONLY
 		if ((ifp->if_flags & IFF_DEBUG) &&

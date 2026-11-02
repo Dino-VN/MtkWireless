@@ -14,6 +14,9 @@ header = (vendor / 'include/Airport/apple80211_var.h').read_text()
 start = header.index('enum apple80211_card_capability\n')
 enum = header[start:header.index('\n};', start) + 3]
 hal = (vendor / 'SimpleMtkWlan/hal_mwx/MtkMwx.cpp').read_text()
+wcl = (vendor / 'AirportMtkWlan/WCL/WCL.cpp').read_text()
+start = wcl.index('    joinBssidSpecified = AirportWCL::validUnicastAddress(join.bssid);')
+join_bssid = wcl[start:wcl.index('    // Same-ESS roaming', start)]
 start = hal.index('\t/* MtkWireless: WCL lists carry Instant Hotspot')
 firmware_targets = hal[start:hal.index('\n\tfor (nchan', start)]
 code = r'''
@@ -48,14 +51,26 @@ struct AirportMtkWlan {Hal hal;Hal*fHalService=&hal;bool awdlExperimental=false;
 #define htole32(x) (x)
 #define IEEE80211_NWID_LEN 32
 struct ScanIc {bool ic_wcl_scan_requested=true,ic_wcl_scan_active=true;
+    bool ic_wcl_join_requested=false;
+    unsigned ic_des_esslen=0;uint8_t ic_des_essid[32]{};
     unsigned ic_wcl_scan_ssid_length=0;uint8_t ic_wcl_scan_ssid[32]{};
-    mtk_wlan_scan_ssids ic_wcl_scan_targets{};};
+    mtk_wlan_scan_ssids ic_wcl_scan_targets{};
+    uint16_t ic_wcl_join_chan=0;struct {unsigned ic_flags=0;} ic_channels[256];};
+#define IEEE80211_CHAN_MAX 255
 struct FwSsid {uint32_t ssid_len=0;uint8_t ssid[32]{};};
 struct FwScan {FwSsid ssids[4],ext_ssids[6];unsigned scan_type=0,probe_req_num=0,
     ssid_type=0,ssid_type_ext=0,ssids_num=0,ext_ssids_num=0;};
 void encodeTargets(ScanIc*ic,FwScan*req){unsigned i,n_ssids=0;
 ''' + firmware_targets + r'''
 }
+#define IEEE80211_F_DESBSSID 1
+struct BssidIc {uint8_t ic_des_bssid[6]{};unsigned ic_flags=0;};
+struct BssidBinding {bool joinBssidSpecified=false;uint8_t joinBSSID[6]{};
+    BssidIc controller;
+    void bind(AirportWCL::JoinRequest&join){auto ic=&controller;
+''' + join_bssid + r'''
+    }
+};
 
 int main(){
     AirportMtkWlan driver;
@@ -141,6 +156,35 @@ int main(){
     }
     ic.ic_wcl_scan_active=false;firmware={};encodeTargets(&ic,&firmware);
     assert(!firmware.ssids_num && !firmware.ext_ssids_num && !firmware.scan_type);
+    // A join has no separate WCL SCAN_REQ. Its first scan and retries must
+    // direct probes at the ESS even after the previous request is cleared.
+    ic.ic_wcl_scan_requested=false;ic.ic_wcl_join_requested=true;
+    ic.ic_wcl_scan_targets.wildcard=true; // stale list must not affect joins
+    for(unsigned length : {1u,4u,32u}){
+        ic.ic_des_esslen=length;memset(ic.ic_des_essid,'H',32);
+        firmware={};encodeTargets(&ic,&firmware);
+        assert(firmware.ssids_num==1 && !firmware.ext_ssids_num);
+        assert(firmware.ssids[0].ssid_len==length);
+        assert(!memcmp(firmware.ssids[0].ssid,ic.ic_des_essid,length));
+        assert(firmware.scan_type==1 && firmware.probe_req_num==2);
+        assert(firmware.ssid_type==4 && firmware.ssid_type_ext==1);
+    }
+    // An explicit passive/list scan keeps priority over a pending join.
+    ic.ic_wcl_scan_requested=true;firmware={};encodeTargets(&ic,&firmware);
+    assert(!firmware.ssids_num && !firmware.scan_type);
+    ic.ic_wcl_scan_active=true;ic.ic_wcl_scan_targets={};
+    ic.ic_wcl_scan_targets.count=1;ic.ic_wcl_scan_targets.lengths[0]=4;
+    memcpy(ic.ic_wcl_scan_targets.ssids[0],"List",4);
+    firmware={};encodeTargets(&ic,&firmware);
+    assert(firmware.ssids_num==1 && !memcmp(firmware.ssids[0].ssid,"List",4));
+    ic.ic_wcl_scan_requested=false;
+    for(unsigned length : {0u,33u}){
+        ic.ic_des_esslen=length;firmware={};encodeTargets(&ic,&firmware);
+        assert(!firmware.ssids_num && !firmware.scan_type);
+    }
+    ic.ic_des_esslen=4;ic.ic_wcl_join_requested=false;
+    firmware={};encodeTargets(&ic,&firmware);
+    assert(!firmware.ssids_num && !firmware.scan_type);
     mtk_wlan_scan_ssids invalid{};invalid.count=7;
     assert(mtk_wlan_scan_ssids_parse(nullptr,1,&invalid)==22 && invalid.count==0);
     assert(mtk_wlan_scan_ssids_parse(modern,sizeof(modern),nullptr)==22);
@@ -158,6 +202,24 @@ int main(){
     assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
     assert(jr.keyLength==pwlen && memcmp(jr.key,pw,pwlen)==0);
     assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Sae);
+    // Candidate flags at +0x1e0: 2 Instant Hotspot, 4 auto Instant Hotspot
+    // map to the Apple IE 0x0b flag like Broadcom's performJoin (2 / 1).
+    assert(jr.assocFlags==0 && AirportWCL::instantHotspotFlag(jr.assocFlags)==0);
+    join[0x1e0]=2|8;assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(jr.assocFlags==10 && AirportWCL::instantHotspotFlag(jr.assocFlags)==2);
+    join[0x1e0]=4;assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::instantHotspotFlag(jr.assocFlags)==1);
+    join[0x1e0]=6;assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    assert(AirportWCL::instantHotspotFlag(jr.assocFlags)==3);
+    join[0x1e0]=0;
+    // Instant Hotspot/Family Sharing can leave candidate BSSID selection to
+    // the directed SSID/channel result. The WCL request uses an all-zero
+    // BSSID for that wildcard; multicast addresses remain invalid.
+    memset(join+0x21c,0,6);
+    assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
+    memset(join+0x21c,0xff,6);
+    assert(!AirportWCL::decodeJoin(join,sizeof(join),jr));
+    memset(join+0x21c,0,6);join[0x21c]=2;
     j32(0x14,AirportWCL::AuthSAE|(1u<<3));   // transition: SAE + WPA2-PSK
     assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
     assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Sae);
@@ -173,6 +235,16 @@ int main(){
     j32(0x44,32);j32(0x48,6);                // a PMK cannot start SAE
     assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
     assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Invalid);
+    // Leaving an existing network clears the previous BSSID flag. Bind the
+    // next candidate after teardown so explicit joins retain their BSSID.
+    BssidBinding binding;memcpy(jr.bssid,"\x02\x11\x22\x33\x44\x55",6);
+    binding.bind(jr);
+    assert(binding.joinBssidSpecified && (binding.controller.ic_flags&IEEE80211_F_DESBSSID));
+    assert(!memcmp(binding.joinBSSID,jr.bssid,6));
+    assert(!memcmp(binding.controller.ic_des_bssid,jr.bssid,6));
+    memset(jr.bssid,0,6);binding.bind(jr);
+    assert(!binding.joinBssidSpecified && !(binding.controller.ic_flags&IEEE80211_F_DESBSSID));
+    assert(!memcmp(binding.joinBSSID,jr.bssid,6));
     j32(0x14,AirportWCL::AuthSAE|(1u<<3));   // ...but joins the PSK side
     assert(AirportWCL::decodeJoin(join,sizeof(join),jr));
     assert(AirportWCL::classifyLegacyAuth(jr)==AirportWCL::LegacyAuth::Personal);

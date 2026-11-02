@@ -93,6 +93,15 @@ bool AirportMtkSkywalkInterface::initWCL()
     uint32_t roam = 1;
     PE_parse_boot_argn("amtk_roam", &roam, sizeof(roam));
     wclRoamingEnabled = roam != 0;
+    uint32_t compat = 1;
+    PE_parse_boot_argn("amtk_hotspot_compat", &compat, sizeof(compat));
+    joinCompatEnabled = compat != 0;
+    uint32_t hotspotLevel = 3;
+    PE_parse_boot_argn("amtk_hotspot_level", &hotspotLevel, sizeof(hotspotLevel));
+    joinHotspotLevel = uint8_t(hotspotLevel > 3 ? 3 : hotspotLevel);
+    uint32_t appleIE = 3;
+    PE_parse_boot_argn("amtk_apple_ie", &appleIE, sizeof(appleIE));
+    appleIEMask = uint8_t(appleIE & 3);
     joinTimer = IOTimerEventSource::timerEventSource(this, wclJoinTimeout);
     roamTimer = IOTimerEventSource::timerEventSource(this, wclRoamTimeout);
     if (!joinTimer || !roamTimer)
@@ -139,6 +148,7 @@ IOReturn AirportMtkSkywalkInterface::stopWCLGated(
     OSObject *, void *arg, void *, void *, void *)
 {
     auto self = static_cast<AirportMtkSkywalkInterface *>(arg);
+    self->instance->setEAPOLTransport(false);
     self->portAuthorized = false;
     self->updateWCLLinkQuality(true);
     self->wclStopping = true;
@@ -177,7 +187,7 @@ IOReturn AirportMtkSkywalkInterface::updateWCLLinkQualityGated(
     if (self->portAuthorized && self->linkState() == kIO80211NetworkLinkUp &&
         (ifnet_flags(interface) & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING) &&
         ic && ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
-        IEEE80211_ADDR_EQ(ic->ic_bss->ni_bssid, self->joinBSSID)) {
+        self->joinBssidMatches(ic->ic_bss->ni_bssid)) {
         int rssi = MTK_MIN_DBM + ic->ic_bss->ni_rssi;
         quality = rssi >= -70 ? 100 : (rssi >= -85 ? 50 : 20);
     }
@@ -293,6 +303,12 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
     ieee80211com *ic = fHalService->get80211Controller();
     if (!(ic->ic_if.if_flags & IFF_RUNNING))
         return kIOReturnNotReady;
+    // MtkWireless: F_BGSCAN is only meaningful in RUN. A leave during a
+    // RUN background scan left it set in SCAN, and every later WCL scan
+    // returned busy until reboot (2026-11-01 19:48, Wi-Fi dead).
+    if ((ic->ic_flags & IEEE80211_F_BGSCAN) && ic->ic_state != IEEE80211_S_RUN &&
+        !roamPending)
+        ic->ic_flags &= ~IEEE80211_F_BGSCAN;
     if (scanPending || joinPending || roamPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
@@ -402,7 +418,7 @@ void AirportMtkSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, co
             bzero(wclRoamBssInfo, sizeof(wclRoamBssInfo));
             memcpy(wclRoamBssInfo, metadata, messageSize);
         }
-    } else if (assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID)) {
+    } else if (assocNotified && joinBssidMatches(node->ni_bssid)) {
         wclBssValid = messageSize <= sizeof(wclBssInfo);
         if (wclBssValid) {
             bzero(wclBssInfo, sizeof(wclBssInfo));
@@ -411,6 +427,11 @@ void AirportMtkSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, co
     }
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
     IOFree(metadata, size);
+}
+
+bool AirportMtkSkywalkInterface::joinBssidMatches(const uint8_t *bssid) const
+{
+    return bssid && (!joinBssidSpecified || IEEE80211_ADDR_EQ(bssid, joinBSSID));
 }
 
 void AirportMtkSkywalkInterface::clearWCLPMKSA()
@@ -514,11 +535,30 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
             join.upperAuth, join.keyLength, join.keyCipher, join.rsnLength, ic->ic_state,
             ic->ic_if.if_flags, joinPending, scanPending, ic->ic_wcl_mac_reconfig,
             !!(ic->ic_flags & IEEE80211_F_BGSCAN));
+    if (supported && !joinPending && !ic->ic_wcl_mac_reconfig &&
+        (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC))
+        leaveWCLNetwork();
+    if (supported && !joinPending && !ic->ic_join_diag.Active) {
+        uint64_t attempt = ic->ic_join_diag.Attempt + 1;
+        bzero(&ic->ic_join_diag, sizeof(ic->ic_join_diag));
+        auto &d = ic->ic_join_diag;
+        d.Attempt = attempt; d.Active = 1; d.StartedAtUS = mtk_join_now();
+        d.AuthStatus = d.AssocStatus = 65535; d.KeyFirmwareStatus = UINT32_MAX;
+        d.LowerAuth = join.lowerAuth; d.UpperAuth = join.upperAuth;
+        d.KeyCipher = join.keyCipher; d.KeyLength = join.keyLength;
+        d.MacRequestedAtUS = ic->ic_wcl_mac_requested_at;
+        d.MacPlan = ic->ic_wcl_mac_plan;
+        memcpy(d.WCLMAC, ic->ic_wcl_requested_mac, 6);
+        memcpy(d.FirmwareMAC, ic->ic_firmware_mac, 6);
+        d.FirmwareMacAtUS = ic->ic_firmware_mac_at; d.FirmwareMacError = ic->ic_firmware_mac_error;
+        memcpy(d.BSSID, join.bssid, 6);
+    }
     // Applying a private MAC restarts firmware asynchronously. WCL can issue
     // the association before that restart has completed; keep one request
     // until the HAL reports READY rather than making the user retry it.
     if (supported && !joinPending && ic->ic_wcl_mac_reconfig &&
         (ic->ic_if.if_flags & IFF_UP)) {
+        ic->ic_join_diag.DeferredAtUS = mtk_join_now();
         deferredJoin = join;
         memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
         explicit_bzero(&join, sizeof(join));
@@ -540,8 +580,6 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
                 joinPending ? "join pending" : "scan pending");
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
-    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
-        leaveWCLNetwork();
     clearWCLRoam();
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
@@ -627,15 +665,41 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     }
     ic->ic_des_esslen = join.ssidLength;
     memcpy(ic->ic_des_essid, join.ssid, sizeof(ic->ic_des_essid));
-    memcpy(ic->ic_des_bssid, join.bssid, 6);
-    memcpy(joinBSSID, join.bssid, 6);
-    ic->ic_flags |= IEEE80211_F_DESBSSID;
+    joinBssidSpecified = AirportWCL::validUnicastAddress(join.bssid);
+    if (joinBssidSpecified) {
+        memcpy(ic->ic_des_bssid, join.bssid, 6);
+        memcpy(joinBSSID, join.bssid, 6);
+        ic->ic_flags |= IEEE80211_F_DESBSSID;
+    } else {
+        bzero(ic->ic_des_bssid, sizeof(ic->ic_des_bssid));
+        bzero(joinBSSID, sizeof(joinBSSID));
+        ic->ic_flags &= ~IEEE80211_F_DESBSSID;
+    }
     // Same-ESS roaming re-runs only the open or PSK handshake in net80211;
     // WEP and 802.1X (PMK keyed to the joined BSSID) keep the BSSID.
     ic->ic_wcl_roam = wclRoamingEnabled &&
         (auth == AirportWCL::LegacyAuth::Open || personal);
     ic->ic_wcl_join_requested = true;
     ic->ic_wcl_scan_requested = false;
+    // MtkWireless: a full scan before the join took ~5 s of airportd's 10 s
+    // join budget (Instant Hotspot, 2026-11-01). Probe the channel WCL
+    // chose first; mt7921_mcu_hw_scan falls back to every channel after.
+    {
+        unsigned index = AirportWCL::chanspecIndex(join.channelSpec);
+        ic->ic_wcl_join_chan = index && index <= IEEE80211_CHAN_MAX &&
+            ic->ic_channels[index].ic_flags ? uint16_t(index) : 0;
+    }
+    // MtkWireless: a native Mac's Association Request carries Apple IE 0x0a
+    // (airportd, Wi-Fi power-on) and, when WCL marks the candidate as an
+    // Instant Hotspot join, 0x0b (AppleBCMWLANJoinAdapter::performJoin).
+    // Ordinary joins drop the hotspot IE, as performJoin removes it.
+    {
+        uint8_t hotspot = AirportWCL::instantHotspotFlag(join.assocFlags);
+        ic->ic_wcl_hotspot_flag = hotspot;
+        ic->ic_wcl_apple_ie = uint8_t(appleIEMask & (hotspot ? 3 : 1));
+        ic->ic_join_diag.AppleJoinFlags = join.assocFlags;
+        ic->ic_join_diag.AppleIE = ic->ic_wcl_apple_ie | (uint64_t(hotspot) << 8);
+    }
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
     explicit_bzero(&join, sizeof(join));
@@ -646,6 +710,7 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
+    applyJoinCompat();
     if (ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         WCL_LOG("join rejected: newstate SCAN failed\n");
         joinPending = false;
@@ -660,10 +725,80 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     return kIOReturnSuccess;
 }
 
+void AirportMtkSkywalkInterface::noteJoinFailure(const mtk_join_diag &d)
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    if (!joinCompatEnabled || !mtk_join_eapol_stall(&d) ||
+        !ic->ic_des_esslen || ic->ic_des_esslen > sizeof(joinCompatSsid))
+        return;
+    bool same = joinCompatSsidLength == ic->ic_des_esslen &&
+        !memcmp(joinCompatSsid, ic->ic_des_essid, ic->ic_des_esslen);
+    if (!same) {
+        memcpy(joinCompatSsid, ic->ic_des_essid, ic->ic_des_esslen);
+        joinCompatSsidLength = uint8_t(ic->ic_des_esslen);
+        // Level 1 (HE/PMF off, HT/VHT on) never helped the iPhone hotspot
+        // (1.0.17-1.0.22); level 3 (legacy) worked. Start at HT20.
+        joinCompatLevel = 2;
+    } else if (joinCompatActive && joinCompatLevel < 3) {
+        // The compat join itself stalled: step down one more PHY generation.
+        ++joinCompatLevel;
+    } else if (!joinCompatActive && !joinCompatLevel) {
+        joinCompatLevel = 2;
+    }
+    WCL_LOG("join stalled before EAPOL; next joins to this SSID use compat level %u\n",
+        joinCompatLevel);
+}
+
+void AirportMtkSkywalkInterface::applyJoinCompat()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    restoreJoinCompat();
+    if (!joinCompatEnabled)
+        return;
+    uint8_t level = 0;
+    if (joinCompatSsidLength && joinCompatLevel &&
+        ic->ic_des_esslen == joinCompatSsidLength &&
+        !memcmp(ic->ic_des_essid, joinCompatSsid, joinCompatSsidLength))
+        level = joinCompatLevel;
+    // Retain the existing compatibility experiment for a locally
+    // administered target BSSID. Later 1.0.26/1.0.27 captures still stall
+    // at level 3, so neither this profile nor a first-association rule is
+    // established as a remedy. A local BSSID alone does not identify iOS.
+    if (joinBssidSpecified && (joinBSSID[0] & 0x02) && joinHotspotLevel > level)
+        level = joinHotspotLevel;
+    if (!level)
+        return;
+    // SAE needs PMF; only PSK (incl. a transition network's PSK side) falls back.
+    if (ic->ic_rsnakms & IEEE80211_AKM_SAE)
+        return;
+    joinCompatActive = true;
+    // HE/VHT/HT: the HAL re-derives them at AUTH from ic_wcl_compat_phy
+    // (1.0.17 cleared F_HEON here and still negotiated HE).
+    joinCompatClearedHE = (ic->ic_flags & IEEE80211_F_HEON) != 0;
+    ic->ic_wcl_compat_phy = level;
+    joinCompatClearedMFP = (ic->ic_caps & IEEE80211_C_MFP) != 0;
+    ic->ic_flags &= ~IEEE80211_F_HEON;
+    ic->ic_caps &= ~IEEE80211_C_MFP;
+    ic->ic_join_diag.Compat = 1 | 2 | (joinCompatClearedMFP ? 4 : 0) |
+        (level >= 2 ? 8 : 0) | (level >= 3 ? 16 : 0);
+}
+
+void AirportMtkSkywalkInterface::restoreJoinCompat()
+{
+    if (!joinCompatActive)
+        return;
+    ieee80211com *ic = fHalService->get80211Controller();
+    ic->ic_wcl_compat_phy = 0;
+    if (joinCompatClearedHE) ic->ic_flags |= IEEE80211_F_HEON;
+    if (joinCompatClearedMFP) ic->ic_caps |= IEEE80211_C_MFP;
+    joinCompatActive = joinCompatClearedHE = joinCompatClearedMFP = false;
+}
+
 void AirportMtkSkywalkInterface::resumeWCLJoin()
 {
     if (!joinDeferred || wclStopping)
         return;
+    fHalService->get80211Controller()->ic_join_diag.ReadyAtUS = mtk_join_now();
     AirportWCL::JoinRequest join = deferredJoin;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinDeferred = joinPending = false;
@@ -680,6 +815,20 @@ void AirportMtkSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason,
 {
     if (!joinPending)
         return;
+    auto &d = fHalService->get80211Controller()->ic_join_diag;
+    if (d.Active) {
+        d.ConnectCompleteAtUS = mtk_join_now();
+        d.Outcome = uint32_t(driverStatus); d.EndedAtUS = mtk_join_now();
+        if (status) {
+            d.Active = 0;
+            auto ic = fHalService->get80211Controller();
+            d.State = ic->ic_state; d.PortValid = ic->ic_bss && ic->ic_bss->ni_port_valid;
+            d.NodeFlags = ic->ic_bss ? ic->ic_bss->ni_flags : 0;
+            d.ObservedAtUS = d.EndedAtUS;
+            noteJoinFailure(d);
+            mtk_join_record_failure(&d, &ic->ic_join_failed, &ic->ic_join_assoc_failed);
+        }
+    }
     WCL_LOG("join finished status=%u reason=%u driver=0x%x\n", status, reason, driverStatus);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
@@ -716,6 +865,29 @@ void AirportMtkSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventSou
 IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
 {
     ieee80211com *ic = fHalService->get80211Controller();
+    auto &d = ic->ic_join_diag;
+    // MtkWireless: RUN -> SCAN below is net80211's beacon-miss path and sends
+    // nothing, so the AP kept us associated: the next join to an iPhone
+    // hotspot with PMF got status 30 (2026-11-01). Deauthenticate first.
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss &&
+        (ic->ic_state == IEEE80211_S_ASSOC || ic->ic_state == IEEE80211_S_RUN)) {
+        IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH,
+                            IEEE80211_REASON_AUTH_LEAVE);
+        IOSleep(10);    // let the frame leave before the STA record goes
+    }
+    if (d.Active) {
+        d.EndedAtUS = mtk_join_now(); d.Active = 0;
+        d.State = ic->ic_state; d.PortValid = ic->ic_bss && ic->ic_bss->ni_port_valid;
+        d.NodeFlags = ic->ic_bss ? ic->ic_bss->ni_flags : 0;
+        d.ObservedAtUS = d.EndedAtUS;
+        // Link up without a valid port is the 4-way-handshake timeout.
+        if (!d.PortValidAtUS) {
+            if (!d.Outcome) d.Outcome = uint32_t(kIOReturnAborted);
+            noteJoinFailure(d);
+            mtk_join_record_failure(&d, &ic->ic_join_failed, &ic->ic_join_assoc_failed);
+        }
+    }
+    instance->setEAPOLTransport(false);
     WCL_LOG("leave state=%d join_pending=%d roam=%d\n", ic->ic_state, joinPending,
             bool(roamPending));
     clearWCLRoam();
@@ -727,12 +899,19 @@ IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
     joinTimer->cancelTimeout();
     ic->ic_wcl_join_requested = false;
+    ic->ic_wcl_join_chan = 0;
+    ic->ic_wcl_apple_ie = 0;
+    ic->ic_wcl_hotspot_flag = 0;
+    joinBssidSpecified = false;
+    bzero(joinBSSID, sizeof(joinBSSID));
     wclAssociatedBeacons = 0;
     wclBssValid = false;
     disassocIsVoluntary = true;
     ic->ic_deauth_reason = IEEE80211_REASON_AUTH_LEAVE;
     if (ic->ic_state > IEEE80211_S_SCAN)
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+    // A RUN background scan dies with the link; do not let it block WCL.
+    ic->ic_flags &= ~IEEE80211_F_BGSCAN;
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
@@ -740,6 +919,7 @@ IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
     clearWCLPMKSA();
     ic->ic_wcl_enterprise = false;
     ic->ic_flags &= ~(IEEE80211_F_PSK | IEEE80211_F_DESBSSID);
+    restoreJoinCompat();
     ic->ic_des_esslen = 0;
     bzero(ic->ic_des_essid, sizeof(ic->ic_des_essid));
     return kIOReturnSuccess;
@@ -756,6 +936,8 @@ void AirportMtkSkywalkInterface::handleWCLLink(bool up)
 {
     if (wclStopping)
         return;
+    if (up && fHalService->get80211Controller()->ic_join_diag.Active)
+        fHalService->get80211Controller()->ic_join_diag.WCLLinkUpAtUS = mtk_join_now();
     portAuthorized = up;
     if (!up && wclLinkIndicated) {
         AirportWCL::LinkStatusEvent event = {};
@@ -790,6 +972,10 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
     }
     ieee80211com *ic = fHalService->get80211Controller();
     switch (code) {
+        case IEEE80211_EVT_STATE_CHANGED:
+            instance->setEAPOLTransport(!wclStopping && ic->ic_wcl_enterprise &&
+                                      ic->ic_state == IEEE80211_S_RUN);
+            break;
         case IEEE80211_EVT_STA_ROAM_START:
             beginWCLRoam(static_cast<const ieee80211_roam_event *>(data));
             break;
@@ -860,7 +1046,7 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
             // Retain the actual associated beacon, including its advancing TSF.
             // WCL polls BEACON_INFO to distinguish fresh reception from a stale BSS.
             if (assocNotified && (joinPending || portAuthorized) &&
-                IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID) &&
+                joinBssidMatches(beacon->node->ni_bssid) &&
                 beacon->frame && beacon->frame_length >= 36 &&
                 beacon->frame_length <= 0x800 &&
                 (beacon->frame[0] & 0xfc) == IEEE80211_FC0_SUBTYPE_BEACON) {
@@ -884,18 +1070,24 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
                 }
             }
             if (scanPending || joinPending || ic->ic_state == IEEE80211_S_SCAN ||
-                (portAuthorized && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) ||
+                (portAuthorized && joinBssidMatches(beacon->node->ni_bssid)) ||
                 (roamPending && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, roamTarget)))
                 publishWCLBeacon(beacon->node, beacon->ies, beacon->length);
             if (roamPending && IEEE80211_ADDR_EQ(beacon->node->ni_bssid, roamTarget))
                 tryCompleteWCLRoam();
+            // WCL reads EXTENDED_BSS_INFO on LinkStatus up and leaves the
+            // network when it fails ("Update Bss fail"); that needs RUN. The
+            // HAL's RUN task (80 MHz switch, BSS/peer setup) can take ~2 s
+            // after the Association Response, while beacons keep arriving.
             if (joinPending && assocNotified && !firstBeaconNotified &&
-                IEEE80211_ADDR_EQ(beacon->node->ni_bssid, joinBSSID)) {
+                ic->ic_state == IEEE80211_S_RUN &&
+                joinBssidMatches(beacon->node->ni_bssid)) {
                 AirportWCL::FirstBeaconEvent event = {};
                 memcpy(event.peer.bssid, joinBSSID, 6);
                 if (!wclBssValid)
                     break;
                 firstBeaconNotified = true;
+                if (ic->ic_join_diag.Active) ic->ic_join_diag.FirstBeaconAtUS = mtk_join_now();
                 AirportWCL::LinkStatusEvent link = {};
                 memcpy(link.bssid, joinBSSID, sizeof(link.bssid));
                 link.up = 1;
@@ -923,6 +1115,10 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         case IEEE80211_EVT_STA_ASSOC_DONE:
             if (joinPending && !assocNotified) {
+                if (!ic->ic_assoc_status && !joinBssidSpecified && ic->ic_bss) {
+                    memcpy(joinBSSID, ic->ic_bss->ni_bssid, sizeof(joinBSSID));
+                    joinBssidSpecified = true;
+                }
                 AirportWCL::AssociationEvent event = {};
                 event.status = ic->ic_assoc_status;
                 memcpy(event.bssid, joinBSSID, 6);

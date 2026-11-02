@@ -364,6 +364,66 @@ ieee80211_inputm(struct _ifnet *ifp, mbuf_t m, struct ieee80211_node *ni,
         }
     } else
         hdrlen = 0;
+    // MtkWireless: observe a complete plaintext EAPOL-Key before address,
+    // sequence/replay or port filtering. Rust bounds-checks the frame; this
+    // neither captures key bytes nor changes any acceptance decision.
+    // MtkWireless: after association, count what the AP actually sends us
+    // (headers only) so a missing M1 can be told apart from a dead RX path.
+    if (ic->ic_join_diag.Active && ic->ic_join_diag.AssocRxCount &&
+        type != IEEE80211_FC0_TYPE_CTL &&
+        !(rxi->rxi_flags & IEEE80211_RXI_AMPDU_DONE)) {
+        auto &d = ic->ic_join_diag;
+        bool toMe = IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr);
+        if (IEEE80211_ADDR_EQ(wh->i_addr2, d.BSSID)) {
+            if (type == IEEE80211_FC0_TYPE_MGT) {
+                if (subtype == IEEE80211_FC0_SUBTYPE_BEACON) ++d.RxBssBeacon;
+                else ++d.RxBssMgmt;
+            } else {
+                ++d.RxBssData;
+                if (wh->i_fc[1] & IEEE80211_FC1_PROTECTED) ++d.RxBssDataProtected;
+                if (toMe) ++d.RxBssDataToMe;
+                if (IEEE80211_IS_MULTICAST(wh->i_addr1)) ++d.RxBssDataMcast;
+                uint64_t a1 = 0;
+                for (int i = 0; i < 6; i++) a1 = (a1 << 8) | wh->i_addr1[i];
+                d.RxBssLastA1 = a1;
+                d.RxBssLastFC = wh->i_fc[0] | (wh->i_fc[1] << 8);
+                d.RxBssLastAtUS = mtk_join_now();
+                uint64_t llc = 0;
+                if (mbuf_len(m) >= (size_t)hdrlen + 8) {
+                    const uint8_t *p = mtod(m, const uint8_t *) + hdrlen;
+                    for (int i = 0; i < 8; i++) llc = (llc << 8) | p[i];
+                }
+                d.RxBssLastLLC = llc;
+            }
+        } else if (type == IEEE80211_FC0_TYPE_DATA && toMe) {
+            ++d.RxOtherTAToMe;
+            uint64_t ta = 0;
+            for (int i = 0; i < 6; i++) ta = (ta << 8) | wh->i_addr2[i];
+            d.RxOtherTALast = ta;
+        }
+    }
+    static const uint8_t eapol_snap[8] = { 0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e };
+    // MtkWireless: Active stays set for the whole association. Cheap
+    // necessary conditions of mtk_wlan_eapol_observe (FromDS, plaintext,
+    // unfragmented, EAPOL SNAP at hdrlen) skip the FFI call for other data.
+    if (ic->ic_join_diag.Active && type == IEEE80211_FC0_TYPE_DATA &&
+        !(rxi->rxi_flags & IEEE80211_RXI_AMPDU_DONE) &&
+        (wh->i_fc[1] & 0x47) == IEEE80211_FC1_DIR_FROMDS &&
+        mbuf_len(m) >= (size_t)hdrlen + sizeof(eapol_snap) &&
+        !memcmp(mtod(m, const uint8_t *) + hdrlen, eapol_snap, sizeof(eapol_snap))) {
+        mtk_wlan_eapol_observation observation = {};
+        auto &d = ic->ic_join_diag;
+        if (!mtk_wlan_eapol_observe(mtod(m, const uint8_t *), mbuf_len(m), &observation) &&
+            IEEE80211_ADDR_EQ(observation.transmitter, d.BSSID)) {
+            unsigned msg = mtk_join_message(observation.info, observation.data_length);
+            if (msg == 1) ++d.EapolRawM1;
+            else if (msg == 3) ++d.EapolRawM3;
+            else ++d.EapolRawOther;
+            d.EapolRawAtUS = mtk_join_now(); d.EapolRawState = ic->ic_state;
+            if (!IEEE80211_ADDR_EQ(observation.receiver, ic->ic_myaddr)) ++d.EapolRawWrongMAC;
+            if (ic->ic_state != IEEE80211_S_RUN) ++d.EapolRawPreRun;
+        }
+    }
     sta_rx = ieee80211_accept_sta_frame(ic, wh, type, subtype, dir);
     if (!sta_rx) {
         ic->ic_stats.is_rx_wrongbss++;
@@ -2372,6 +2432,11 @@ ieee80211_recv_auth(struct ieee80211com *ic, mbuf_t m,
     algo   = LE_READ_2(frm); frm += 2;
     seq    = LE_READ_2(frm); frm += 2;
     status = LE_READ_2(frm); frm += 2;
+    if (ic->ic_join_diag.Active) {
+        auto &d = ic->ic_join_diag;
+        d.AuthRxAtUS = mtk_join_now(); ++d.AuthRxCount;
+        d.AuthAlgorithm = algo; d.AuthSequence = seq; d.AuthStatus = status;
+    }
     DPRINTF(("auth %d seq %d from %s\n", algo, seq,
              ether_sprintf((u_int8_t *)wh->i_addr2)));
 
@@ -2788,6 +2853,10 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
     capinfo = LE_READ_2(frm); frm += 2;
     status =  LE_READ_2(frm); frm += 2;
 
+    if (ic->ic_join_diag.Active) {
+        ic->ic_join_diag.AssocRxAtUS = mtk_join_now();
+        ++ic->ic_join_diag.AssocRxCount; ic->ic_join_diag.AssocStatus = status;
+    }
     ic->ic_assoc_status = status;
     { // WCL must also receive failed association responses.
         if (ic->ic_event_handler) {
@@ -2997,6 +3066,10 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     frm = (const u_int8_t *)&wh[1];
     
     reason = LE_READ_2(frm);
+    if (ic->ic_join_diag.Active) {
+        ic->ic_join_diag.DeauthRxAtUS = mtk_join_now();
+        ic->ic_join_diag.DeauthRxReason = reason;
+    }
 
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
@@ -3065,6 +3138,10 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
     frm = (const u_int8_t *)&wh[1];
     
     reason = LE_READ_2(frm);
+    if (ic->ic_join_diag.Active) {
+        ic->ic_join_diag.DisassocRxAtUS = mtk_join_now();
+        ic->ic_join_diag.DisassocRxReason = reason;
+    }
     
     XYLog("Disassoc received, reason %d\n", reason);
     

@@ -1513,6 +1513,8 @@ ieee80211_newstate(struct ieee80211com *ic, enum ieee80211_state nstate,
 		ieee80211_sae_clear(ic);
 	ieee80211_set_link_state(ic, LINK_STATE_DOWN);
 	ic->ic_xflags &= ~IEEE80211_F_TX_MGMT_ONLY;
+	if (nstate != IEEE80211_S_RUN)
+		timeout_del(&ic->ic_eapol_start_to);
 	switch (nstate) {
 	case IEEE80211_S_INIT:
 		/*
@@ -1792,11 +1794,23 @@ justcleanup:
                 ni->ni_fails = 0;
 			ic->ic_mgt_timer = 0;
 			ieee80211_set_beacon_miss_threshold(ic);
+			/* MtkWireless: no M1 300 ms after association -> EAPOL-Start. */
+			if (ic->ic_opmode == IEEE80211_M_STA &&
+			    (ic->ic_flags & IEEE80211_F_RSNON) &&
+			    (ic->ic_flags & IEEE80211_F_PSK)) {
+				ic->ic_eapol_start_tries = 0;
+				timeout_add_msec(&ic->ic_eapol_start_to, 300);
+			}
 			(*ifp->if_start)(ifp);
 			break;
 		}
 		break;
 	}
+	/* MtkWireless: user-space EAP needs the BSD transport in RUN before
+	 * RSN authorizes the port. Notify after the state is fully committed,
+	 * not at the early Association Response notification. */
+	if (ic->ic_event_handler)
+		ic->ic_event_handler(ic, IEEE80211_EVT_STATE_CHANGED, NULL);
 	return 0;
 }
 

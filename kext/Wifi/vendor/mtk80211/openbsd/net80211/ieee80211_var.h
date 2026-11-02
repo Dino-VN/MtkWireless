@@ -85,6 +85,7 @@
 
 #include <IOKit/IOLib.h>
 #include "mtk_wlan.h"
+#include <net80211/mtk_join_diag.h>
 
 /* Mirror driver printf() output into a ring readable through the user client. */
 int mtk_printf(const char *fmt, ...) __printflike(1, 2);
@@ -471,9 +472,23 @@ struct ieee80211com {
     /* The channel width has changed (20<->2040) */
     void            (*ic_update_chw)(struct ieee80211com *);
     void            (*ic_event_handler)(struct ieee80211com *, int, void *);
+    struct mtk_join_diag ic_join_diag, ic_join_failed, ic_join_assoc_failed;
+    uint8_t ic_wcl_requested_mac[6], ic_firmware_mac[6];
+    uint64_t ic_firmware_mac_at, ic_firmware_mac_error;
+    uint64_t ic_wcl_mac_requested_at, ic_wcl_mac_plan;
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;
+    /* MtkWireless: ic_channels index WCL named for the join, scanned alone
+     * by the join's first firmware scan (0 = none or already used). */
+    uint16_t ic_wcl_join_chan;
+    /* MtkWireless: WCL hotspot fallback; mwx_apply_phy_knobs keeps HE off. */
+    uint8_t ic_wcl_compat_phy; /* 1 no HE, 2 + no VHT/40, 3 + no HT */
+    /* MtkWireless: Apple vendor IEs in the (Re)Association Request, as a
+     * native Mac sends them: bit 0 device IE (subtype 0x0a, airportd),
+     * bit 1 Instant Hotspot IE (subtype 0x0b) with ic_wcl_hotspot_flag. */
+    uint8_t ic_wcl_apple_ie;
+    uint8_t ic_wcl_hotspot_flag;
     bool ic_wcl_scan_requested;
     bool ic_wcl_scan_inflight; /* A firmware scan, not just logical SCAN. */
     bool ic_wcl_scan_active;
@@ -490,6 +505,8 @@ struct ieee80211com {
     bool ic_wcl_roam_targeted;
     uint8_t ic_wcl_roam_target[IEEE80211_ADDR_LEN];
 	CTimeout*		ic_bgscan_timeout;
+	CTimeout*		ic_eapol_start_to;	/* MtkWireless: STA EAPOL-Start nudge */
+	int			ic_eapol_start_tries;
 	uint32_t		ic_bgscan_fail;
 	u_int8_t		ic_myaddr[IEEE80211_ADDR_LEN];
 	struct ieee80211_rateset ic_sup_rates[IEEE80211_MODE_MAX];
@@ -734,6 +751,8 @@ struct ieee80211_ess {
  * ieee80211_roam_event) or ended without leaving the current one (NULL). */
 #define IEEE80211_EVT_STA_ROAM_START 9
 #define IEEE80211_EVT_STA_ROAM_NONE 10
+/* MtkWireless: committed net80211 state; the HAL has finished BSS setup. */
+#define IEEE80211_EVT_STATE_CHANGED 11
 struct ieee80211_roam_event {
     const struct ieee80211_node *cur;
     const struct ieee80211_node *sel;

@@ -67,6 +67,18 @@ static_assert(offsetof(mtk_wlan_scan_ssids, ssids) == 11, "scan SSID offset");
 static_assert(offsetof(mtk_wlan_scan_ssids, wildcard) == 331, "scan wildcard offset");
 #endif
 
+/* Key-free plaintext RX observation before STA address/replay filtering. */
+typedef struct mtk_wlan_eapol_observation {
+    uint8_t receiver[6], transmitter[6];
+    uint16_t info, data_length;
+} mtk_wlan_eapol_observation;
+int32_t mtk_wlan_eapol_observe(const uint8_t *frame, size_t len,
+                              mtk_wlan_eapol_observation *out);
+#ifdef __cplusplus
+static_assert(sizeof(mtk_wlan_eapol_observation) == 16, "EAPOL observation ABI");
+static_assert(offsetof(mtk_wlan_eapol_observation, info) == 12, "EAPOL info ABI");
+#endif
+
 /* RX descriptor (rust/mtk-wlan/src/connac2/rxd.rs). */
 enum mtk_wlan_rx_drop {
     MTK_WLAN_RX_OK = 0,

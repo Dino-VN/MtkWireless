@@ -7,5 +7,6 @@ pub mod chip;
 pub mod fw;
 pub mod hci;
 pub mod le_features;
+pub mod le_ready;
 pub mod setup;
 pub mod wmt;

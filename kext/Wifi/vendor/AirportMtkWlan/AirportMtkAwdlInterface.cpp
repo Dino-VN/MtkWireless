@@ -245,6 +245,8 @@ void AirportMtkAwdlInterface::setDataPathEnabled(bool value)
         dataPathEnabled=false;
         txSubmit->disable(); rxComplete->disable();
         drainCompletions(); txComplete->disable();
+        setProperty("MTKAWDLNativeRxPackets",nativeRx,64);
+        setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     }
     setProperty("MTKAWDLDataPathEnabled",dataPathEnabled);
 }
@@ -319,9 +321,32 @@ void AirportMtkAwdlInterface::inputNative(const uint8_t *bytes,size_t length)
     memcpy(destination,bytes,length);
     IOReturn status=rxComplete->enqueuePackets(&packet,1,0);
     if(status!=kIOReturnSuccess) { rxPool->deallocatePacket(packet); ++nativeDrops; }
-    else { ++nativeRx; setProperty("MTKAWDLNativeRxPackets",nativeRx,64); }
+    else ++nativeRx; // published by publishScheduler (1 Hz), not per packet
     // Successful RX enqueue disposes the wrapper and transfers the packet
     // handle to networking. No release/deallocation after that transfer.
+}
+// MtkWireless: decode an accepted AWDL MSDU straight into the Skywalk
+// buffer; no 1514-byte stack frame and no second copy per packet.
+void AirportMtkAwdlInterface::inputNativeView(const mtkawdl::DataView &view)
+{
+    if(!dataPathEnabled || stopping || !rxPool || !rxComplete) return;
+    // Same bounds as mtk_awdl_decode_data_view; Ethernet length = payload - 2.
+    if(view.length<56 || view.length>1516) { ++nativeDrops; return; }
+    const size_t length=view.length-2;
+    IOSkywalkPacket *packet=NULL;
+    if(rxPool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) { ++nativeDrops; return; }
+    if(packet->prepareWithQueue(NULL,2,0)!=kIOReturnSuccess ||
+       packet->getPacketBufferCount()!=1 || packet->setDataOffset(0)!=kIOReturnSuccess ||
+       packet->setDataLength(static_cast<unsigned>(length))!=kIOReturnSuccess) {
+        rxPool->deallocatePacket(packet); ++nativeDrops; return;
+    }
+    auto destination=static_cast<uint8_t *>(packet->getDataVirtualAddress());
+    if(!destination || mtkawdl::decodeDataView(destination,length,view)!=length) {
+        rxPool->deallocatePacket(packet); ++nativeDrops; return;
+    }
+    IOReturn status=rxComplete->enqueuePackets(&packet,1,0);
+    if(status!=kIOReturnSuccess) { rxPool->deallocatePacket(packet); ++nativeDrops; }
+    else ++nativeRx;
 }
 
 bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ether_addr *mac,MtkMwx *transport)
@@ -575,6 +600,8 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     if(stopping) status=kIOReturnNotReady;
     if(status==kIOReturnSuccess) enabled=value;
     if(!enabled) {
+        // MtkWireless: the tick that would send PM=0 is canceled below.
+        hal->awdlInfraWakeIfIdle();
         dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false; trafficPeerInstalled=false;
         bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         // Firmware commandSleep releases the gate. Submission can queue drop
@@ -705,6 +732,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     if(lastDiagnostic && now-lastDiagnostic<1000000) return;
     lastDiagnostic=now;
     hal->awdlPublishDiagnostics();
+    setProperty("MTKAWDLNativeRxPackets",nativeRx,64);
+    setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     publishBSDOffloadState(getBSDInterface());
     setProperty("MTKAWDLDataTxSubmitted",dataTxSubmitted,64);
     setProperty("MTKAWDLDataTxFailed",dataTxFailed,64);
@@ -1477,10 +1506,8 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         if(!accepted) {
             ++self->dataRxReplay; continue;
         }
-        uint8_t eth[1514];
-        size_t size=mtkawdl::decodeDataView(eth,sizeof(eth),view);
         ++self->dataRxDecoded;
-        self->inputNative(eth,size);
+        self->inputNativeView(view);
     }
     return true;
 }

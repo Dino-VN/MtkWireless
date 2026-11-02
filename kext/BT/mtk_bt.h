@@ -74,6 +74,29 @@ typedef struct mtk_bt_le_received {
 } mtk_bt_le_received;
 mtk_bt_le_received mtk_bt_le_receive(uint64_t registry_id, uint8_t *events, size_t len);
 
+/* LE readiness: real HCI observations, serialized by the same LE lock. */
+typedef struct mtk_bt_le_ready_command_stats {
+    uint32_t count, usb_errors, last_usb_status, status_events, complete_events;
+    uint32_t last_status, last_kind, last_handle, arg0, arg1, serial, response_serial;
+} mtk_bt_le_ready_command_stats;
+typedef struct mtk_bt_le_ready_meta_stats {
+    uint32_t count, last_handle, last_status, value0, value1, value2, value3, serial;
+} mtk_bt_le_ready_meta_stats;
+typedef struct mtk_bt_le_ready_diagnostics {
+    uint64_t controller_id, mask_before, mask_after;
+    uint32_t mask_rewrites, mask_write_errors, malformed, serial;
+    mtk_bt_le_ready_command_stats commands[4]; /* 2001, 2022, 2032, 2030 */
+    mtk_bt_le_ready_meta_stats meta[4]; /* 07, 0C, 14, 04 */
+} mtk_bt_le_ready_diagnostics;
+bool mtk_bt_le_ready_candidate_request(uint8_t bm, uint8_t request, uint16_t value,
+                                      uint16_t index, uint16_t length);
+/* index + 1; bit 8 requests write-back of mask bytes 3..11. */
+uint32_t mtk_bt_le_ready_command(uint64_t id, uint8_t *command, size_t len, bool fix);
+void mtk_bt_le_ready_mask_written(bool ok);
+void mtk_bt_le_ready_usb_status(uint32_t command, uint32_t status);
+bool mtk_bt_le_ready_events(uint64_t id, const uint8_t *events, size_t len);
+void mtk_bt_le_ready_snapshot(mtk_bt_le_ready_diagnostics *out);
+
 #ifdef __cplusplus
 }
 #endif

@@ -363,8 +363,14 @@ private:
     void resumeWCLJoin();
     IOReturn abortWCLJoin();
     IOReturn leaveWCLNetwork();
+    // MtkWireless: after an EAPOL stall, the next joins to that SSID go
+    // without HE and PMF (amtk_hotspot_compat=0 off).
+    void noteJoinFailure(const struct mtk_join_diag &);
+    void applyJoinCompat();
+    void restoreJoinCompat();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+    bool joinBssidMatches(const uint8_t *) const;
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
     // Driver-driven roaming (docs/ROAMING.md).
     static void wclRoamTimeout(OSObject *, IOTimerEventSource *);
@@ -391,6 +397,20 @@ private:
     uint8_t wclRoamBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
+    bool joinCompatEnabled = true;
+    bool joinCompatActive = false;
+    bool joinCompatClearedHE = false, joinCompatClearedMFP = false;
+    uint8_t joinCompatSsid[32] = {};
+    uint8_t joinCompatSsidLength = 0;
+    // 1 HE/PMF off, 2 + VHT/40 MHz off, 3 + HT off; raised per stalled join.
+    uint8_t joinCompatLevel = 0;
+    // Level for the first join to a locally administered BSSID (iPhone
+    // hotspot); boot-arg amtk_hotspot_level, 0 = only after a stall.
+    uint8_t joinHotspotLevel = 3;
+    // Apple vendor IEs in the Association Request (amtk_apple_ie): bit 0
+    // device IE 0x0a, bit 1 Instant Hotspot IE 0x0b. Default both.
+    uint8_t appleIEMask = 3;
+    bool joinBssidSpecified = false;
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;

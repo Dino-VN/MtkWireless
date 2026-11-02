@@ -456,7 +456,17 @@ struct JoinRequest {
     uint16_t channelSpec;
     uint16_t rsnLength;
     uint8_t rsn[257];
+    // MtkWireless: apple80211AssocCandidates +0x1e0 (IO80211Family
+    // fillAssocCandidatesList): 2 INSTANT_HOTSPOT_ASSOC, 4 AUTO_INSTANT_HOTSPOT.
+    uint16_t assocFlags;
 };
+
+// MtkWireless: native Broadcom performJoin adds Apple IE subtype 0x0b when
+// a candidate has either hotspot bit (AppleBCMWLANCoreMac 25G332,
+// addInstantHSAppleDeviceIE): payload flag 2 manual, 1 auto.
+inline uint8_t instantHotspotFlag(uint16_t assocFlags) {
+    return uint8_t((assocFlags & 2) | ((assocFlags >> 2) & 1));
+}
 
 inline bool validCipherKey(uint32_t cipher, uint32_t length, uint16_t flags,
                            uint16_t index, uint32_t rscLength) {
@@ -535,11 +545,9 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
         return false;
     if (p[0x21c] & 1)
         return false;
-    uint8_t addressBits = 0;
-    for (unsigned i = 0; i < 6; ++i)
-        addressBits |= p[0x21c + i];
-    if (!addressBits)
-        return false;
+    // A WCL association candidate may omit its BSSID when the caller wants
+    // the directed SSID/channel result to choose the AP. The multicast check
+    // above still rejects malformed non-unicast addresses.
     out = {};
     out.lowerAuth = read32(p + 0x10);
     out.upperAuth = read32(p + 0x14);
@@ -553,6 +561,7 @@ inline bool decodeJoin(const void *buffer, size_t length, JoinRequest &out) {
     out.channelSpec = read16(p + 0x228);
     out.rsnLength = rsnLength;
     memcpy(out.rsn, p + 0xd6, rsnLength);
+    out.assocFlags = read16(p + 0x1e0);
     return true;
 }
 

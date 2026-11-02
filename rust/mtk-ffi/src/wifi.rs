@@ -30,6 +30,27 @@ pub unsafe extern "C" fn mtk_wlan_scan_ssids_parse(
     }
 }
 
+/// # Safety
+/// `data` points to `len` bytes; `out` is writable and does not overlap it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_eapol_observe(
+    data: *const u8,
+    len: usize,
+    out: *mut mtk_wlan::join::EapolObservation,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return EINVAL;
+    };
+    *out = mtk_wlan::join::EapolObservation::default();
+    match mtk_wlan::join::EapolObservation::parse(unsafe { image(data, len) }) {
+        Ok(observation) => {
+            *out = observation;
+            0
+        }
+        Err(_) => EINVAL,
+    }
+}
+
 #[repr(C)]
 pub struct MtkWlanFwRegion {
     pub addr: u32,
@@ -433,5 +454,29 @@ pub unsafe extern "C" fn mtk_wlan_dma_rx_segment(
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    #[test]
+    fn observation_ffi_clears_output_on_invalid_input_and_matches_c_layout() {
+        use mtk_wlan::join::EapolObservation;
+        assert_eq!(core::mem::size_of::<EapolObservation>(), 16);
+        assert_eq!(core::mem::offset_of!(EapolObservation, info), 12);
+        let mut out = EapolObservation {
+            receiver: [9; 6],
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { mtk_wlan_eapol_observe(core::ptr::null(), 10, &mut out) },
+            EINVAL
+        );
+        assert_eq!(out, EapolObservation::default());
+        assert_eq!(
+            unsafe { mtk_wlan_eapol_observe(core::ptr::null(), 0, core::ptr::null_mut()) },
+            EINVAL
+        );
     }
 }

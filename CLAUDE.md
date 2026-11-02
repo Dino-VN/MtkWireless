@@ -120,6 +120,10 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
 
 ## Wi-Fi roaming (docs/ROAMING.md, unverified on hardware)
 
+- Join LinkStatus up (first beacon) is posted only once `ic_state == RUN`:
+  WCL then reads `EXTENDED_BSS_INFO` (RUN only) and leaves on failure
+  ("Update Bss fail"). On an 80 MHz AP the HAL RUN task took ~2 s after the
+  Association Response (2026-10-31, 1.0.7, every join to that AP failed).
 - WCL learns a BSS switch only from LinkStatus (216) up naming the new BSSID
   while already linked: `WCLNetManager::linkUp` re-reads `WCL_BSS_INFO` and
   leaves the network if that fails, so stage the new beacon first. Roam
@@ -132,6 +136,145 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   `sc_awdl_infra_ps` is cleared on AUTH. `amtk_roam=0` turns it off.
 
 ## WPA3 / PMF (do not regress)
+
+- 1.0.15 Hotspot Wi-Fi (25G332, 2026-10-31 22:10): 1.0.14 passes the
+  whole outgoing BLE path; Wi-Fi times out after association. AUTH now
+  cancels existing AWDL ROC and admission covers queued AUTH/ASSOC/RUN
+  during MCU waits, not just committed ic_state. Key commands retain real
+  firmware status; port-valid waits for the queued GTK/IGTK batch. RSN OUI
+  pointers use permanent storage (C++ ASan found compound-literal lifetime
+  UB). PSK+PMF remains AKM :2 / descriptor 2; SHA256-PSK 3, SAE 0.
+  `MTKWiFiJoin` / `MTKWiFiJoinLastFailed` on AirportMtkWlan retain key-free
+  per-attempt diagnostics independently of AWDL. Regression:
+  `scripts/test-wifi-hotspot.py`, Rust join/FFI tests. Hotspot hardware
+  verification pending; `amtk_pmf=0` remains an A/B test, see
+  docs/INSTANT-HOTSPOT.md. Do not infer a specific M1/M3 failure from WCL
+  association/LinkStatus alone.
+- 1.0.15 hardware (2026-11-01 11:45): same failure. Each join first ran a
+  full net80211 scan (~5.8 s of airportd's 10 s budget, measured from
+  SUSPEND AWDL), then link up and ~4 s with no completion. 1.0.15 never
+  recorded link-up failures in `MTKWiFiJoinLastFailed` (only attempts that
+  never reached link up), so a later scan-only attempt was all ioreg showed.
+  1.0.16: `mtk_join_record_failure` keeps every failure without a valid
+  port, and associated ones also in `MTKWiFiJoinLastAssocFailed`
+  (diagnostic version 2). The join's first firmware scan visits only WCL's
+  `channelSpec` channel (`ic_wcl_join_chan`); a miss falls back to the
+  full scan. Unverified on hardware.
+- 1.0.16 hardware (2026-11-01 12:59): scan 0.26 s, auth/assoc status 0,
+  RUN, then 8.5 s without one EAPOL frame from the iPhone (`EapolRaw*` 0:
+  nothing reached ieee80211_input). The home WPA2 AP on the same channel
+  got M1 34 ms after association; it negotiated neither HE nor PMF, the
+  hotspot both. 1.0.17: `mtk_join_eapol_stall` (associated, RUN, no
+  EAPOL) marks the SSID; later PSK joins to it clear `IEEE80211_F_HEON`
+  and `IEEE80211_C_MFP` for that join only (`applyJoinCompat`, restored on
+  leave/next join; never for SAE). airportd's retry is then the compat
+  join. ioreg `MTKWiFiJoinCompat` 1|2 HE|4 PMF. `amtk_hotspot_compat=0`
+  off. 1.0.17 hardware (13:15): the compat join had no MFP but still HE
+  (`mwx_apply_phy_knobs` re-sets F_HEON at AUTH) and still got no EAPOL in
+  8.5 s, so PMF alone is not the cause. 1.0.18: `ic_wcl_compat_no_he`
+  keeps HE off through the AUTH knobs. 1.0.18 hardware (14:40): compat
+  join `Compat` 7, NodeFlags 0xFC402 (no HE, no MFP, VHT 80), assoc 0,
+  RUN, still no EAPOL in 8.5 s: neither HE nor PMF is the cause. 1.0.19
+  adds post-association RX counters to the join diagnostics: frames with
+  TA = BSSID reaching ieee80211_input (`RxBss*`: beacons, other mgmt,
+  data, protected, to-me, last FC/LLC), data to us from another TA
+  (`RxOtherTA*`), and U2M frames the HAL drops (`RxHalDrop*`: amsdu-err,
+  icv, other, last RXD1-3; RXD1 low 10 bits = wcid, 0x3ff unknown peer).
+  1.0.19 hardware (14:55, non-compat join with HE+PMF): after assoc 31
+  beacons and 28 protected data frames from the BSSID reached
+  ieee80211_input, none addressed to us; no unicast frame at all and no
+  U2M HAL drop. The phone transmits, but no M1 arrives (not sent, or lost
+  in firmware/PHY before the host). 1.0.20: compat level per stalled
+  join to the SSID (`joinCompatLevel`, `ic_wcl_compat_phy` read by
+  `mwx_apply_phy_knobs`): 1 HE/PMF off, 2 + VHT/40 MHz off, 3 + HT off;
+  `Compat` bits 8 (level 2) and 16 (level 3). Also `RxBssDataMcast`,
+  `RxBssLastA1`, `RxBssLastRate`/`RxBssMgmtRate` (P-RXV word 0).
+  Likely cause (1.0.19 dump: `MTKAWDLInfraPowerSave` Yes, PSSleeps 30 /
+  Wakes 29): the AWDL scheduler calls `awdlInfraSleep` before
+  `awdlReserve`, and it sent Null PM=1 in RUN before the port was valid;
+  the AP then buffers M1 for a dozing STA (only beacons/group data
+  arrive). 1.0.21: `awdlInfraSleep` refuses while
+  `mwx_awdl_infra_joining`, `awdlInfraWakeIfIdle` wakes at once when AWDL
+  is off/stopping or a join runs, AWDL disable calls it before canceling
+  its tick. Join diag `InfraPS{Sleeps,Wakes,Refused,AtUS,AtStart}`.
+  1.0.22 hardware (18:20-18:37): PM=1 ruled out (InfraPSSleeps 0 in the
+  stalled joins). First working Instant Hotspot join (18:37:45, attempt
+  22, 5 GHz ch 149 WPA3-transition AP, PSK side): `Compat` 31 = level 3,
+  HT/VHT/HE/PMF all off (legacy 11a), M1 29 ms after assoc, port valid,
+  DHCP 172.20.10.2, ping OK. Level 1 (HT+VHT, no HE/PMF) always stalled;
+  level 2 (HT20) never ran properly because the retry join did not scan
+  (`ScanStartedAtUS` 0, SCAN->SCAN while MWX_FLAG_SCANNING). So the
+  iPhone's unicast frames are lost when we negotiate HT/VHT: look at the
+  HT/VHT STA_REC / RA / LDPC/STBC/A-MPDU setup for this peer. Also: WCL
+  leave goes RUN->SCAN, which sends no Deauth, so the phone keeps the old
+  association and the next PMF join gets status 30.
+  1.0.23: leaveWCLNetwork sends Deauth (AUTH_LEAVE) from ASSOC/RUN first;
+  a WCL join's SCAN->SCAN restarts a scan started for another attempt
+  (`sc_scan_join_attempt`; diag `ScanRestarted`/`ScanSkippedBusy`/
+  `ScanSuspendedAWDL`); the first stall starts compat at level 2 (HT20).
+  1.0.24: the Association Request no longer carries the QoS Capability
+  element (46) and puts WMM last (after HT/VHT/HE), as mac80211 does;
+  level 3 dropped both together with HT, so it did not prove HT itself
+  is at fault. Join diag `RunBw`/`RunCenter`/`RunSwitchError` (first RUN
+  channel switch; a failure silently falls back to 20 MHz). A/B without
+  reboots: boot-arg `amtk_hotspot_compat=0`, then `mtkctl knob` 0x22
+  (HT20), 0x12 (HT40), 0x202, 0x402. 1.0.24 hardware (19:30): level 2
+  and even level 3 stalled (RunBw 0, no switch error) on a BSSID that had
+  already seen a stalled join from our MAC; after the user restarted the
+  hotspot (new BSSID) the first, level-3 join worked (M1 28 ms, DHCP,
+  ping). The phone runs the 4-way handshake only for a MAC's first
+  association to a BSSID; a stall poisons that BSSID until the hotspot
+  restarts, so every earlier "compat retry" result was meaningless.
+  1.0.25: joins to a locally administered BSSID start at
+  `amtk_hotspot_level` (default 3, legacy; 0 = old behaviour). To find
+  the HT bug, test levels 0-2 only on a freshly restarted hotspot.
+  1.0.25 hardware (19:45-19:47): Instant-Hotspot-activated (BLE) hotspots
+  stalled even on the first, level-3 join to a new BSSID, so the
+  "first association" theory is wrong too. Both successes so far came
+  after the user enabled Personal Hotspot by hand on the phone; every
+  BLE-activated one stalled. sharingd sends `com.sharing.hotspot.request`
+  (8 keys) before the join; the phone may admit only what it learns
+  there (MAC?). Unresolved. Also found: a user disconnect during a RUN
+  background scan left `IEEE80211_F_BGSCAN` set in SCAN, so every WCL
+  scan returned busy (Wi-Fi dead until reboot). 1.0.26 clears it on
+  leave and in beginWCLScan outside RUN.
+  1.0.26 hardware (20:04-20:19): ~25 more stalls (Instant Hotspot and
+  plain joins, AirDrop/Handoff off, native AWDL "off"), same pattern; the
+  two successes are not explained by MAC, BSSID freshness, compat level,
+  manual vs BLE activation or native AWDL state. 1.0.27: net80211 sends
+  EAPOL-Start (802.1X v2, type 1) 300 ms after RUN without EAPOL, then at
+  +1 s and +2 s (`ic_eapol_start_to`, ieee80211_pae_output.c; diag
+  `EapolStartTx`/`EapolStartAtUS`). 1.0.27 hardware (2026-11-01 22:14):
+  association status 0, RUN in 19 ms, 3 Starts submitted to DMA, zero raw
+  or parsed M1 and no BSS data for ~10 s; no ROC/infra-PS activity. This
+  experiment did not fix the failure. 1.0.28 fixes diagnostic ASSOC DMA
+  overcounting (subtype 0 also counted data/Starts), and records firmware
+  TX-free ACK/failure/count/raw/time for unicast Auth/Assoc/EAPOL, scoped
+  to the submitting join attempt. It changes no radio/RX/RSN behavior;
+  hardware TX-free capture pending. See docs/INSTANT-HOTSPOT.md.
+  1.0.29 source review: mt7921_mac_set_timing hard-coded is_2ghz=1
+  (SIFS=10 even at 5 GHz) and slot=9. Match MT76's band selection
+  (2 GHz 10 us, 5/6 GHz 16 us) and net80211's 2 GHz ERP slot flag
+  (9/20 us, always 9 otherwise). Wire ic_updateslot and refresh after
+  RUN BSS/peer setup even at 20 MHz. Join MacTiming* retains written
+  timing/readback. This is a configuration correction, not proof of
+  hotspot root cause; hotspot/AWDL hardware verification pending.
+  1.0.30 (REA of 25G332, 2026-11-02): a native Mac's Association
+  Request carries Apple vendor IEs we never sent: `dd 0b 00 17 f2 0a 00
+  01 04 00 00 00 00` (airportd installs it at Wi-Fi power-on via request
+  85; our `setIE` returns unsupported, log "configure Apple device IE
+  failed") and, for Instant Hotspot joins, subtype 0x0b with flag 2
+  (manual) / 1 (auto) from the WCL candidate flags at `+0x1e0`
+  (`AppleBCMWLANJoinAdapter::performJoin` -> `addInstantHSAppleDeviceIE`).
+  `decodeJoin` keeps `assocFlags`, `ieee80211_get_assoc_req` appends both
+  (`ic_wcl_apple_ie`, cleared on leave). `amtk_apple_ie` bit 0 = 0x0a,
+  bit 1 = 0x0b (default 3, 0 off). Join diag `AppleJoinFlags`,
+  `AppleIE` (mask | flag << 8). Repo's custom-IE struct
+  (`apple80211_ioctl.h`) has a bogus pad (Tahoe: 0x814 bytes, data at
+  +20); fix it before implementing `setIE`. Hardware (2026-11-02,
+  Instant Hotspot, dev build 1.0.30, released as 1.0.7): `AppleJoinFlags`
+  2, `AppleIE` 515, M1 received, port valid, DHCP 172.20.10.2. The missing
+  Apple IEs were the cause of the hotspot stalls.
 
 - airportd offers WPA3-SAE only with `CARD_CAPABILITIES` byte 5 bit 3 and
   PMF only with byte 2 `& 0x11` (IO80211.framework `Apple80211IsAuthSelAllowed`,
@@ -221,6 +364,48 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   (event read from the interrupt pipe); unanswered, it resets the subsystem
   and downloads once more (Linux `BTMTK_FIRMWARE_DL_RETRY`). Still silent is
   only logged (`MtkBtLog`). Unverified on hardware.
+- Advertising address patches (`advAddress*`) are exact bytes per build:
+  `*25G332` variants for macOS 26.7.2. On 25G332 without them
+  (`BluetoothdAdvAddress*Patched=0`) bluetoothd looped on `multipleAdvStartCb`
+  STATUS 718 and Instant Hotspot failed with `BLE client connect timeout`
+  (2026-10-31). After a macOS update run `scripts/test-bt-page-patches.py`.
+- Instant Hotspot outgoing BLE (25G332): chip 0 has no initialized controller
+  privacy backend, while the host AH resolver overwrites the on-air RPA with
+  its identity. The accept list then cannot match the phone. `rpa*25G332`
+  retains verified legacy ADV_IND RPAs, keeps identity/UUID/security intact,
+  and selects the last advertised address at the two initiating-list sites.
+  Device updates use the native mutex. `-mtkbtnorpa` off (also needs advertising
+  and verify routes); ioreg `BluetoothdRpa*Patched`. On only when
+  `kern.osversion` is 25G332 (25G241 shares child signatures), read at the
+  first bluetoothd page: launchd sets it after the kext starts, so 1.0.12's
+  check in `init` always saw an empty string and left RPA off. Helpers live
+  in end-of-__TEXT padding after `__eh_frame` (0x100aa2c00). Never put them
+  on the header/load-command pages: in 1.0.10 they sat right after the load
+  commands (0x1000026c8) and every re-exec of bluetoothd failed
+  (`OS_REASON_EXEC`, launchd spawn failed, Bluetooth dead until reboot).
+  The helper page is faulted lazily, so children do not wait for it (1.0.10
+  gated them and patched only 2/7); a child's call faults it in and page
+  validation installs the helpers first. No `0x2027/0x202D` is added:
+  hardware must show a current random RPA in `0x2011` and a real central-role
+  LE connection, then hotspot activation. See docs/INSTANT-HOTSPOT.md.
+  1.0.13 hardware (2026-10-31 20:25): RPA counters all 1, real central-role
+  connection and encryption succeed; Hotspot still stalls in wait-for-phy.
+  HFP's `hfpFill*25G332`
+  also preserves the native call displacement, with the existing mSBC scope.
+- Instant Hotspot LE readiness (1.0.14): 25G332's generic backend selects
+  LE event mask `0x1f` (`0x100171183`, constant `0x100a74481`), disabling
+  Data Length Change (0x07) and PHY Update Complete (0x0c), although the
+  remote-features callback waits for them. The MediaTek EP0 shim ORs `0x840`
+  into nonzero `0x2001` masks; zero still disables events. No completion is
+  synthesized and no new bluetoothd page is patched. `-mtkbtnolereadymask`
+  disables only the mask repair. Rust bounds-checks commands/events;
+  IOResources `MtkWirelessBT` publishes `LeEventMask*`,
+  `Le{SetEventMask,SetDataLength,SetPhy,ReadPhy}*` and
+  `Le{DataLengthChange,PhyUpdateComplete,ChannelSelection,RemoteFeatures}*`.
+  Offline Rust/USB tests cover original event ordering, asynchronous errors
+  and 0xFD3C coexistence. 1.0.14 hardware passes BLE readiness, rapportd
+  PSM 0x81 and hotspot activation; Wi-Fi still times out (1.0.15 diagnostics);
+  see docs/INSTANT-HOTSPOT.md and scripts/test-bt-le-ready.py.
 - `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
   AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
   crashes make launchd throttle it (640–1200 s).

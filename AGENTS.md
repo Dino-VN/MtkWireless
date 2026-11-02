@@ -69,6 +69,16 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 ## Wi-Fi + AWDL coexistence (do not regress)
 
+- MT7922 campus report (2026-10-31, 1.0.6): join scans omitted the SSID
+  despite WCL supplying it, and Enterprise BSD output waited for RSN port
+  authorization even though user-space EAP must precede it. Join scans now
+  probe `ic_des_essid` unless an explicit WCL scan owns the request. A
+  committed net80211-state event enables BSD EAPOL transport in Enterprise
+  RUN, without authorizing WCL or bypassing RX/TX port gates; leave/reset/
+  abort/stop close it. Keep this event after HAL BSS setup, not at the early
+  AssocComplete event. Regressions: `scripts/test-wifi-capabilities.py` and
+  `scripts/test-wifi-eapol.py`. Hardware verification pending; the separate
+  Open System auth timeout is unproven. See docs/WIFI-ENTERPRISE.md.
 - Instant Hotspot 1.0.0 capture (2026-10-24 21:13): sharingd activates
   iPhone Dino on channel 149, then Apple80211Scan rejects SCAN_SSID_LIST
   with -3903 before reaching the driver. Tahoe capability bit 73 selects

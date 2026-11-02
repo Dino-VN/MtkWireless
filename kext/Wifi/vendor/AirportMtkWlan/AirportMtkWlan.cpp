@@ -100,7 +100,47 @@ void AirportMtkWlan::watchdogAction(IOTimerEventSource *timer)
     struct _ifnet *ifp = &fHalService->get80211Controller()->ic_ac.ac_if;
     (*ifp->if_watchdog)(ifp);
 
+    getCommandGate()->runAction(publishJoinDiagnosticsGated);
     watchdogTimer->setTimeoutMS(kWatchDogTimerPeriod);
+}
+
+static OSDictionary *mtkJoinDictionary(const mtk_join_diag &d)
+{
+    auto dict = OSDictionary::withCapacity(120);
+    if (!dict) return nullptr;
+#define MTK_JOIN_NUMBER(name) { \
+    auto value = OSNumber::withNumber(d.name, 64); \
+    if (value) { dict->setObject("MTKWiFiJoin" #name, value); value->release(); } \
+}
+    MTK_JOIN_DIAG_FIELDS(MTK_JOIN_NUMBER)
+#undef MTK_JOIN_NUMBER
+#define MTK_JOIN_BYTES(name, length) { \
+    auto value = OSData::withBytes(d.name, length); \
+    if (value) { dict->setObject("MTKWiFiJoin" #name, value); value->release(); } \
+}
+    MTK_JOIN_BYTES(WCLMAC, 6); MTK_JOIN_BYTES(AssocMAC, 6);
+    MTK_JOIN_BYTES(FirmwareMAC, 6); MTK_JOIN_BYTES(PTKMAC, 6); MTK_JOIN_BYTES(BSSID, 6);
+    MTK_JOIN_BYTES(APRSN, d.APRSNLength); MTK_JOIN_BYTES(AssocRSN, d.AssocRSNLength);
+#undef MTK_JOIN_BYTES
+    return dict;
+}
+
+IOReturn AirportMtkWlan::publishJoinDiagnosticsGated(OSObject *owner, void *, void *, void *, void *)
+{
+    auto self = static_cast<AirportMtkWlan *>(owner);
+    auto ic = self->fHalService->get80211Controller();
+    auto &d = ic->ic_join_diag;
+    d.ObservedAtUS = mtk_join_now(); d.State = ic->ic_state;
+    d.PortValid = ic->ic_bss && ic->ic_bss->ni_port_valid;
+    d.NodeFlags = ic->ic_bss ? ic->ic_bss->ni_flags : 0;
+    auto dict = mtkJoinDictionary(d);
+    if (dict) { self->setProperty("MTKWiFiJoin", dict); dict->release(); }
+    dict = mtkJoinDictionary(ic->ic_join_failed);
+    if (dict) { self->setProperty("MTKWiFiJoinLastFailed", dict); dict->release(); }
+    dict = mtkJoinDictionary(ic->ic_join_assoc_failed);
+    if (dict) { self->setProperty("MTKWiFiJoinLastAssocFailed", dict); dict->release(); }
+    self->setProperty("MTKWiFiJoinDiagnosticVersion", uint64_t(3), 32);
+    return kIOReturnSuccess;
 }
 
 void AirportMtkWlan::fakeScanDone(OSObject *owner, IOTimerEventSource *sender)
@@ -625,6 +665,47 @@ setLinkStateGated(OSObject *target, void *arg0, void *arg1, void *arg2, void *ar
     return kIOReturnSuccess;
 }
 
+void AirportMtkWlan::setEAPOLTransport(bool enabled)
+{
+    // Called on every net80211 state commit from the HAL task; take the
+    // gate only for Enterprise joins or to close an open transport.
+    auto ic = fHalService->get80211Controller();
+    if (!eapolTransportActive && (!enabled || !ic->ic_wcl_enterprise))
+        return;
+    getCommandGate()->runAction(setEAPOLTransportGated,
+                               reinterpret_cast<void *>(uintptr_t(enabled)));
+}
+
+IOReturn AirportMtkWlan::setEAPOLTransportGated(
+    OSObject *target, void *arg0, void *, void *, void *)
+{
+    auto self = static_cast<AirportMtkWlan *>(target);
+    bool enabled = uintptr_t(arg0) != 0;
+    auto ic = self->fHalService->get80211Controller();
+    enabled = enabled && self->bsdInterface && ic->ic_wcl_enterprise &&
+        ic->ic_state == IEEE80211_S_RUN && (ic->ic_if.if_flags & IFF_RUNNING);
+    if (self->eapolTransportActive == enabled)
+        return kIOReturnSuccess;
+    self->eapolTransportActive = enabled;
+    if (enabled) {
+        // Keep BSD RX/TX available to eapolclient. net80211 still admits
+        // only EtherType 0x888e while ni_port_valid is clear. Do not publish
+        // an authorized WCL link or finish the join before the key handshake.
+        self->bsdInterface->setLinkState(kIO80211NetworkLinkUp);
+#ifdef __PRIVATE_SPI__
+        self->bsdInterface->startOutputThread();
+#endif
+    } else if (self->bsdInterface && !(self->currentStatus & kIONetworkLinkActive)) {
+#ifdef __PRIVATE_SPI__
+        self->bsdInterface->stopOutputThread();
+        self->bsdInterface->flushOutputQueue();
+#endif
+        self->bsdInterface->setLinkState(kIO80211NetworkLinkDown);
+    }
+    mtk_printf("AirportMtkWlan-wcl: EAPOL transport=%d state=%d\n", enabled, ic->ic_state);
+    return kIOReturnSuccess;
+}
+
 #ifdef __PRIVATE_SPI__
 IOReturn AirportMtkWlan::outputStart(IONetworkInterface *interface, IOOptionBits options)
 {
@@ -714,6 +795,11 @@ IOReturn AirportMtkWlan::setHardwareAddress(const void *addrP, UInt32 addrBytes)
     auto ic = fHalService->get80211Controller();
     bool initializing = (ic->ic_if.if_flags & IFF_UP) && !(ic->ic_if.if_flags & IFF_RUNNING);
     auto update = AirportWCL::planMacUpdate(ic->ic_myaddr, address, addrBytes, initializing);
+    if (addrBytes == 6) {
+        memcpy(ic->ic_wcl_requested_mac, address, 6);
+        ic->ic_wcl_mac_requested_at = mtk_join_now();
+        ic->ic_wcl_mac_plan = unsigned(update);
+    }
     if (addrBytes >= IEEE80211_ADDR_LEN)
         mtk_printf("AirportMtkWlan-wcl: set mac %02x:%02x:%02x:%02x:%02x:%02x plan=%d "
                    "state=%d if_flags=0x%x\n", address[0], address[1], address[2],
