@@ -107,6 +107,33 @@ scripts/package.sh Release    # dist/MtkWireless-<version>-RELEASE.zip
 
 ## Install (OpenCore)
 
+One command installs or updates everything. Paste it into Terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dino-VN/MtkWireless/main/scripts/install.sh -o /tmp/mtkw-install.sh && sudo bash /tmp/mtkw-install.sh
+```
+
+The script:
+
+- detects the MediaTek Wi-Fi card (`14c3:7961/0608/7922/0616`) and the USB
+  Bluetooth controller, and installs only the kexts that have hardware;
+- finds the EFI partition OpenCore booted from and mounts it;
+- downloads the latest release and installs it, or updates it if the EFI
+  has an older version (`--force` reinstalls, `--version v1.0.7` picks one);
+- removes conflicting kexts from `EFI/OC/Kexts` and `Kernel → Add`: itlwm,
+  AirportItlwm, IntelBluetoothFirmware/IntelBTPatcher/IntelBluetoothInjector,
+  BrcmPatchRAM*/BrcmFirmware*/BrcmBluetoothInjector*, SimpleMtkWlan,
+  AirportMtkWlan, SimpleMtkBtFw, SimpleMtkBtPatcher;
+- adds Lilu and BlueToolFixup if they are missing (latest acidanthera
+  releases), puts them in the right order, and sets the Bluetooth NVRAM keys;
+- prints which features work on your macOS build (see the table above).
+
+It asks before changing anything and backs up `config.plist` and every
+removed kext to `~/Desktop/MtkWireless-backup-<date>`. Preview without
+changes: add `--dry-run`. Then reboot.
+
+### Manual install
+
 Copy the kexts to `EFI/OC/Kexts` and merge `docs/config-snippet.plist`
 (`Kernel → Add` in order, NVRAM variables for Bluetooth). Remove
 SimpleMtkBtFw and SimpleMtkBtPatcher first. Details: [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
