@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 source = (ROOT / "kext/BT/Patcher.cpp").read_text()
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--binary", type=Path, help="optional Tahoe x86_64 bluetoothd to check, without modifying it")
-parser.add_argument("--no-sanitize", action="store_true", help="run without ASan/UBSan when unavailable on the host")
+sanitizers = parser.add_mutually_exclusive_group()
+sanitizers.add_argument("--no-sanitize", action="store_true", help="run without ASan/UBSan when unavailable on the host")
+sanitizers.add_argument("--thread-sanitize", action="store_true", help="check concurrent patch/verification with ThreadSanitizer")
 args = parser.parse_args()
 
 
@@ -63,10 +65,13 @@ mock = r'''
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 using mach_vm_address_t = uintptr_t;
 using vnode_t = const char *;
@@ -114,9 +119,26 @@ bool checkKernelArgument(const char *name) {
     assert(!strcmp(name, "-mtkbtnoextadv")); return noExtAdv;
 }
 void *IOLockAlloc() { return reinterpret_cast<void *>(1); }
-int lockDepth;
-void IOLockLock(IOLock *) { assert(!lockDepth++); }
-void IOLockUnlock(IOLock *) { assert(lockDepth-- == 1); }
+thread_local int lockDepth;
+std::mutex pageMutex, raceMutex;
+std::condition_variable raceCondition;
+thread_local bool watchLockAttempt;
+bool lockAttempted, operationFinished, operationPaused, releaseOperation;
+void IOLockLock(IOLock *) {
+    if (watchLockAttempt) {
+        std::lock_guard<std::mutex> guard(raceMutex);
+        lockAttempted = true; raceCondition.notify_all();
+    }
+    assert(!lockDepth); pageMutex.lock(); lockDepth = 1;
+}
+void IOLockUnlock(IOLock *) { assert(lockDepth-- == 1); pageMutex.unlock(); }
+void (*afterReplacement)();
+void (*beforeHash)();
+void pauseOperation() {
+    std::unique_lock<std::mutex> guard(raceMutex);
+    operationPaused = true; raceCondition.notify_all();
+    raceCondition.wait(guard, [] { return releaseOperation; });
+}
 void *IOMalloc(size_t size) { return malloc(size); }
 void IOFree(void *p, size_t) { free(p); }
 void OSIncrementAtomic(int32_t *value) { ++*value; }
@@ -147,6 +169,7 @@ const uint8_t *pristine; // the file as stored; the verify mock hashes against i
 int verifies;
 errno_t originalVerify(vnode_t, off_t offset, uint8_t *buf, size_t size, size_t *, void **, uint32_t, vfs_context_t, void *) {
     ++verifies;
+    if (beforeHash) beforeHash();
     return buf && memcmp(buf, pristine + offset, size) ? 94 : 0;
 }
 mach_vm_address_t orgCsValidatePage, orgVnopVerify;
@@ -176,7 +199,9 @@ struct KernelPatcher {
         const auto *needle = static_cast<const uint8_t *>(find);
         auto *hit = std::search(bytes, bytes + size, needle, needle + findSize);
         if (hit == bytes + size) return false;
-        memcpy(hit, replace, replaceSize); return true;
+        memcpy(hit, replace, replaceSize);
+        if (afterReplacement) afterReplacement();
+        return true;
     }
 };
 int kextIOBluetoothFamily, kextIOUSBHostFamily;
@@ -437,6 +462,83 @@ void verifyTests() {
     assert(patchRangeCount == 0 && verify(btd, 0, cache.data(), cache.size()) == 94);
     puts("PASS: VNOP_VERIFY restores recorded patch ranges (ours and a wrapped foreign patcher) only in bluetoothd blocks");
 }
+// Pause real patching after bytes change but before their originals are recorded.
+// Use the live fault's universal-file offset: __DATA_CONST follows the helper
+// page inside the same 16 KB APFS verification block, after a 16 KB fat header.
+void verifyRaceTests() {
+    const char *btd = "/usr/sbin/bluetoothd";
+    const size_t blockOffset = 0x4000 + 0xaa0000;
+    const size_t pageOffset = blockOffset + 0x2000;
+    std::vector<uint8_t> file(blockOffset + PAGE_SIZE * 4, 0x5a);
+    memcpy(file.data() + blockOffset + 0x2b88, rpaHelpersFind25G332, sizeof(rpaHelpersFind25G332));
+    pristine = file.data();
+    for (bool knownVnode : {false, true}) {
+        reset(25, true, false); Patcher::init(0);
+        if (knownVnode) { Page untouched {}; apply(untouched); }
+        auto cache = file;
+        lockAttempted = operationFinished = operationPaused = releaseOperation = false;
+        afterReplacement = pauseOperation;
+        std::thread patcher([&] {
+            csValidatePage(btd, nullptr, pageOffset, cache.data() + pageOffset, nullptr, nullptr, nullptr);
+        });
+        {
+            std::unique_lock<std::mutex> guard(raceMutex);
+            raceCondition.wait(guard, [] { return operationPaused; });
+        }
+        int result = -1;
+        std::thread verifier([&] {
+            watchLockAttempt = true;
+            size_t blockSize = 16384;
+            result = vnopVerify(btd, blockOffset, cache.data() + blockOffset, 16384,
+                                &blockSize, nullptr, 0, nullptr, nullptr);
+            std::lock_guard<std::mutex> guard(raceMutex);
+            operationFinished = true; raceCondition.notify_all();
+        });
+        {
+            std::unique_lock<std::mutex> guard(raceMutex);
+            raceCondition.wait(guard, [] { return lockAttempted || operationFinished; });
+            assert(lockAttempted && !operationFinished);
+            releaseOperation = true; raceCondition.notify_all();
+        }
+        patcher.join(); verifier.join(); afterReplacement = nullptr;
+        assert(result == 0 && verifyRestored == 1 && !verifyRestoreFailed);
+        assert(!memcmp(cache.data() + blockOffset + 0x2b88,
+                       rpaHelpersReplace25G332, sizeof(rpaHelpersReplace25G332)));
+    }
+
+    // Verification of an untouched block must also exclude a new patch until
+    // the original verifier finishes hashing the shared buffer.
+    reset(25, true, false); Patcher::init(0);
+    Page untouched {}; apply(untouched);
+    auto cache = file;
+    lockAttempted = operationFinished = operationPaused = releaseOperation = false;
+    beforeHash = pauseOperation;
+    int result = -1;
+    std::thread verifier([&] {
+        size_t blockSize = 16384;
+        result = vnopVerify(btd, blockOffset, cache.data() + blockOffset, 16384,
+                            &blockSize, nullptr, 0, nullptr, nullptr);
+    });
+    {
+        std::unique_lock<std::mutex> guard(raceMutex);
+        raceCondition.wait(guard, [] { return operationPaused; });
+    }
+    std::thread patcher([&] {
+        watchLockAttempt = true;
+        csValidatePage(btd, nullptr, pageOffset, cache.data() + pageOffset, nullptr, nullptr, nullptr);
+        std::lock_guard<std::mutex> guard(raceMutex);
+        operationFinished = true; raceCondition.notify_all();
+    });
+    {
+        std::unique_lock<std::mutex> guard(raceMutex);
+        raceCondition.wait(guard, [] { return lockAttempted || operationFinished; });
+        assert(lockAttempted && !operationFinished);
+        releaseOperation = true; raceCondition.notify_all();
+    }
+    verifier.join(); patcher.join(); beforeHash = nullptr;
+    assert(result == 0 && !verifyRestored && !verifyRestoreFailed);
+    puts("PASS: concurrent patch/verify waits for recorded originals, including first vnode, fat offsets and untouched blocks");
+}
 int main() {
     for (int version : {21, 25}) for (bool disable : {false, true}) {
         reset(version, false, true, true); noLeReadyMask = disable; Patcher::init(0);
@@ -508,6 +610,7 @@ int main() {
     assert(blocked == originals() && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
     verifyTests();
     rpaTests();
+    verifyRaceTests();
     puts("PASS: actual page hook gates unknown/unsupported/mixed controllers; supported IDs retain WBS; verification and advertising checks pass");
 }
 '''
@@ -526,7 +629,8 @@ with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     cpp, binary = directory / "pages.cpp", directory / "pages"
     scope_include = '#include "' + str(ROOT / "kext/BT/msbc/MsbcControllerScope.hpp") + '"\n'
     cpp.write_text(scope_include + mock + declarations + state + "\n" + wrappers + tests)
-    sanitizer = [] if args.no_sanitize else ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+    sanitizer = [] if args.no_sanitize else ["-fsanitize=" + ("thread" if args.thread_sanitize else "address,undefined"),
+                                            "-fno-sanitize-recover=all"]
     subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
                     *sanitizer, str(cpp), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

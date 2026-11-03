@@ -47,6 +47,7 @@ public:
     bool setLinkState(IO80211LinkState, unsigned int) override;
     UInt32 output(mbuf_t);
     static bool receive(void*, const uint8_t*, size_t, uint8_t, int8_t);
+    bool bpfScratchReady();
     IOReturn getSSID(apple80211_ssid_data*) override;
     IOReturn getCHANNEL(apple80211_channel_data*) override;
     IOReturn getBSSID(apple80211_bssid_data*) override;
@@ -192,6 +193,8 @@ private:
     uint64_t actionSubmitted = 0, actionFailed = 0, actionReceived = 0, lastDiagnostic = 0;
     uint64_t actionHostAccepted = 0, actionHostRejected = 0, actionRSSIRejected = 0;
     uint64_t actionNativeDelivered = 0, actionInvalid = 0, actionNoBuffer = 0;
+    uint64_t bpfScratchPrepared = 0, bpfScratchFailed = 0;
+    OSObject *bpfScratchPacket = NULL;  // IO80211's, not retained
     uint8_t rejectedAction[2048] = {}; size_t rejectedActionLength = 0;
     int32_t lastActionRSSI = 0;
     uint8_t miTemplate[2048] = {}; size_t miTemplateLength = 0;

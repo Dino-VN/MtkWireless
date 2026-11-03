@@ -1057,6 +1057,8 @@ mach_vm_address_t orgCsValidatePage, orgVnopVerify;
  * it is installed later, as with Lilu plugin order today), and hand
  * VNOP_VERIFY a copy of the block with those bytes restored. A range is
  * restored only while the block still holds exactly the patched bytes.
+ * Both hooks hold pageLock: verification must not hash a page between its
+ * modification and recording the originals, including the first page.
  * -mtkbtnoverifyfix disables it.
  */
 constexpr size_t kPatchRangeMax = 96;
@@ -1137,8 +1139,13 @@ errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *
                    uint32_t flags, vfs_context_t ctx, void *kind)
 {
     auto org = FunctionCast(vnopVerify, orgVnopVerify);
-    if (LIKELY(!buf || vp != __atomic_load_n(&bluetoothdVnode, __ATOMIC_ACQUIRE)) || flags != 0 || offset < 0)
+    if (LIKELY(!buf) || !size || !pageLock || flags != 0 || offset < 0)
         return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    // The first validated page may still be recording its originals. Do not
+    // bypass the lock just because csValidatePage has not published its vnode.
+    if (vp != __atomic_load_n(&bluetoothdVnode, __ATOMIC_ACQUIRE) && !isBluetoothd(vp))
+        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    IOLockLock(pageLock);
     const uint64_t start = (uint64_t)offset;
     const uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE);
     auto patchedInBlock = [&](const PatchRange &r) {
@@ -1148,12 +1155,18 @@ errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *
     bool restore = false;
     for (uint32_t i = 0; i < count && !restore; i++)
         restore = patchedInBlock(patchRanges[i]);
-    if (!restore)
-        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+    if (!restore) {
+        // The shared buffer must remain untouched until the hash finishes.
+        errno_t err = org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        IOLockUnlock(pageLock);
+        return err;
+    }
     auto copy = static_cast<uint8_t *>(IOMalloc(size));
     if (!copy) {
         OSIncrementAtomic(&verifyRestoreFailed);
-        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        errno_t err = org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        IOLockUnlock(pageLock);
+        return err;
     }
     memcpy(copy, buf, size);
     for (uint32_t i = 0; i < count; i++) {
@@ -1161,6 +1174,8 @@ errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *
         if (patchedInBlock(r))
             memcpy(copy + (r.fileOffset - start), r.original, r.length);
     }
+    // The private copy no longer depends on the mutable file-cache pages.
+    IOLockUnlock(pageLock);
     errno_t err = org(vp, offset, copy, size, blockSize, context, flags, ctx, kind);
     IOFree(copy, size);
     OSIncrementAtomic(err ? &verifyRestoreFailed : &verifyRestored);
@@ -1191,8 +1206,8 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     patchBluetoothdPage(data);
     if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0)
         recordPageDiff(pageOffset, pageSnapshot, static_cast<const uint8_t *>(data));
-    IOLockUnlock(pageLock);
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+    IOLockUnlock(pageLock);
 }
 
 // Empty until launchd sets it, so only call this once bluetoothd runs.

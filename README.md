@@ -8,9 +8,6 @@ protocol logic written in Rust. Two independent kexts:
 | `MtkWirelessWifi.kext` | PCIe Wi-Fi (IO80211/Skywalk), macOS 26 Tahoe | — | GPL-2.0 |
 | `MtkWirelessBT.kext` | USB Bluetooth firmware + bluetoothd fixes | Lilu | GPL-3.0-only |
 
-Successor of [SimpleMtkWlan](https://github.com/eiyuumiru/SimpleMtkWlan) and
-[SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw).
-
 ## Status
 
 Tested on one machine: macOS 26.7.1 (25G241) and 26.7.2 (25G332), SMBIOS MacPro7,1 (no real T2),
@@ -83,14 +80,12 @@ ioreg -l -w0 | grep -E 'RustCore|RustSelfTestFailed'
 Suggested order on a new machine, one kext at a time, keeping a bootable
 fallback EFI:
 
-1. **MtkWirelessBT** instead of SimpleMtkBtFw + SimpleMtkBtPatcher (OpenCore,
-   after Lilu and BlueToolFixup). Check `MtkBtLog` on the USB device, the
+1. **MtkWirelessBT** (after Lilu and BlueToolFixup). Check `MtkBtLog` on the USB device, the
    `MtkWirelessBT` dictionary on IOResources (`RustSelfTestFailed = 0`,
    `LeFeaturesShimEnabled = true`, `BluetoothdExtAdvPatched` ≥ 1), pairing,
    AirPods audio. Then run `scripts/Collect-AirDrop-BT.command` for the BLE
    advertising check.
-2. **MtkWirelessWifi** instead of AirportMtkWlan (same load method as
-   before). Check `RustSelfTestFailed = 0` and `AwdlLayoutOk = Yes`, then scan,
+2. **MtkWirelessWifi**. Check `RustSelfTestFailed = 0` and `AwdlLayoutOk = Yes`, then scan,
    join, DHCP, throughput and `mtkctl log`. Then AirDrop both ways;
    `scripts/Collect-AirDrop-AWDL.command` records AWDL if it fails.
 
@@ -120,10 +115,9 @@ The script:
 - finds the EFI partition OpenCore booted from and mounts it;
 - downloads the latest release and installs it, or updates it if the EFI
   has an older version (`--force` reinstalls, `--version v1.0.7` picks one);
-- removes conflicting kexts from `EFI/OC/Kexts` and `Kernel → Add`: itlwm,
-  AirportItlwm, IntelBluetoothFirmware/IntelBTPatcher/IntelBluetoothInjector,
-  BrcmPatchRAM*/BrcmFirmware*/BrcmBluetoothInjector*, SimpleMtkWlan,
-  AirportMtkWlan, SimpleMtkBtFw, SimpleMtkBtPatcher;
+- removes conflicting Wi-Fi/Bluetooth kexts (Intel itlwm/AirportItlwm/
+  IntelBluetooth*, Broadcom BrcmPatchRAM*/BrcmFirmware*/BrcmBluetoothInjector*,
+  other MediaTek kexts) from `EFI/OC/Kexts` and `Kernel → Add`;
 - adds Lilu and BlueToolFixup if they are missing (latest acidanthera
   releases), puts them in the right order, and sets the Bluetooth NVRAM keys;
 - prints which features work on your macOS build (see the table above).
@@ -134,6 +128,65 @@ changes: add `--dry-run`. Then reboot.
 
 ### Manual install
 
-Copy the kexts to `EFI/OC/Kexts` and merge `docs/config-snippet.plist`
-(`Kernel → Add` in order, NVRAM variables for Bluetooth). Remove
-SimpleMtkBtFw and SimpleMtkBtPatcher first. Details: [docs/BLUETOOTH.md](docs/BLUETOOTH.md).
+Download `MtkWireless-<version>-RELEASE.zip` from
+[Releases](https://github.com/Dino-VN/MtkWireless/releases) and unzip it.
+Keep a bootable copy of your EFI (USB stick) before changing it.
+
+1. **Mount the EFI partition** OpenCore boots from:
+
+   ```sh
+   sudo diskutil mount disk0s1     # check the disk with: diskutil list
+   ```
+
+2. **Remove conflicting kexts** from `EFI/OC/Kexts` and their entries in
+   `config.plist → Kernel → Add`: itlwm, AirportItlwm, IntelBluetooth*,
+   BrcmPatchRAM*/BrcmFirmware*/BrcmBluetoothInjector*, any other MediaTek
+   Wi-Fi/Bluetooth kext, and any SSDT that disables the Wi-Fi PCI device.
+
+3. **Copy kexts** to `EFI/OC/Kexts`:
+   - `MtkWirelessWifi.kext` (Wi-Fi)
+   - `MtkWirelessBT.kext` (Bluetooth), plus
+     [Lilu](https://github.com/acidanthera/Lilu/releases) and `BlueToolFixup.kext`
+     from [BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM/releases)
+     if you do not already have them.
+
+4. **`Kernel → Add`** (ProperTree / OCAT, or merge
+   [docs/config-snippet.plist](docs/config-snippet.plist)), in this order:
+
+   | # | BundlePath | ExecutablePath | MinKernel | MaxKernel |
+   |---|---|---|---|---|
+   | 1 | `Lilu.kext` | `Contents/MacOS/Lilu` | | |
+   | 2 | `BlueToolFixup.kext` | `Contents/MacOS/BlueToolFixup` | `21.0.0` | |
+   | 3 | `MtkWirelessWifi.kext` | `Contents/MacOS/MtkWirelessWifi` | `25.0.0` | `25.99.99` |
+   | 4 | `MtkWirelessBT.kext` | `Contents/MacOS/MtkWirelessBT` | | |
+
+   `PlistPath` is `Contents/Info.plist`, `Arch` `x86_64`, `Enabled` true.
+   Lilu must come before BlueToolFixup and MtkWirelessBT.
+
+5. **NVRAM for Bluetooth**: under `NVRAM → Add →
+   7C436110-AB2A-4BBB-A880-FE41995C9F82` add
+
+   | Key | Type | Value |
+   |---|---|---|
+   | `bluetoothInternalControllerInfo` | Data | `0000000000000000000000000000` (14 zero bytes) |
+   | `bluetoothExternalDongleFailed` | Data | `00` |
+
+   and list both keys under `NVRAM → Delete` for the same GUID.
+
+6. Save `config.plist`, run OpenCore's `ocvalidate` if you have it, then
+   reboot (Reset NVRAM once from the OpenCore picker so the NVRAM keys apply).
+
+7. **Check**:
+
+   ```sh
+   kmutil showloaded --list-only | grep MtkWireless
+   ioreg -l -w0 | grep -E 'RustSelfTestFailed'      # should be 0
+   system_profiler SPBluetoothDataType | grep -E 'Chipset|State'
+   ```
+
+   Bluetooth should show `Chipset: THIRD_PARTY_DONGLE` and `State: On`;
+   the Wi-Fi menu should list networks.
+
+**Updating**: replace the two kexts in `EFI/OC/Kexts` and reboot (or rerun
+the installer). Details: [docs/WIFI.md](docs/WIFI.md),
+[docs/BLUETOOTH.md](docs/BLUETOOTH.md).

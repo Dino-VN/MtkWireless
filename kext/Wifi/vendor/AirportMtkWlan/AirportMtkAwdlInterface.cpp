@@ -838,6 +838,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLActionNativeDelivered",actionNativeDelivered,64);
     setProperty("MTKAWDLActionInvalid",actionInvalid,64);
     setProperty("MTKAWDLActionNoBuffer",actionNoBuffer,64);
+    setProperty("MTKAWDLBpfScratchPrepared",bpfScratchPrepared,64);
+    setProperty("MTKAWDLBpfScratchFailed",bpfScratchFailed,64);
     setProperty("MTKAWDLLastActionRSSI",static_cast<uint64_t>(lastActionRSSI),32);
     if(rejectedActionLength) setProperty("MTKAWDLRejectedAction",rejectedAction,static_cast<unsigned>(rejectedActionLength));
     setProperty("MTKAWDLMISubmitted",miSubmitted,64);
@@ -1378,6 +1380,39 @@ void AirportMtkAwdlInterface::recordInvalidDataRx(const uint8_t *f,size_t n,
     memcpy(sample.prefix,f,length);
 }
 
+// MtkWireless: IO80211VirtualInterface::allocBpfResources (setInterfaceEnable)
+// takes a scratch packet from getTxPacketPool() with allocatePacket(&p,0) and
+// setDataOffset(0), but never prepares it. Our pool's buflets exist only after
+// prepareWithQueue, so the packet's buffer slot stays NULL. With a BPF tap on
+// awdl0, actionFrameInput -> sendToBpfTap -> getDataVirtualAddress then reads
+// NULL+0x58 (panic 2026-11-03 12:27, 25G332). Prepare that packet once here.
+// Tahoe 25G IO80211Family: BPF state at this+0x128, scratch packet at +0x40,
+// filled only by allocBpfResources and freed (pool deallocate) in stop().
+#ifdef KERNEL
+bool AirportMtkAwdlInterface::bpfScratchReady()
+{
+    auto state=*reinterpret_cast<uint8_t **>(reinterpret_cast<uint8_t *>(this)+0x128);
+    if(!state) return true;
+    auto object=*reinterpret_cast<OSObject **>(state+0x40);
+    if(!object) return true;  // sendToBpfTap skips a missing scratch packet
+    if(object==bpfScratchPacket) return true;
+    IOSkywalkPacket *packet=OSDynamicCast(IOSkywalkPacket,object);
+    if(!packet) { ++bpfScratchFailed; return false; }
+    IOSkywalkPacketBuffer *buffer=NULL;
+    if(packet->getPacketBuffers(&buffer,1)!=1 || !buffer) {
+        buffer=NULL;
+        if(packet->prepareWithQueue(NULL,2,0)!=kIOReturnSuccess ||
+           packet->getPacketBuffers(&buffer,1)!=1 || !buffer ||
+           packet->setDataOffset(0)!=kIOReturnSuccess) {
+            ++bpfScratchFailed; return false;
+        }
+    }
+    bpfScratchPacket=object;
+    ++bpfScratchPrepared;
+    return true;
+}
+#endif
+
 bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,uint8_t channel,int8_t rssi)
 {
     auto self=static_cast<AirportMtkAwdlInterface *>(context);
@@ -1440,6 +1475,9 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         // sync TLV or election policy. Native validates the bounded body itself.
         // Native AWDL action input receives the vendor action body and a
         // 72-byte host metadata header. bpfTapInput owns/returns the buffer.
+#ifdef KERNEL
+        if(!self->bpfScratchReady()) { ++self->actionNoBuffer; return true; }
+#endif
         IO80211BufferPool *pool=self->getMgmtFramePool();
         IO80211Buffer *buffer=pool ? pool->getBuffer() : NULL;
         if(!buffer) { ++self->actionNoBuffer; return true; }

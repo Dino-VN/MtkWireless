@@ -1,12 +1,12 @@
 # Bluetooth (MtkWirelessBT.kext)
 
 Firmware loader and bluetoothd fixes for MediaTek MT7921 / MT7922 USB
-Bluetooth. Replaces `SimpleMtkBtFw.kext` **and** `SimpleMtkBtPatcher.kext`:
-never load them together with MtkWirelessBT (both would claim the device).
+Bluetooth. Do not load any other MediaTek Bluetooth firmware kext together
+with it (both would claim the device).
 
 | Feature | Status |
 |---|---|
-| Firmware load, pairing | ✅ (same sequence as SimpleMtkBtFw 1.1.0) |
+| Firmware load, pairing | ✅ |
 | A2DP (SBC/AAC), AirPods AAC-ELD, controls, switching | ✅ via Read Clock and ACL fixes |
 | BLE scanning | ✅ |
 | BLE advertising / AirDrop | ⚠️ feature-mask shim, see [BLE-ADVERTISING.md](BLE-ADVERTISING.md) |
@@ -14,8 +14,6 @@ never load them together with MtkWirelessBT (both would claim the device).
 
 Rewritten in Rust (rust/mtk-bt): firmware parsing, WMT, the bring-up
 sequence and every HCI rewrite. C++ keeps USB access, zlib and the Lilu routes.
-Behavior is the same as SimpleMtkBtFw/SimpleMtkBtPatcher; the boot arguments
-were renamed (see below).
 
 ## Install (OpenCore)
 
@@ -44,7 +42,7 @@ were renamed (see below).
 | `-mtkbtoff` | Disable the Lilu routes (the loader still runs) |
 | `-mtkbtdbg` | Lilu debug logging for the plugin |
 | `-mtkbtnolefix` | Disable the LE feature-mask shim only |
-| `-mtkbtrandaddr` | Send a fixed LE random address before scanning (was `-smbtrandaddr`) |
+| `-mtkbtrandaddr` | Send a fixed LE random address before scanning |
 | `-mtkbtnomsbc` | Disable the mSBC (wideband microphone) bridge; calls fall back to CVSD |
 
 ## Wideband microphone (Tahoe)
@@ -113,6 +111,20 @@ bluetoothd range and lets the verification hash a copy with them restored.
 `-mtkbtnoverifyfix` disables this. `BluetoothdPatchRanges` should count
 both kexts' patches (about six on 25G241) and `BluetoothdVerifyRestored` how
 often a block needed it.
+
+Since 1.0.8 the page hook and verification hook share a lock. Without it, a
+neighbour's page-in could hash a page after its bytes were patched but before
+their originals were recorded, including the first page before the cached
+vnode was published. Verification also keeps an untouched shared buffer
+locked until its hash finishes; restored private copies can be hashed after
+unlocking. The 2026-11-02 regression pauses the production hook in this gap
+and verifies the 16 KB block containing the RPA helpers and the adjacent
+`__DATA_CONST` page, using the universal binary's 16 KB slice offset. It
+fails before the fix and passes with the lock. Run it with ASan/UBSan by
+default, or with `python3 scripts/test-bt-msbc-page-patches.py --thread-sanitize`.
+The recorded `SIGBUS / FS pagein error: 94 Bad message` crashes are consistent
+with this race; a build with the fix still needs hardware verification after
+installation and reboot.
 
 ## Checking
 

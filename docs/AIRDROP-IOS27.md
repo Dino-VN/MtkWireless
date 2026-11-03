@@ -67,7 +67,7 @@ no EFI files were replaced and the running driver is still the previous build.
 
 After the user installed the archive and restarted, the running Wi-Fi UUID
 was FA49826C-19FD-34E1-9FC2-EB6DE0642209, matching this build. Rust self-tests
-and AWDL layout checks passed, but AirportMtkWlan stopped during startup
+and AWDL layout checks passed, but the Wi-Fi driver stopped during startup
 before publishing a network interface. Accessible logs do not retain the
 exact failure reason. A full power removal was suggested to distinguish a
 warm-restart controller state issue; its result and AirDrop verification are

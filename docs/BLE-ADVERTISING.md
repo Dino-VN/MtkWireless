@@ -5,8 +5,7 @@ rejects. The shim is on by default on Monterey and later when all four
 IOUSBHostFamily routes resolve (`-mtkbtnolefix` turns it off). The hook
 symbols were checked on Tahoe 26.7.1 / 25G241; other versions are unverified.
 
-The logic is in `rust/mtk-bt/src/le_features.rs` (ported from
-SimpleMtkBtPatcher's `LeFeaturesShim.hpp`); `kext/BT/Patcher.cpp` moves the
+The logic is in `rust/mtk-bt/src/le_features.rs` ; `kext/BT/Patcher.cpp` moves the
 bytes in and out of the USB transfers. Separate bluetoothd page patches enable
 its standard advertising and per-set address paths. macOS owns the addresses;
 the shim does not provision an IRK or implement Broadcom privacy commands.
@@ -21,11 +20,7 @@ transfer still fails: endpoint resolution stalls and sharingd reports
 `missingEndpoint` before transferring data. Advertising is verified;
 end-to-end AirDrop is still unresolved.
 
-In the earlier capture
-(`airdrop-bt-20261023-212105`) `kexts.txt` lists SimpleMtkBtFw 1.0.0 but no
-SimpleMtkBtPatcher, so the patcher that carried the shim was not loaded and
-the trace shows the unpatched behavior. The collector now warns when
-MtkWirelessBT is not loaded.
+The collector warns when MtkWirelessBT is not loaded.
 
 ## 2026-10-24: bluetoothd disables its own advertiser
 
