@@ -105,7 +105,7 @@ scripts/package.sh Release    # dist/MtkWireless-<version>-RELEASE.zip
 One command installs or updates everything. Paste it into Terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Dino-VN/MtkWireless/main/scripts/install.sh -o /tmp/mtkw-install.sh && sudo bash /tmp/mtkw-install.sh
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dino-VN/MtkWireless/main/scripts/install.sh)"
 ```
 
 The script:
