@@ -337,12 +337,28 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   `apfs_announce_hash_mismatch ... (bluetoothd)` (2026-10-27/29,
   BlueToolFixup's 15.4 chipset patch at 0x1e3737, fault 0x1e2327).
   `csValidatePage` snapshots each bluetoothd page before any patcher runs
-  and records the changed ranges; the `_VNOP_VERIFY` route hashes a copy of
+  and records the changed ranges; APFS's verifier then hashes a copy of
   the block with those ranges restored (only where the block holds exactly
   the patched bytes). Our route must be installed after BlueToolFixup's to
-  see its patches (Lilu plugin order). `-mtkbtnoverifyfix` off. ioreg
-  `BluetoothdVerifyFixRouted`/`BluetoothdPatchRanges`/`BluetoothdVerifyRestored`.
-  Test: `scripts/test-bt-msbc-page-patches.py`. Unverified on hardware.
+  see its patches (Lilu plugin order). `-mtkbtnoverifyfix` off.
+  Do not route `_VNOP_VERIFY` for this: 25G332 inlines it into
+  `decmpfs_pagein_compressed` (`callq *vp->v_op[vdesc_offset]`), so 1.0.4-1.0.8
+  never saw a page-in. 1.0.8 hardware (2026-11-03 17:31, after sleep):
+  bluetoothd aborted, every relaunch SIGBUSed at dyld start ("Data hash
+  mismatch ... offset 11157504": RPA helper page resident, `__got` absent;
+  APFS's hash = block with exactly our helper patch), launchd throttled it,
+  Bluetooth dead until reboot. 1.0.9 (`installVerifyOp`, at bluetoothd's
+  first validated page, under `pageLock`) replaces the `vnop_verify` entry of
+  the bluetoothd vnode's operations vector (APFS's, shared by its regular
+  files) with `verifyOp`; `v_op`'s offset is decoded from `_VNOP_VERIFY`
+  (0xd0) and checked against `vnode_mount`/`vnode_fsnode`; `vdesc_offset` is
+  read then, not at patcher load (bsd_init numbers it). RPA and range
+  recording need it installed. ioreg `BluetoothdVerifyHookState` (1 in,
+  2-6 failed step), `BluetoothdVnodeOpsOffset`, `BluetoothdPatchRanges`,
+  `BluetoothdVerifyRestored`, `BluetoothdVerifyFailed`(+`LastFailOffset`),
+  published from a thread call so they update while bluetoothd crashes.
+  Test: `scripts/test-bt-msbc-page-patches.py` (decodes this host's kernel).
+  Unverified on hardware.
 - HFP wideband (Tahoe, on unless `-mtkbtnomsbc`; USB `13d3:3610` and
   `0489:e0cd` only, `UsbMsbcScope.hpp`; `kext/BT/msbc`):
   bluetoothd keeps a 33-byte PCM SCO view; `UsbMsbcBridge` maps interface 1

@@ -66,6 +66,7 @@ mock = r'''
 #include <array>
 #include <cassert>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +81,10 @@ using memory_object_offset_t = uint64_t;
 using errno_t = int;
 using vfs_context_t = void *;
 typedef void IOLock;
+typedef void IOSimpleLock;
+using thread_call_param_t = void *;
+using thread_call_t = void *;
+constexpr int KERN_SUCCESS = 0;
 using SInt32 = int32_t;
 constexpr size_t PAGE_SIZE = 4096;
 #ifndef PATH_MAX
@@ -107,8 +112,24 @@ int32_t bluetoothdRpaHelpersPatched, bluetoothdRpaLegacyPatched, bluetoothdRpaSc
 int32_t bluetoothdRpaDecodePatched, bluetoothdRpaDevicePatched, bluetoothdRpaConnectPatched, bluetoothdRpaUpdatePatched;
 uint32_t rustFailed;
 uint32_t patchRangeCount;
-int32_t patchRangeOverflow, verifyRestored, verifyRestoreFailed;
+int32_t patchRangeOverflow, verifyRestored, verifyRestoreFailed, verifyFailed, verifyOpState;
+uint64_t verifyLastFailOffset;
+uint32_t vnodeOpsOffset;
 bool verifyFixEnabled, verifyFixRouted;
+int publishes;
+void publishLater() { ++publishes; }
+thread_call_t publishCall;
+thread_call_t thread_call_allocate(void (*)(thread_call_param_t, thread_call_param_t), thread_call_param_t) {
+    static int call; return &call;
+}
+// Kernel write protection lifted around the vector store, always restored.
+bool writingFails; int writing, writingRounds;
+struct MachInfo {
+    static int setKernelWriting(bool enable, IOSimpleLock *) {
+        if (enable) { assert(!writing); writing = 1; ++writingRounds; return writingFails ? 1 : KERN_SUCCESS; }
+        assert(writing == 1); writing = 0; return KERN_SUCCESS;
+    }
+};
 void *leLock;
 int getKernelVersion() { return kernel; }
 bool checkKernelArgument(const char *name) {
@@ -167,12 +188,11 @@ void originalValidate(vnode_t, memory_object_t, memory_object_offset_t, const vo
 }
 const uint8_t *pristine; // the file as stored; the verify mock hashes against it
 int verifies;
-errno_t originalVerify(vnode_t, off_t offset, uint8_t *buf, size_t size, size_t *, void **, uint32_t, vfs_context_t, void *) {
-    ++verifies;
-    if (beforeHash) beforeHash();
-    return buf && memcmp(buf, pristine + offset, size) ? 94 : 0;
-}
-mach_vm_address_t orgCsValidatePage, orgVnopVerify;
+mach_vm_address_t orgCsValidatePage;
+// _VNOP_VERIFY's code, decoded for offsetof(struct vnode, v_op), and _vnop_verify_desc.
+struct FakeDesc { int vdesc_offset; } fakeDesc;
+uint8_t fakeVerifyCode[192];
+bool verifySymbolsMissing;
 struct KernelPatcher {
     static constexpr int KernelID = 0;
     struct RouteRequest {
@@ -180,16 +200,19 @@ struct KernelPatcher {
         mach_vm_address_t *original;
         template<class Fn> RouteRequest(const char *s, Fn, mach_vm_address_t &o) : symbol(s), original(&o) {}
     };
-    bool routeFails = false, verifyRouteFails = false;
+    static IOSimpleLock *kernelWriteLock;
+    bool routeFails = false;
     bool routeMultipleLong(int id, RouteRequest *routes, size_t count) {
         assert(id == KernelID && count == 1);
-        if (!strcmp(routes[0].symbol, "_VNOP_VERIFY")) {
-            if (verifyRouteFails) return false;
-            *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalVerify); return true;
-        }
         assert(!strcmp(routes[0].symbol, "_cs_validate_page"));
         if (routeFails) return false;
         *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalValidate); return true;
+    }
+    mach_vm_address_t solveSymbol(int id, const char *symbol) {
+        assert(id == KernelID);
+        if (verifySymbolsMissing) return 0;
+        if (!strcmp(symbol, "_vnop_verify_desc")) return reinterpret_cast<mach_vm_address_t>(&fakeDesc);
+        assert(!strcmp(symbol, "_VNOP_VERIFY")); return reinterpret_cast<mach_vm_address_t>(fakeVerifyCode);
     }
     void clearError() {}
     static bool findAndReplace(void *data, size_t size, const void *find, size_t findSize,
@@ -204,6 +227,7 @@ struct KernelPatcher {
         return true;
     }
 };
+IOSimpleLock *KernelPatcher::kernelWriteLock;
 int kextIOBluetoothFamily, kextIOUSBHostFamily;
 void processKext(void *, KernelPatcher &, size_t, mach_vm_address_t, size_t) {}
 struct Lilu {
@@ -215,6 +239,42 @@ struct Lilu {
     }
 } lilu;
 namespace Patcher { void init(uint32_t); void observeMsbcController(bool); }
+'''
+
+# After VnopVerifyArgs/VnodeOp: the APFS operations vector of the bluetoothd vnode.
+vop_mock = r'''
+constexpr int kVerifyIndex = 37;
+VnodeOp fakeOps[64];
+void *fakeFields[3];
+int fakeMount, fakeData, fakeContext;
+bool badFields;
+void *const *vnodeOpsFields(vnode_t) { assert(vnodeOpsOffset); return fakeFields; }
+void *vnode_mount(vnode_t) { return &fakeMount; }
+void *vnode_fsnode(vnode_t) { return badFields ? nullptr : &fakeData; }
+size_t verifyBlockSize = 16384;
+int apfsVerify(void *arg) {
+    auto *ap = static_cast<VnopVerifyArgs *>(arg); ++verifies;
+    assert(ap->a_desc == &fakeDesc && ap->a_context == &fakeContext && ap->a_verifyblksize == &verifyBlockSize);
+    if (beforeHash) beforeHash();
+    return ap->a_buf && memcmp(ap->a_buf, pristine + ap->a_foffset, ap->a_bufsize) ? 94 : 0;
+}
+int defaultOp(void *) { return 45; }
+// VNOP_VERIFY as decmpfs inlines it: vp->v_op[vnop_verify_desc.vdesc_offset](&args).
+int verifyCall(vnode_t vp, off_t offset, uint8_t *buf, size_t size, uint32_t flags = 0) {
+    VnopVerifyArgs args {&fakeDesc, vp, offset, buf, size, &verifyBlockSize, nullptr, flags, &fakeContext, nullptr};
+    return fakeOps[fakeDesc.vdesc_offset](&args);
+}
+// 25G332: 49 8b 8f d0 00 00 00 (movq 0xd0(%r15),%rcx), 48 63 15 rel32 (movslq _vnop_verify_desc(%rip),%rdx).
+void writeVerifyCode(size_t at, bool disp8 = false, int64_t skew = 0) {
+    memset(fakeVerifyCode, 0xcc, sizeof(fakeVerifyCode));
+    uint8_t *p = fakeVerifyCode + at;
+    const uint8_t load32[] {0x49, 0x8b, 0x8f, 0xd0, 0x00, 0x00, 0x00}, load8[] {0x48, 0x8b, 0x4f, 0x68};
+    if (disp8) { memcpy(p, load8, sizeof(load8)); p += sizeof(load8); }
+    else { memcpy(p, load32, sizeof(load32)); p += sizeof(load32); }
+    const uint8_t movslq[] {0x48, 0x63, 0x15}; memcpy(p, movslq, sizeof(movslq));
+    const int32_t rel = int32_t(reinterpret_cast<intptr_t>(&fakeDesc) + skew - reinterpret_cast<intptr_t>(p + 7));
+    memcpy(p + 3, &rel, sizeof(rel));
+}
 '''
 
 tests = r'''
@@ -235,7 +295,15 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     kernel = version; flag = enabled; noExtAdv = disableAdv; noVerifyFix = disableVerify;
     verifyFixEnabled = verifyFixRouted = false; patchRangeCount = 0; bluetoothdVnode = nullptr;
     patchRangeOverflow = verifyRestored = verifyRestoreFailed = verifies = 0;
-    free(pageSnapshot); pageSnapshot = nullptr; pageLock = nullptr; lilu.patcher.verifyRouteFails = false;
+    free(pageSnapshot); pageSnapshot = nullptr; pageLock = nullptr;
+    vnopVerifyDesc = 0; vnodeOpsOffset = 0; verifyOpState = verifyFailed = 0; verifyLastFailOffset = 0;
+    orgVerifyOp = nullptr; publishCall = nullptr; publishes = 0; verifySymbolsMissing = false;
+    writingFails = false; writingRounds = 0; badFields = false;
+    fakeDesc.vdesc_offset = kVerifyIndex;
+    for (auto &op : fakeOps) op = nullptr;
+    fakeOps[0] = defaultOp; fakeOps[kVerifyIndex] = apfsVerify;
+    fakeFields[0] = fakeOps; fakeFields[1] = &fakeMount; fakeFields[2] = &fakeData;
+    writeVerifyCode(0x70);
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
     noRpa = rpaPatchEnabled = rpaHelpersReady = false; rpaBuildState = 0;
     noLeReadyMask = leReadyMaskEnabled = false;
@@ -347,7 +415,7 @@ void rpaTests() {
     helper = helperPage(); helper[0xb88 + 4] ^= 1;
     const Page unsupported = helper; apply(helper);
     assert(helper == unsupported && !rpaHelpersReady);
-    reset(25, true, false); lilu.patcher.verifyRouteFails = true; Patcher::init(0);
+    reset(25, true, false); verifySymbolsMissing = true; Patcher::init(0);
     helper = helperPage(); const Page noVerify = helper; apply(helper);
     assert(helper == noVerify && !rpaHelpersReady && !bluetoothdRpaHelpersPatched);
 
@@ -378,8 +446,8 @@ void rpaTests() {
     assert(cache == expected && patchRangeCount < kPatchRanges && !patchRangeOverflow);
     for (const auto &site : rpaSites) assert(*site.counter == 1);
     const uint32_t ranges = patchRangeCount;
-    size_t blockSize = 16384;
-    assert(vnopVerify(btd, 0, cache.data(), cache.size(), &blockSize, nullptr, 0, nullptr, nullptr) == 0);
+    assert(fakeOps[kVerifyIndex] == verifyOp);
+    assert(verifyCall(btd, 0, cache.data(), cache.size()) == 0);
     assert(cache == expected && verifyRestored == 1 && !verifyRestoreFailed);
     // Revalidation is idempotent, and a refault must reuse the same ranges.
     for (size_t page = 0; page < 4; ++page) {
@@ -390,7 +458,7 @@ void rpaTests() {
     }
     assert(patchRangeCount == ranges && !patchRangeOverflow);
     auto tampered = cache; tampered[0x6c8] ^= 1;
-    assert(vnopVerify(btd, 0, tampered.data(), tampered.size(), &blockSize, nullptr, 0, nullptr, nullptr) == 94);
+    assert(verifyCall(btd, 0, tampered.data(), tampered.size()) == 94);
     assert(verifyRestoreFailed == 1);
     puts("PASS: RPA build/boot/verify gates, page boundaries, counters and full verify-block restoration");
 }
@@ -401,15 +469,16 @@ void verifyTests() {
     memcpy(file.data() + PAGE_SIZE + 210, extAdvFind, sizeof(extAdvFind));
     memcpy(file.data() + PAGE_SIZE + 3000, foreignFind, sizeof(foreignFind));
     pristine = file.data();
-    size_t blockSize = 16384;
     auto verify = [&](vnode_t vp, off_t offset, uint8_t *buf, size_t size, uint32_t flags = 0) {
-        return vnopVerify(vp, offset, buf, size, &blockSize, nullptr, flags, nullptr, nullptr);
+        return verifyCall(vp, offset, buf, size, flags);
     };
 
     reset(25, true, false); Patcher::init(0);
-    assert(verifyFixRouted && extAdvPatchRouted);
+    // Installed at bluetoothd's first validated page, not at patcher load.
+    assert(!verifyFixRouted && !verifyOpState && extAdvPatchRouted && fakeOps[kVerifyIndex] == apfsVerify);
     std::vector<uint8_t> cache = file; // the file cache: page 1 resident and patched
     csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
+    assert(verifyFixRouted && verifyOpState == VerifyOpInstalled && fakeOps[kVerifyIndex] == verifyOp);
     assert(bluetoothdPatched == 1 && patchRangeCount == 2 && bluetoothdVnode == btd && !lockDepth);
     assert(!memcmp(cache.data() + PAGE_SIZE + 3000, foreignReplace, sizeof(foreignReplace)));
     const std::vector<uint8_t> patched = cache;
@@ -456,11 +525,71 @@ void verifyTests() {
     assert(!verifyFixRouted && extAdvPatchRouted && !pageSnapshot);
     cache = file; csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
     assert(bluetoothdPatched == 1 && patchRangeCount == 0 && !bluetoothdVnode);
-    reset(25, true, false); lilu.patcher.verifyRouteFails = true; Patcher::init(0);
+    assert(!verifyOpState && fakeOps[kVerifyIndex] == apfsVerify && !writingRounds);
+    reset(25, true, false); verifySymbolsMissing = true; Patcher::init(0);
     assert(!verifyFixRouted && extAdvPatchRouted);
     cache = file; csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
     assert(patchRangeCount == 0 && verify(btd, 0, cache.data(), cache.size()) == 94);
-    puts("PASS: VNOP_VERIFY restores recorded patch ranges (ours and a wrapped foreign patcher) only in bluetoothd blocks");
+    assert(verifyOpState == VerifyOpNoSymbols && fakeOps[kVerifyIndex] == apfsVerify && !writingRounds);
+    puts("PASS: vnop_verify restores recorded patch ranges (ours and a wrapped foreign patcher) only in bluetoothd blocks");
+}
+// The verifier entry of the bluetoothd vnode's operations vector.
+void verifyOpTests() {
+    const char *btd = "/usr/sbin/bluetoothd", *other = "/usr/sbin/BlueTool";
+    const auto code = reinterpret_cast<uint64_t>(fakeVerifyCode), desc = reinterpret_cast<uint64_t>(&fakeDesc);
+    auto decode = [&](size_t size = sizeof(fakeVerifyCode)) { return decodeVnodeOpsOffset(fakeVerifyCode, size, code, desc); };
+    writeVerifyCode(0x70); assert(decode() == 0xd0);
+    writeVerifyCode(0x10, true); assert(decode() == 0x68);
+    writeVerifyCode(0x70, false, 8); assert(!decode());                // movslq of another symbol
+    writeVerifyCode(0x70); fakeVerifyCode[0x72] = 0x8c; assert(!decode()); // SIB form
+    writeVerifyCode(0x70); fakeVerifyCode[0x71] = 0x89; assert(!decode()); // a store, not a load
+    writeVerifyCode(0x70); fakeVerifyCode[0x73] = 0xd4; assert(!decode()); // not pointer aligned
+    writeVerifyCode(0x70); assert(!decode(0x70 + 13));                  // past the scanned bytes
+    if (realKernel) {
+        const uint32_t offset = decodeVnodeOpsOffset(realVerifyCode, sizeof(realVerifyCode), realVerifyAddress, realDescAddress);
+        assert(offset);
+        printf("PASS: this host's kernel: _VNOP_VERIFY loads v_op from vnode+%#x\n", offset);
+    }
+
+    reset(25, true, false); Patcher::init(0);
+    assert(vnodeOpsOffset == 0xd0 && vnopVerifyDesc && !verifyOpState && fakeOps[kVerifyIndex] == apfsVerify);
+    std::vector<uint8_t> file(PAGE_SIZE * 4, 0x5a); pristine = file.data();
+    Page page {}; apply(page, other);
+    assert(!verifyOpState && !writingRounds);
+    page = originals(); apply(page);
+    assert(verifyOpState == VerifyOpInstalled && verifyFixRouted && orgVerifyOp == apfsVerify);
+    assert(fakeOps[kVerifyIndex] == verifyOp && fakeOps[0] == defaultOp && writingRounds == 1 && !writing && publishes);
+    page = originals(); apply(page); assert(writingRounds == 1);
+    // Other vnodes, flags and digest-only calls reach APFS with the caller's arguments.
+    std::vector<uint8_t> buf = file; int before = verifies;
+    assert(verifyCall(other, 0, buf.data(), buf.size()) == 0 && verifies == before + 1);
+    buf[5] ^= 1;
+    assert(verifyCall(other, 0, buf.data(), buf.size()) == 94 && verifyCall(btd, 0, buf.data(), buf.size(), 8) == 94);
+    assert(verifyCall(btd, 0, nullptr, 0) == 0 && !verifyFailed);
+    // A bluetoothd block failing without recorded patch bytes is counted and published.
+    const int published = publishes;
+    assert(verifyCall(btd, PAGE_SIZE, buf.data() + PAGE_SIZE, PAGE_SIZE) == 0 && !verifyFailed);
+    assert(verifyCall(btd, 0, buf.data(), buf.size()) == 94 && verifyFailed == 1 && !verifyLastFailOffset);
+    assert(publishes == published + 1 && !verifyRestored && !verifyRestoreFailed);
+
+    // Every failed step leaves APFS's verifier, and RPA, alone.
+    for (int step = VerifyOpNoSymbols; step <= VerifyOpNoWrite + 1; ++step) {
+        reset(25, true, false);
+        if (step == VerifyOpNoSymbols) verifySymbolsMissing = true;
+        if (step == VerifyOpNoWrite + 1) writeVerifyCode(0x70, false, 8); // undecodable: also NoSymbols
+        if (step == VerifyOpBadVnode) badFields = true;
+        if (step == VerifyOpNoEntry) fakeOps[kVerifyIndex] = nullptr;
+        if (step == VerifyOpNoWrite) writingFails = true;
+        Patcher::init(0);
+        if (step == VerifyOpBadIndex) fakeDesc.vdesc_offset = 0;
+        Page helpers = helperPage(); const Page unpatched = helpers; apply(helpers);
+        assert(verifyOpState == (step > VerifyOpNoWrite ? int(VerifyOpNoSymbols) : step) && !verifyFixRouted);
+        assert(helpers == unpatched && !rpaHelpersReady && !patchRangeCount && !writing);
+        assert(fakeOps[kVerifyIndex] == (step == VerifyOpNoEntry ? nullptr : apfsVerify));
+        assert(writingRounds == (step == VerifyOpNoWrite));
+        page = originals(); apply(page); assert(bluetoothdPatched == 1 && !patchRangeCount);
+    }
+    puts("PASS: verifyOp replaces vnop_verify in the bluetoothd vnode's operations vector once, at its first page");
 }
 // Pause real patching after bytes change but before their originals are recorded.
 // Use the live fault's universal-file offset: __DATA_CONST follows the helper
@@ -488,9 +617,7 @@ void verifyRaceTests() {
         int result = -1;
         std::thread verifier([&] {
             watchLockAttempt = true;
-            size_t blockSize = 16384;
-            result = vnopVerify(btd, blockOffset, cache.data() + blockOffset, 16384,
-                                &blockSize, nullptr, 0, nullptr, nullptr);
+            result = verifyCall(btd, blockOffset, cache.data() + blockOffset, 16384);
             std::lock_guard<std::mutex> guard(raceMutex);
             operationFinished = true; raceCondition.notify_all();
         });
@@ -515,9 +642,7 @@ void verifyRaceTests() {
     beforeHash = pauseOperation;
     int result = -1;
     std::thread verifier([&] {
-        size_t blockSize = 16384;
-        result = vnopVerify(btd, blockOffset, cache.data() + blockOffset, 16384,
-                            &blockSize, nullptr, 0, nullptr, nullptr);
+        result = verifyCall(btd, blockOffset, cache.data() + blockOffset, 16384);
     });
     {
         std::unique_lock<std::mutex> guard(raceMutex);
@@ -553,7 +678,7 @@ int main() {
         const bool adv = version >= 21 && !disableAdv;
         const bool wideband = version == 25 && enabled && ready && scope == MsbcControllerScope::Supported;
         assert(lilu.pageRegistrations == int(version >= 21));
-        assert(verifyFixRouted == (version >= 21));
+        assert(!verifyFixRouted && !verifyOpState);
         assert(extAdvPatchEnabled == adv && msbcPatchEnabled == (version == 25 && enabled));
         Page page = originals(), expected = page;
         if (wideband) {
@@ -566,6 +691,7 @@ int main() {
             memcpy(expected.data() + 410, advAddressRetryReplace, sizeof(advAddressRetryReplace));
         }
         apply(page); assert(page == expected && validations == 1 && bluetoothdPages == 1);
+        assert(verifyFixRouted == (version >= 21) && (fakeOps[kVerifyIndex] == verifyOp) == (version >= 21));
         assert(bluetoothdWbsPatched == wideband && bluetoothdHfpFillPatched == wideband);
         assert(bluetoothdPatched == adv && bluetoothdAddressPatched == adv && bluetoothdAddressRetryPatched == adv);
         apply(page); assert(page == expected && bluetoothdWbsPatched == wideband && bluetoothdHfpFillPatched == wideband);
@@ -609,6 +735,7 @@ int main() {
     Page blocked = originals(); apply(blocked);
     assert(blocked == originals() && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
     verifyTests();
+    verifyOpTests();
     rpaTests();
     verifyRaceTests();
     puts("PASS: actual page hook gates unknown/unsupported/mixed controllers; supported IDs retain WBS; verification and advertising checks pass");
@@ -616,11 +743,56 @@ int main() {
 '''
 
 declarations = "\n".join(array(name)[0] for name in names)
+types = source[source.index("// struct vnop_verify_args"):source.index("/*\n * offsetof(struct vnode, v_op)")]
+
+
+def kernel_verify_code():
+    """192 bytes of this host's _VNOP_VERIFY, as processPatcher decodes them."""
+    kernel = Path("/System/Library/Kernels/kernel")
+    if platform.system() != "Darwin" or not kernel.exists():
+        return None
+    symbols = {}
+    for line in subprocess.run(["nm", "-arch", "x86_64", str(kernel)], capture_output=True, text=True).stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 3 and parts[2] in ("_VNOP_VERIFY", "_vnop_verify_desc"):
+            symbols[parts[2]] = int(parts[0], 16)
+    if len(symbols) != 2:
+        return None
+    data = kernel.read_bytes()
+    base = 0
+    if int.from_bytes(data[:4], "big") == 0xcafebabe:  # fat: pick the x86_64 slice
+        for i in range(int.from_bytes(data[4:8], "big")):
+            cputype, _, offset = (int.from_bytes(data[8 + 20 * i + 4 * j:12 + 20 * i + 4 * j], "big") for j in range(3))
+            if cputype == 0x01000007:
+                base = offset
+    assert int.from_bytes(data[base:base + 4], "little") == 0xfeedfacf
+    ncmds, at = int.from_bytes(data[base + 16:base + 20], "little"), base + 32
+    address = symbols["_VNOP_VERIFY"]
+    for _ in range(ncmds):
+        cmd, size = (int.from_bytes(data[at + 4 * j:at + 4 * j + 4], "little") for j in range(2))
+        if cmd == 0x19:
+            vmaddr, vmsize, fileoff = (int.from_bytes(data[at + 24 + 8 * j:at + 32 + 8 * j], "little") for j in range(3))
+            if vmaddr <= address < vmaddr + vmsize:
+                start = base + fileoff + address - vmaddr
+                return data[start:start + 192], address, symbols["_vnop_verify_desc"]
+        at += size
+    return None
+
+
+real = kernel_verify_code()
+if real:
+    real_code = ("const uint8_t realVerifyCode[] {" + ",".join(str(b) for b in real[0]) + "};\n" +
+                 f"const uint64_t realVerifyAddress = {real[1]:#x}ULL, realDescAddress = {real[2]:#x}ULL;\n" +
+                 "constexpr bool realKernel = true;\n")
+else:
+    real_code = "const uint8_t realVerifyCode[1] {};\nconst uint64_t realVerifyAddress = 0, realDescAddress = 0;\n" \
+                "constexpr bool realKernel = false;\n"
 state_start = source.index("constexpr size_t kPatchRangeMax")
 state = source[state_start:source.index("\n", source.index("vnode_t bluetoothdVnode;"))]
 wrappers = "\n\n".join(function(name) for name in (
     "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "static __attribute__((noinline)) bool isBluetoothdPath(", "bool isBluetoothd(",
-    "errno_t vnopVerify(", "bool isBluetoothdRpaBuild()", "void patchBluetoothdRpaPage(", "void patchBluetoothdPage(const void *data)\n{", "void csValidatePage(", "void processPatcher(",
+    "uint32_t decodeVnodeOpsOffset(", "void noteVerifyFailure(", "template <typename Verify>\nerrno_t verifyBluetoothdBlock(",
+    "int verifyOp(void *arg)", "void installVerifyOp(", "bool isBluetoothdRpaBuild()", "void patchBluetoothdRpaPage(", "void patchBluetoothdPage(const void *data)\n{", "void csValidatePage(", "void processPatcher(",
     "void Patcher::observeMsbcController(", "void Patcher::init("))
 compiler = shutil.which("clang++")
 assert compiler, "clang++ is required"
@@ -628,7 +800,8 @@ with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     directory = Path(directory)
     cpp, binary = directory / "pages.cpp", directory / "pages"
     scope_include = '#include "' + str(ROOT / "kext/BT/msbc/MsbcControllerScope.hpp") + '"\n'
-    cpp.write_text(scope_include + mock + declarations + state + "\n" + wrappers + tests)
+    cpp.write_text(scope_include + mock + declarations + state + "\n" + types + vop_mock + real_code + "\n" +
+                   wrappers + tests)
     sanitizer = [] if args.no_sanitize else ["-fsanitize=" + ("thread" if args.thread_sanitize else "address,undefined"),
                                             "-fno-sanitize-recover=all"]
     subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",

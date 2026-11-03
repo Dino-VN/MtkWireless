@@ -122,9 +122,30 @@ and verifies the 16 KB block containing the RPA helpers and the adjacent
 `__DATA_CONST` page, using the universal binary's 16 KB slice offset. It
 fails before the fix and passes with the lock. Run it with ASan/UBSan by
 default, or with `python3 scripts/test-bt-msbc-page-patches.py --thread-sanitize`.
-The recorded `SIGBUS / FS pagein error: 94 Bad message` crashes are consistent
-with this race; a build with the fix still needs hardware verification after
-installation and reboot.
+1.0.8 still lost Bluetooth after sleep (2026-11-03 17:31). On wake the
+USB port had been powered off, the controller re-enumerated and took the
+~22 s cold firmware download; bluetoothd aborted itself ("updateAdvertisement
+busy with address change for more than 10000ms") and every relaunch died at
+dyld start with SIGBUS. The kernel log named the block: "Data hash mismatch
+for 16384 bytes at offset 11157504" (file offset 0xaa4000: the RPA helper
+page resident, `__DATA_CONST`'s `__got` page absent), and the hash APFS
+computed is exactly that of the block with our helper patch applied. The
+verification hook had never run: the 25G332 kernel inlines `VNOP_VERIFY`
+into `decmpfs_pagein_compressed` and calls APFS's verifier through the
+vnode's operations vector, so the `_VNOP_VERIFY` route only saw other
+callers. Since 1.0.9 the hook replaces the `vnop_verify` entry of the
+bluetoothd vnode's operations vector (APFS's, shared by its regular files)
+at bluetoothd's first validated page; the `v_op` offset is decoded from
+`_VNOP_VERIFY` (0xd0 on 25G332) and checked against `vnode_mount` and
+`vnode_fsnode`. Expect `BluetoothdVerifyHookState = 1` once bluetoothd runs
+(2-6: the failed step, page patches then stay without RPA and
+recording), `BluetoothdVnodeOpsOffset = 208`, and `BluetoothdVerifyRestored`
+counting blocks that needed restoring (one after each bluetoothd relaunch
+whose `__got` page was evicted). `BluetoothdVerifyFailed` counts bluetoothd
+blocks that still failed with no recorded patch bytes in them
+(`BluetoothdVerifyLastFailOffset` is the last one). These counters are
+published from a thread call, so they stay current while bluetoothd is
+crashing. Hardware verification after sleep is pending.
 
 ## Checking
 

@@ -12,6 +12,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLocks.h>
+#include <kern/thread_call.h>
 #include <sys/syslimits.h>
 #include <sys/sysctl.h>
 #include <sys/vnode.h>
@@ -57,6 +58,13 @@ volatile SInt32 bluetoothdRpaDecodePatched, bluetoothdRpaDevicePatched;
 volatile SInt32 bluetoothdRpaConnectPatched, bluetoothdRpaUpdatePatched;
 uint32_t patchRangeCount; // bluetoothd patch ranges, stored with release after each entry is filled
 volatile SInt32 patchRangeOverflow, verifyRestored, verifyRestoreFailed;
+// bluetoothd blocks whose hash failed with no recorded patch in them.
+volatile SInt32 verifyFailed;
+volatile uint64_t verifyLastFailOffset;
+// verifyOp in the vnode operations vector: 0 no bluetoothd page yet, 1 in,
+// otherwise the VerifyOpState step that failed.
+volatile SInt32 verifyOpState;
+uint32_t vnodeOpsOffset;
 bool verifyFixEnabled, verifyFixRouted;
 
 void publishCounters()
@@ -168,8 +176,22 @@ void publishCounters()
     number("BluetoothdPatchRangeOverflow", (uint32_t)patchRangeOverflow);
     number("BluetoothdVerifyRestored", (uint32_t)verifyRestored);
     number("BluetoothdVerifyRestoreFailed", (uint32_t)verifyRestoreFailed);
+    number("BluetoothdVerifyHookState", (uint32_t)__atomic_load_n(&verifyOpState, __ATOMIC_ACQUIRE));
+    number("BluetoothdVnodeOpsOffset", vnodeOpsOffset);
+    number("BluetoothdVerifyFailed", (uint32_t)verifyFailed);
+    number("BluetoothdVerifyLastFailOffset", (uint32_t)__atomic_load_n(&verifyLastFailOffset, __ATOMIC_RELAXED));
     res->setProperty("MtkWirelessBT", d);
     d->release();
+}
+
+thread_call_t publishCall;
+
+// For page-in and page validation, which must not touch the registry; a
+// bluetoothd stuck in a SIGBUS loop sends no HCI traffic that would publish.
+void publishLater()
+{
+    if (publishCall)
+        thread_call_enter(publishCall);
 }
 
 /* MtkBtLog and FirmwareLoaded are published together by MtkWirelessBTLoader
@@ -1040,7 +1062,7 @@ const uint8_t hfpFillReplace25G332[] {
     0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
 static_assert(sizeof(hfpFillFind25G332) == sizeof(hfpFillReplace25G332), "HFP fill patch size");
 
-mach_vm_address_t orgCsValidatePage, orgVnopVerify;
+mach_vm_address_t orgCsValidatePage;
 
 /*
  * Page patches live in the shared file cache, and the sealed system volume
@@ -1054,13 +1076,96 @@ mach_vm_address_t orgCsValidatePage, orgVnopVerify;
  *
  * Record what each validated bluetoothd page looked like before ANY
  * cs_validate_page patcher touched it (ours wraps BlueToolFixup's route when
- * it is installed later, as with Lilu plugin order today), and hand
- * VNOP_VERIFY a copy of the block with those bytes restored. A range is
- * restored only while the block still holds exactly the patched bytes.
- * Both hooks hold pageLock: verification must not hash a page between its
- * modification and recording the originals, including the first page.
+ * it is installed later, as with Lilu plugin order today), and hand the
+ * file system's verifier a copy of the block with those bytes restored. A
+ * range is restored only while the block still holds exactly the patched
+ * bytes. Both hooks hold pageLock: verification must not hash a page between
+ * its modification and recording the originals, including the first page.
  * -mtkbtnoverifyfix disables it.
+ *
+ * The verifier is APFS's vnop_verify, reached through vp->v_op. 25G332's
+ * kernel inlines VNOP_VERIFY into decmpfs_pagein_compressed
+ * (`movq 0xd0(%rdx),%rax; movslq _vnop_verify_desc(%rip),%rcx; callq
+ * *(%rax,%rcx,8)`), so the _VNOP_VERIFY route of 1.0.4-1.0.8 never saw a
+ * page-in. 1.0.8 hardware, 2026-11-03 17:31 after sleep: bluetoothd aborted
+ * itself and every relaunch died at dyld start ("Data hash mismatch for
+ * 16384 bytes at offset 11157504", valid_pages 3, invalid_pages 1: the RPA
+ * helper page resident, __DATA_CONST's __got absent); the hash APFS got is
+ * that of the block with exactly our helper patch applied. launchd then
+ * throttled bluetoothd and Bluetooth stayed dead until reboot. So the
+ * verifier entry of the bluetoothd vnode's operations vector (APFS's, shared
+ * by its regular files) is replaced instead, at bluetoothd's first validated
+ * page, which works whether or not a caller inlines VNOP_VERIFY.
  */
+
+// struct vnop_verify_args (xnu bsd/sys/vnode_if.h; not in MacKernelSDK).
+struct VnopVerifyArgs {
+    void *a_desc;
+    vnode_t a_vp;
+    off_t a_foffset;
+    uint8_t *a_buf;
+    size_t a_bufsize;
+    size_t *a_verifyblksize;
+    void **a_verifyctxp;
+    uint32_t a_flags;
+    vfs_context_t a_context;
+    void *a_verifykind;
+};
+static_assert(offsetof(VnopVerifyArgs, a_flags) == 0x38 && offsetof(VnopVerifyArgs, a_verifykind) == 0x48 &&
+                  sizeof(VnopVerifyArgs) == 0x50,
+              "struct vnop_verify_args");
+using VnodeOp = int (*)(void *);
+VnodeOp orgVerifyOp;
+// struct vnodeop_desc, whose first field is int vdesc_offset. The offsets are
+// assigned by vfs_op_init in bsd_init, so read it only once bluetoothd runs.
+mach_vm_address_t vnopVerifyDesc;
+
+enum VerifyOpState : SInt32 {
+    VerifyOpInstalled = 1,
+    VerifyOpNoSymbols = 2, // _vnop_verify_desc / _VNOP_VERIFY missing or v_op load not decoded
+    VerifyOpBadIndex = 3,  // vdesc_offset out of range
+    VerifyOpBadVnode = 4,  // v_op is not followed by v_mount, v_data
+    VerifyOpNoEntry = 5,   // empty vector slot
+    VerifyOpNoWrite = 6,   // kernel write protection could not be lifted
+};
+
+/*
+ * offsetof(struct vnode, v_op) from _VNOP_VERIFY, which loads vp->v_op right
+ * before vdesc_offset (25G332: `49 8b 8f d0 00 00 00` movq 0xd0(%r15),%rcx;
+ * `48 63 15 <rel32>` movslq _vnop_verify_desc(%rip),%rdx). The movslq must
+ * address desc; 0 when the pattern is not there.
+ */
+uint32_t decodeVnodeOpsOffset(const uint8_t *code, size_t size, uint64_t codeAddress, uint64_t desc)
+{
+    for (size_t i = 4; i + 7 <= size; i++) {
+        // REX.W 63 /r, mod 00 rm 101: movslq disp32(%rip), %reg64
+        if ((code[i] & 0xfb) != 0x48 || code[i + 1] != 0x63 || (code[i + 2] & 0xc7) != 0x05)
+            continue;
+        int32_t rel;
+        memcpy(&rel, code + i + 3, sizeof(rel));
+        if (codeAddress + i + 7 + (uint64_t)(int64_t)rel != desc)
+            continue;
+        // REX.W 8b /r, mod 10 (disp32) or 01 (disp8), no SIB: movq disp(%base), %reg64
+        int64_t disp = -1;
+        if (i >= 7 && (code[i - 7] & 0xf8) == 0x48 && code[i - 6] == 0x8b && (code[i - 5] & 0xc7) != 0x84 &&
+            (code[i - 5] & 0xc0) == 0x80) {
+            int32_t d32;
+            memcpy(&d32, code + i - 4, sizeof(d32));
+            disp = d32;
+        } else if ((code[i - 4] & 0xf8) == 0x48 && code[i - 3] == 0x8b && (code[i - 2] & 0xc7) != 0x44 &&
+                   (code[i - 2] & 0xc0) == 0x40) {
+            disp = (int8_t)code[i - 1];
+        }
+        return disp > 0 && disp < 0x200 && !(disp & 7) ? (uint32_t)disp : 0;
+    }
+    return 0;
+}
+
+// v_op, v_mount and v_data, adjacent in struct vnode.
+void *const *vnodeOpsFields(vnode_t vp)
+{
+    return reinterpret_cast<void *const *>(reinterpret_cast<uintptr_t>(vp) + vnodeOpsOffset);
+}
 constexpr size_t kPatchRangeMax = 96;
 constexpr uint32_t kPatchRanges = 32;
 struct PatchRange {
@@ -1135,16 +1240,26 @@ bool isBluetoothd(vnode_t vp)
     return isBluetoothdPath(vp);
 }
 
-errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *blockSize, void **context,
-                   uint32_t flags, vfs_context_t ctx, void *kind)
+void noteVerifyFailure(off_t offset)
 {
-    auto org = FunctionCast(vnopVerify, orgVnopVerify);
+    OSIncrementAtomic(&verifyFailed);
+    __atomic_store_n(&verifyLastFailOffset, (uint64_t)offset, __ATOMIC_RELAXED);
+}
+
+/*
+ * verify(buf) runs the file system's verifier. When buf holds recorded
+ * bluetoothd patch ranges, it runs on a copy with their originals restored.
+ */
+template <typename Verify>
+errno_t verifyBluetoothdBlock(vnode_t vp, off_t offset, uint8_t *buf, size_t size, uint32_t flags, Verify &&verify)
+{
     if (LIKELY(!buf) || !size || !pageLock || flags != 0 || offset < 0)
-        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
-    // The first validated page may still be recording its originals. Do not
-    // bypass the lock just because csValidatePage has not published its vnode.
-    if (vp != __atomic_load_n(&bluetoothdVnode, __ATOMIC_ACQUIRE) && !isBluetoothd(vp))
-        return org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        return verify(buf);
+    // csValidatePage publishes the vnode under pageLock before it changes a
+    // byte. Until then, any bluetoothd vnode waits for the lock.
+    vnode_t known = __atomic_load_n(&bluetoothdVnode, __ATOMIC_ACQUIRE);
+    if (LIKELY(known ? vp != known : !isBluetoothd(vp)))
+        return verify(buf);
     IOLockLock(pageLock);
     const uint64_t start = (uint64_t)offset;
     const uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE);
@@ -1157,15 +1272,20 @@ errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *
         restore = patchedInBlock(patchRanges[i]);
     if (!restore) {
         // The shared buffer must remain untouched until the hash finishes.
-        errno_t err = org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        errno_t err = verify(buf);
         IOLockUnlock(pageLock);
+        if (err) {
+            noteVerifyFailure(offset);
+            publishLater();
+        }
         return err;
     }
     auto copy = static_cast<uint8_t *>(IOMalloc(size));
     if (!copy) {
         OSIncrementAtomic(&verifyRestoreFailed);
-        errno_t err = org(vp, offset, buf, size, blockSize, context, flags, ctx, kind);
+        errno_t err = verify(buf);
         IOLockUnlock(pageLock);
+        publishLater();
         return err;
     }
     memcpy(copy, buf, size);
@@ -1176,10 +1296,60 @@ errno_t vnopVerify(vnode_t vp, off_t offset, uint8_t *buf, size_t size, size_t *
     }
     // The private copy no longer depends on the mutable file-cache pages.
     IOLockUnlock(pageLock);
-    errno_t err = org(vp, offset, copy, size, blockSize, context, flags, ctx, kind);
+    errno_t err = verify(copy);
     IOFree(copy, size);
     OSIncrementAtomic(err ? &verifyRestoreFailed : &verifyRestored);
+    publishLater();
     return err;
+}
+
+// Our entry in the vnode operations vector, in place of vnop_verify.
+int verifyOp(void *arg)
+{
+    auto *ap = static_cast<VnopVerifyArgs *>(arg);
+    const VnodeOp org = __atomic_load_n(&orgVerifyOp, __ATOMIC_ACQUIRE);
+    return verifyBluetoothdBlock(ap->a_vp, ap->a_foffset, ap->a_buf, ap->a_bufsize, ap->a_flags,
+                                 [ap, org](uint8_t *buf) {
+        if (buf == ap->a_buf)
+            return org(ap);
+        VnopVerifyArgs copy = *ap;
+        copy.a_buf = buf;
+        return org(&copy);
+    });
+}
+
+// Caller holds pageLock. Once, at bluetoothd's first validated page: by then
+// bsd_init has numbered the vnode operations and the vnode is APFS's.
+void installVerifyOp(vnode_t vp)
+{
+    SInt32 state = VerifyOpNoSymbols;
+    if (vnopVerifyDesc && vnodeOpsOffset) {
+        const int index = *reinterpret_cast<const volatile int *>(vnopVerifyDesc);
+        void *const *fields = vnodeOpsFields(vp);
+        if (index <= 0 || index >= 1024) {
+            state = VerifyOpBadIndex;
+        } else if (!fields[0] || fields[1] != static_cast<void *>(vnode_mount(vp)) || fields[2] != vnode_fsnode(vp)) {
+            state = VerifyOpBadVnode;
+        } else {
+            VnodeOp *slot = static_cast<VnodeOp *>(fields[0]) + index;
+            const VnodeOp current = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+            if (!current) {
+                state = VerifyOpNoEntry;
+            } else {
+                __atomic_store_n(&orgVerifyOp, current, __ATOMIC_RELEASE);
+                // vfs_fsadd allocates the vectors on the heap; lift write
+                // protection anyway in case a kernel keeps them read-only.
+                const bool writable = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS;
+                if (writable)
+                    __atomic_store_n(slot, &verifyOp, __ATOMIC_RELEASE);
+                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                state = writable ? VerifyOpInstalled : VerifyOpNoWrite;
+            }
+        }
+    }
+    verifyFixRouted = state == VerifyOpInstalled;
+    __atomic_store_n(&verifyOpState, state, __ATOMIC_RELEASE);
+    SYSLOG(DRV_NAME, "bluetoothd verify-block fix state %d (v_op at 0x%x)", (int)state, vnodeOpsOffset);
 }
 
 void patchBluetoothdPage(const void *data);
@@ -1195,18 +1365,25 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
         return org(vp, pager, pageOffset, data, validated, tainted, nx);
     // Page-in path: count only; the next publishCounters() reports it.
     OSIncrementAtomic(&bluetoothdPages);
+    if (verifyFixEnabled && pageLock && pageSnapshot && UNLIKELY(!__atomic_load_n(&verifyOpState, __ATOMIC_ACQUIRE))) {
+        IOLockLock(pageLock);
+        if (!verifyOpState)
+            installVerifyOp(vp);
+        IOLockUnlock(pageLock);
+        publishLater();
+    }
     if (!verifyFixRouted) {
         org(vp, pager, pageOffset, data, validated, tainted, nx);
         patchBluetoothdPage(data);
         return;
     }
     IOLockLock(pageLock);
+    __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
     memcpy(pageSnapshot, data, PAGE_SIZE);
     org(vp, pager, pageOffset, data, validated, tainted, nx);
     patchBluetoothdPage(data);
     if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0)
         recordPageDiff(pageOffset, pageSnapshot, static_cast<const uint8_t *>(data));
-    __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
     IOLockUnlock(pageLock);
 }
 
@@ -1320,13 +1497,16 @@ void patchBluetoothdPage(const void *data)
 
 void processPatcher(void *, KernelPatcher &patcher)
 {
-    // Route VNOP_VERIFY first: csValidatePage records ranges only once it is in.
+    // csValidatePage installs verifyOp at bluetoothd's first page and records
+    // patch ranges only once it is in.
     if (verifyFixEnabled && pageLock && pageSnapshot) {
-        KernelPatcher::RouteRequest verify {"_VNOP_VERIFY", vnopVerify, orgVnopVerify};
-        verifyFixRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &verify, 1);
-        if (!verifyFixRouted)
+        vnopVerifyDesc = patcher.solveSymbol(KernelPatcher::KernelID, "_vnop_verify_desc");
+        const mach_vm_address_t kpi = patcher.solveSymbol(KernelPatcher::KernelID, "_VNOP_VERIFY");
+        if (!vnopVerifyDesc || !kpi)
             patcher.clearError();
-        SYSLOG(DRV_NAME, "bluetoothd verify-block fix %s", verifyFixRouted ? "routed" : "failed to route");
+        else
+            vnodeOpsOffset = decodeVnodeOpsOffset(reinterpret_cast<const uint8_t *>(kpi), 192, kpi, vnopVerifyDesc);
+        SYSLOG(DRV_NAME, "bluetoothd verify-block fix: v_op at 0x%x", vnodeOpsOffset);
     }
     KernelPatcher::RouteRequest route {"_cs_validate_page", csValidatePage, orgCsValidatePage};
     extAdvPatchRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &route, 1);
@@ -1364,6 +1544,8 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         if (verifyFixEnabled) {
             pageLock = IOLockAlloc();
             pageSnapshot = static_cast<uint8_t *>(IOMalloc(PAGE_SIZE));
+            publishCall = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { publishCounters(); },
+                                               nullptr);
         }
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
         if (extAdvPatchEnabled || msbcPatchEnabled || verifyFixEnabled)
