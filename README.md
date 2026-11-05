@@ -48,6 +48,8 @@ for a MtkWireless release that adds the new build.
 
 Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 
+1.0.10 fixes AWDL replay-window stalls when a 12-bit counter rolls over inside a nonzero upper-nibble domain (observed during iOS 27 Mirroring traffic). See [failure, regression coverage and hardware limits](docs/AWDL-REPLAY-ROLLOVER.md).
+
 ### Bluetooth (`MtkWirelessBT.kext`)
 
 | Feature | Status | Notes |

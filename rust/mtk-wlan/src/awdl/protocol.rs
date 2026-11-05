@@ -376,7 +376,8 @@ pub struct DataReplayWindow {
     pub last_rx: u64,
     pub sequence: u16,
     pub active: bool,
-    // 0: no rollover observed, 12: observed 4095 -> 0, 16: upper bits seen.
+    // 0: no rollover observed, 12: low counter rolls within a stable
+    // upper-nibble domain, 16: full-width counter until rollover is observed.
     pub sequence_bits: u8,
 }
 
@@ -391,20 +392,28 @@ impl DataReplayWindow {
             return true;
         }
         self.last_rx = now;
-        // The 2026-10-26 large-upload trace reaches 4095, then resumes at
-        // zero within the same active QoS stream. Treating it as a 16-bit
-        // counter pins the high-water mark and drops every later datagram.
-        // Learn this only at the boundary; streams using upper bits retain
-        // full 16-bit arithmetic (including the captured TID 1 at 4096).
-        if seq > 0xfff {
-            self.sequence_bits = 16;
-        } else if self.sequence_bits == 0 && self.sequence >= 0xfc0 && seq < 0x800 {
-            self.sequence_bits = 12;
+        // AirDrop rolls 0x0fff -> 0x0000; iOS 27 Mirroring TID 5 rolls
+        // within the nonzero 0x2xxx domain. Upper bits alone therefore do
+        // not prove a 16-bit counter. Learn only at the same narrow boundary
+        // as before, and only inside the identical upper-nibble domain.
+        // Crossing domains (0x2fff -> 0x3000, or 0xffff -> 0) continues to
+        // use full-width arithmetic. Do not alias packets from other domains.
+        let same_domain = (seq & 0xf000) == (self.sequence & 0xf000);
+        let mut sequence_bits = self.sequence_bits;
+        if !same_domain {
+            sequence_bits = 16;
+        } else if sequence_bits != 12 && (self.sequence & 0xfff) >= 0xfc0 && (seq & 0xfff) < 0x800 {
+            sequence_bits = 12;
+        } else if sequence_bits == 0 && seq > 0xfff {
+            sequence_bits = 16;
         }
-        let mask = if self.sequence_bits == 12 { 0xfff } else { u16::MAX };
+        let mask = if sequence_bits == 12 { 0xfff } else { u16::MAX };
         let forward = seq.wrapping_sub(self.sequence) & mask;
         let delta = if forward <= mask / 2 { forward as i32 } else { forward as i32 - (mask as i32 + 1) };
         if delta > 0 {
+            // A rejected or reordered foreign-domain packet must not change
+            // the modulus of the active high-water window.
+            self.sequence_bits = sequence_bits;
             self.bitmap = if delta >= 64 { 1 } else { (self.bitmap << delta) | 1 };
             self.sequence = seq;
             return true;
@@ -2411,6 +2420,75 @@ mod tests {
         assert!(missed.accept(4095, 1));
         assert!(missed.accept(447, 2)); // first retained live rejection
         assert!(!missed.accept(447, 3));
+    }
+
+    #[test]
+    fn mirroring_rollover_with_nonzero_upper_nibble_preserves_duplicate_window() {
+        // Live iOS 27 Mirroring capture: TID 5 was pinned at 0x2fff;
+        // monotonically increasing 0x219e..0x2450 packets were all too-old.
+        let mut window = DataReplayWindow::default();
+        assert!(window.accept(0x2ffe, 1));
+        assert!(window.accept(0x2fff, 2));
+        assert!(window.accept(0x219e, 3));
+        assert!(!window.accept(0x219e, 4));
+        for (index, seq) in (0x219f..=0x2450).enumerate() {
+            let time = 5 + index as u64 * 2;
+            assert!(window.accept(seq, time));
+            assert!(!window.accept(seq, time + 1));
+        }
+        assert_eq!(window.sequence_bits, 12);
+        assert!(!window.accept(0x2000, 2000)); // outside replay window
+        assert!(!window.accept(0x1451, 2001)); // different upper domain is not aliased
+    }
+
+    #[test]
+    fn captured_mirroring_tid5_rejections_are_accepted_once_after_prefix_rollover() {
+        let fixture = include_str!("../../tests/fixtures/mirroring-tid5-replay.csv");
+        let mut count = 0;
+        for line in fixture.lines().skip(1) {
+            let mut fields = line.split(',');
+            let seq = fields.next().unwrap().parse::<u16>().unwrap();
+            let previous = fields.next().unwrap().parse::<u16>().unwrap();
+            let bitmap = u64::from_str_radix(fields.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+            let mut window = DataReplayWindow {
+                bitmap, last_rx: 100, sequence: previous, active: true, sequence_bits: 16,
+            };
+            assert!(window.accept(seq, 101), "captured sequence {seq:#x}");
+            assert!(!window.accept(seq, 102), "duplicate sequence {seq:#x}");
+            count += 1;
+        }
+        assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn narrow_counters_with_upper_domains_wrap_reorder_and_reject_duplicates() {
+        for domain in 0..16 {
+            let prefix = domain << 12;
+            let mut window = DataReplayWindow::default();
+            for packet in 0..12_000u64 {
+                let seq = prefix | (packet & 0xfff) as u16;
+                assert!(window.accept(seq, 100 + packet * 10));
+                assert!(!window.accept(seq, 101 + packet * 10));
+            }
+            assert_eq!(window.sequence_bits, 12);
+            let mut boundary = DataReplayWindow::default();
+            assert!(boundary.accept(prefix | 0xffe, 1));
+            assert!(boundary.accept(prefix, 2));
+            assert!(boundary.accept(prefix | 0xfff, 3));
+            assert!(!boundary.accept(prefix | 0xfff, 4));
+            assert!(!boundary.accept(prefix | 0xfc0, 5));
+            if domain > 0 {
+                assert!(!boundary.accept(prefix.wrapping_sub(0x1000), 6));
+                assert_eq!(boundary.sequence_bits, 12);
+                assert!(!boundary.accept(prefix | 0xfff, 7));
+            }
+        }
+        // A real 16-bit counter crossing the upper nibble remains full-width.
+        let mut wide = DataReplayWindow::default();
+        assert!(wide.accept(0x2fff, 1));
+        assert!(wide.accept(0x3000, 2));
+        assert!(!wide.accept(0x2000, 3));
+        assert_eq!(wide.sequence_bits, 16);
     }
 
     #[test]
