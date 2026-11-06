@@ -126,6 +126,15 @@ public:
     void setEAPOLTransport(bool enabled);
     static IOReturn setEAPOLTransportGated(OSObject *, void *, void *, void *, void *);
     bool eapolTransportActive = false;
+    // Control-query observations only; published by the existing watchdog.
+    // Getters may run on different caller threads, so counters/samples are
+    // atomic and registry allocation stays on the controller command gate.
+    uint32_t wifiPowerQueryCount = 0;
+    uint32_t wifiStateQueryCount = 0;
+    uint32_t wifiCapabilitiesQueryCount = 0;
+    uint32_t wifiReportedPower = UINT32_MAX;
+    uint32_t wifiReportedState = UINT32_MAX;
+    uint32_t wifiReportedAwdlCapability = UINT32_MAX;
     
     static IOReturn tsleepHandler(OSObject* owner, void* arg0 = 0, void* arg1 = 0, void* arg2 = 0, void* arg3 = 0);
     static void eventHandler(struct ieee80211com *, int, void *);

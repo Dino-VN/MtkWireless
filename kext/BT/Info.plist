@@ -135,6 +135,40 @@
 			<key>idVendor</key>
 			<integer>3725</integer>
 		</dict>
+		<key>MtkWirelessBT_MT7922A_0e8d_0616</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.dinovn.MtkWirelessBT</string>
+			<key>IOClass</key>
+			<string>MtkWirelessBTLoader</string>
+			<key>IOMatchCategory</key>
+			<string>MtkWirelessBTLoader</string>
+			<key>IOProbeScore</key>
+			<integer>4000</integer>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostDevice</string>
+			<key>idProduct</key>
+			<integer>1558</integer>
+			<key>idVendor</key>
+			<integer>3725</integer>
+		</dict>
+		<key>MtkWirelessBT_MediaTek_0e8d_223c</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>com.dinovn.MtkWirelessBT</string>
+			<key>IOClass</key>
+			<string>MtkWirelessBTLoader</string>
+			<key>IOMatchCategory</key>
+			<string>MtkWirelessBTLoader</string>
+			<key>IOProbeScore</key>
+			<integer>4000</integer>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostDevice</string>
+			<key>idProduct</key>
+			<integer>8764</integer>
+			<key>idVendor</key>
+			<integer>3725</integer>
+		</dict>
 		<key>MtkWirelessBT_MT7921_13d3_3563</key>
 		<dict>
 			<key>CFBundleIdentifier</key>

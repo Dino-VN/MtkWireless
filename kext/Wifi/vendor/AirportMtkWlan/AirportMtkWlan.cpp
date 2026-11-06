@@ -128,6 +128,9 @@ static OSDictionary *mtkJoinDictionary(const mtk_join_diag &d)
 IOReturn AirportMtkWlan::publishJoinDiagnosticsGated(OSObject *owner, void *, void *, void *, void *)
 {
     auto self = static_cast<AirportMtkWlan *>(owner);
+#ifdef MTK_NATIVE_AWDL
+    if(self->awdlInterface && !self->awdlStopping) self->awdlInterface->publishCacheDiagnostics();
+#endif
     auto ic = self->fHalService->get80211Controller();
     auto &d = ic->ic_join_diag;
     d.ObservedAtUS = mtk_join_now(); d.State = ic->ic_state;
@@ -140,6 +143,20 @@ IOReturn AirportMtkWlan::publishJoinDiagnosticsGated(OSObject *owner, void *, vo
     dict = mtkJoinDictionary(ic->ic_join_assoc_failed);
     if (dict) { self->setProperty("MTKWiFiJoinLastAssocFailed", dict); dict->release(); }
     self->setProperty("MTKWiFiJoinDiagnosticVersion", uint64_t(3), 32);
+    self->setProperty("MTKWiFiQueryDiagnosticVersion", uint64_t(1), 32);
+#define MTK_WIFI_QUERY_PROPERTY(name, field) \
+    self->setProperty(name, uint64_t(__atomic_load_n(&self->field, __ATOMIC_RELAXED)), 32)
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiPowerQueryCount", wifiPowerQueryCount);
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiStateQueryCount", wifiStateQueryCount);
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiCapabilitiesQueryCount", wifiCapabilitiesQueryCount);
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiReportedPower", wifiReportedPower);
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiReportedState", wifiReportedState);
+    MTK_WIFI_QUERY_PROPERTY("MTKWiFiReportedAwdlCapability", wifiReportedAwdlCapability);
+#undef MTK_WIFI_QUERY_PROPERTY
+    self->setProperty("MTKWiFiPowerPreference", uint64_t(self->power_state), 32);
+    self->setProperty("MTKWiFiPMPowerState", uint64_t(self->pmPowerState), 32);
+    self->setProperty("MTKWiFiInterfaceFlags", uint64_t(ic->ic_if.if_flags), 32);
+    self->setProperty("MTKWiFiNativeLinkStatus", uint64_t(self->currentStatus), 32);
     return kIOReturnSuccess;
 }
 
@@ -971,6 +988,8 @@ getCARD_CAPABILITIES(OSObject *object,
         cd->capabilities[2] |= 0x01;
         cd->capabilities[5] |= 0x08;
     }
+    __atomic_store_n(&wifiReportedAwdlCapability, uint32_t(cd->capabilities[4] & 1), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&wifiCapabilitiesQueryCount, 1u, __ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
 
@@ -1042,6 +1061,8 @@ getPOWER(OSObject *object,
     pd->power_state[1] = power_state;
     pd->power_state[2] = power_state;
     pd->power_state[3] = power_state;
+    __atomic_store_n(&wifiReportedPower, uint32_t(pd->power_state[0]), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&wifiPowerQueryCount, 1u, __ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
 

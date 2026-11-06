@@ -13,12 +13,45 @@ OSDefineMetaClassAndStructors(AirportMtkAwdlInterface, IO80211AWDLProtocol)
 extern IOCommandGate *_fCommandGate;
 // The controller copies the message before returning (same API used by the
 // native BCM driver's cache completion). No message data outlives this call.
-extern void awdlControllerMessage(IO80211Controller*,IO80211SkywalkInterface*,unsigned int,void*,unsigned long,bool)
+extern IOReturn awdlControllerMessage(IO80211Controller*,IO80211SkywalkInterface*,unsigned int,void*,unsigned long,bool)
     __asm__("__ZN17IO80211Controller11postMessageEP23IO80211SkywalkInterfacejPvmb");
 
 static uint64_t awdlNow()
 {
     uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(),&ns); return ns/1000;
+}
+
+IOReturn AirportMtkAwdlInterface::reportDataPathEvents(unsigned int message,void *data,unsigned long length,bool sync)
+{
+    // MtkWireless: observe cache indications before the superclass handles
+    // them. Preserve the native gate, dispatch, arguments and return value.
+    if(message!=0x33) return super::reportDataPathEvents(message,data,length,sync);
+    __atomic_fetch_add(&cacheDiagnostic.events,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.eventTimeUS,awdlNow(),__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.eventLength,length,__ATOMIC_RELAXED);
+    uint64_t versionOp=0, addressTag=0;
+    if(data && length>=16) {
+        memcpy(&versionOp,data,8); memcpy(&addressTag,static_cast<uint8_t*>(data)+8,8);
+    }
+    if(!data || length!=0x1d0)
+        __atomic_fetch_add(&cacheDiagnostic.invalidEvents,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.eventVersionOp,versionOp,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.eventAddressTag,addressTag,__ATOMIC_RELAXED);
+    IOReturn status=super::reportDataPathEvents(message,data,length,sync);
+    __atomic_store_n(&cacheDiagnostic.eventStatus,status,__ATOMIC_RELAXED);
+    return status;
+}
+
+IOReturn AirportMtkAwdlInterface::recordCacheControlResult(IOReturn status,uint64_t start)
+{
+    uint64_t duration=awdlNow()-start;
+    if(status!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.failures,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.result,status,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.durationUS,duration,__ATOMIC_RELAXED);
+    uint64_t maximum=__atomic_load_n(&cacheDiagnostic.maxDurationUS,__ATOMIC_RELAXED);
+    while(duration>maximum && !__atomic_compare_exchange_n(&cacheDiagnostic.maxDurationUS,
+          &maximum,duration,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+    return status;
 }
 
 bool AirportMtkAwdlInterface::start(IOService *provider)
@@ -726,6 +759,38 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
     // Keep it deferred until native has consumed the preceding end event.
     if(enabled && !stopping) state.releaseControls(awdlNow());
     else state.discardControls();
+}
+void AirportMtkAwdlInterface::publishCacheDiagnostics()
+{
+    // MtkWireless: the existing controller watchdog publishes even after
+    // AWDL teardown has stopped its scheduler; counters survive that teardown.
+    setProperty("MTKAWDLCacheDiagnosticVersion",static_cast<uint64_t>(1),32);
+#define CACHE_DIAGNOSTIC(property,field) \
+    setProperty(property,__atomic_load_n(&cacheDiagnostic.field,__ATOMIC_RELAXED),64)
+    CACHE_DIAGNOSTIC("MTKAWDLCacheRequests",requests);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheFailures",failures);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheRequestTimeUS",requestTimeUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheRequestVersionOp",requestVersionOp);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheRequestAddressTag",requestAddressTag);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheResult",result);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheDurationUS",durationUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheMaxDurationUS",maxDurationUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheFirmwareCalls",firmwareCalls);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheFirmwareFailures",firmwareFailures);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheFirmwareStatus",firmwareStatus);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheFirmwareDurationUS",firmwareDurationUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCachePosts",posts);
+    CACHE_DIAGNOSTIC("MTKAWDLCachePostFailures",postFailures);
+    CACHE_DIAGNOSTIC("MTKAWDLCachePostStatus",postStatus);
+    CACHE_DIAGNOSTIC("MTKAWDLCachePostTimeUS",postTimeUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEvents",events);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheInvalidEvents",invalidEvents);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEventLength",eventLength);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEventTimeUS",eventTimeUS);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEventVersionOp",eventVersionOp);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEventAddressTag",eventAddressTag);
+    CACHE_DIAGNOSTIC("MTKAWDLCacheEventStatus",eventStatus);
+#undef CACHE_DIAGNOSTIC
 }
 void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 {
@@ -1899,29 +1964,47 @@ IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_PARAMS(apple80211_awdl_electi
 }
 IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_control *d)
 {
-    if(!d || stopping || !enabled) return kIOReturnNotReady;
+    uint64_t start=awdlNow();
+    __atomic_fetch_add(&cacheDiagnostic.requests,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.requestTimeUS,start,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.requestVersionOp,0,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.requestAddressTag,0,__ATOMIC_RELAXED);
+    if(!d || stopping || !enabled) return recordCacheControlResult(kIOReturnNotReady,start);
     // Tahoe supplies a 0x1d0-byte request. Only the independently verified
     // version/op/address prefix is needed for our raw, unencrypted peer path.
     auto p=reinterpret_cast<uint8_t *>(d);
     uint32_t version=mtkawdl::le32(p), operation=mtkawdl::le32(p+4);
-    if(version>APPLE80211_VERSION || !mtkawdl::unicast(p+8)) return kIOReturnBadArgument;
-    if(operation!=0 && operation!=2 && operation!=6) return kIOReturnUnsupported;
+    uint64_t versionOp, addressTag;
+    memcpy(&versionOp,p,8); memcpy(&addressTag,p+8,8);
+    __atomic_store_n(&cacheDiagnostic.requestVersionOp,versionOp,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.requestAddressTag,addressTag,__ATOMIC_RELAXED);
+    if(version>APPLE80211_VERSION || !mtkawdl::unicast(p+8)) return recordCacheControlResult(kIOReturnBadArgument,start);
+    if(operation!=0 && operation!=2 && operation!=6) return recordCacheControlResult(kIOReturnUnsupported,start);
     uint8_t address[6]; memcpy(address,p+8,6);
-    if(operation!=2 && !dataPeers.canObserve(address,awdlNow())) return kIOReturnNoResources;
+    if(operation!=2 && !dataPeers.canObserve(address,awdlNow())) return recordCacheControlResult(kIOReturnNoResources,start);
     retain();
     int member=dataPeers.find(address,awdlNow());
     bool trafficOwns=member>=0 && dataPeers.entries[member].traffic;
-    IOReturn status=operation==2 && trafficOwns ? kIOReturnSuccess : hal->awdlPeer(address,operation!=2);
+    IOReturn status=kIOReturnSuccess;
+    if(operation!=2 || !trafficOwns) {
+        __atomic_fetch_add(&cacheDiagnostic.firmwareCalls,1,__ATOMIC_RELAXED);
+        uint64_t firmwareStart=awdlNow();
+        status=hal->awdlPeer(address,operation!=2);
+        __atomic_store_n(&cacheDiagnostic.firmwareDurationUS,awdlNow()-firmwareStart,__ATOMIC_RELAXED);
+        __atomic_store_n(&cacheDiagnostic.firmwareStatus,status,__ATOMIC_RELAXED);
+        if(status!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.firmwareFailures,1,__ATOMIC_RELAXED);
+    }
     if(status!=kIOReturnSuccess || stopping || !enabled) {
         if(status==kIOReturnSuccess) status=kIOReturnNotReady;
-        release(); return status;
+        recordCacheControlResult(status,start); release(); return status;
     }
     uint8_t completion[0x1d0]={}; mtkawdl::put32(completion,APPLE80211_VERSION);
     if(!dataPeers.setCached(address,operation!=2,awdlNow())) {
         // Firmware waits release the gate; another request may have filled
         // the bounded cache before this one returned. Never acknowledge a
         // native cache add that the receive path cannot authorize.
-        hal->awdlPeer(address,false); release(); return kIOReturnNoResources;
+        hal->awdlPeer(address,false); recordCacheControlResult(kIOReturnNoResources,start);
+        release(); return kIOReturnNoResources;
     }
     if(operation==2 && !trafficOwns) {
         // Firmware station removal invalidates discovery's local tracking too.
@@ -1929,7 +2012,12 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
             if(!memcmp(discoveryTxPeers[i],address,6)) bzero(discoveryTxPeers[i],6);
     }
     mtkawdl::put32(completion+4,operation==2 ? 3 : 1); memcpy(completion+8,address,6);
-    awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);
+    __atomic_fetch_add(&cacheDiagnostic.posts,1,__ATOMIC_RELAXED);
+    __atomic_store_n(&cacheDiagnostic.postTimeUS,awdlNow(),__ATOMIC_RELAXED);
+    IOReturn postStatus=awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);
+    __atomic_store_n(&cacheDiagnostic.postStatus,postStatus,__ATOMIC_RELAXED);
+    if(postStatus!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.postFailures,1,__ATOMIC_RELAXED);
+    recordCacheControlResult(kIOReturnSuccess,start);
     release(); return kIOReturnSuccess;
 }
 void AirportMtkAwdlInterface::applySequence(uint64_t now)

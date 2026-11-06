@@ -45,6 +45,8 @@ public:
     IOReturn setMacAddress(ether_addr&) override;
     IOReturn setInterfaceEnable(bool) override;
     bool setLinkState(IO80211LinkState, unsigned int) override;
+    IOReturn reportDataPathEvents(unsigned int,void*,unsigned long,bool) override;
+    void publishCacheDiagnostics(); // controller watchdog gate, also when sync is off
     UInt32 output(mbuf_t);
     static bool receive(void*, const uint8_t*, size_t, uint8_t, int8_t);
     bool bpfScratchReady();
@@ -128,6 +130,21 @@ private:
     void service();
     void serviceInGate();
     void publishScheduler(uint64_t);
+    IOReturn recordCacheControlResult(IOReturn,uint64_t);
+    // MtkWireless: observations only. Native message delivery can precede
+    // entry into the controller gate; use atomics also for publication.
+    // Last fields are independent samples, not a transaction-wide snapshot.
+    struct CacheDiagnostic {
+        uint64_t requests=0, failures=0, requestTimeUS=0;
+        uint64_t requestVersionOp=0, requestAddressTag=0;
+        uint64_t result=kIOReturnNotReady, durationUS=0, maxDurationUS=0;
+        uint64_t firmwareCalls=0, firmwareFailures=0;
+        uint64_t firmwareStatus=kIOReturnNotReady, firmwareDurationUS=0;
+        uint64_t posts=0, postFailures=0, postStatus=kIOReturnNotReady, postTimeUS=0;
+        uint64_t events=0, invalidEvents=0, eventLength=0, eventTimeUS=0;
+        uint64_t eventVersionOp=0, eventAddressTag=0, eventStatus=kIOReturnNotReady;
+    };
+    CacheDiagnostic cacheDiagnostic;
     void notifyAvailabilityWindowStart(uint8_t,uint64_t);
     void notifyAvailabilityWindowEnd(uint64_t);
     IOReturn setSync(bool);

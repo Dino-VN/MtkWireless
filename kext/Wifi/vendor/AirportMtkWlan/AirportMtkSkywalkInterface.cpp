@@ -438,6 +438,9 @@ getSTATE(struct apple80211_state_data *sd)
     memset(sd, 0, sizeof(*sd));
     sd->version = APPLE80211_VERSION;
     sd->state = fHalService->get80211Controller()->ic_state;
+    auto controller = static_cast<AirportMtkWlan *>(getController());
+    __atomic_store_n(&controller->wifiReportedState, uint32_t(sd->state), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&controller->wifiStateQueryCount, 1u, __ATOMIC_RELAXED);
     return kIOReturnSuccess;
 }
 

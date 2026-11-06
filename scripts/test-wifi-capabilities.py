@@ -45,6 +45,7 @@ struct Hal {Radio radio;Radio*get80211Controller(){return &radio;}
     Radio*getDriverInfo(){return &radio;}};
 struct AirportMtkAwdlInterface {static bool nativeDataPathAvailable(){return true;}};
 struct AirportMtkWlan {Hal hal;Hal*fHalService=&hal;bool awdlExperimental=false;
+    uint32_t wifiReportedAwdlCapability=UINT32_MAX,wifiCapabilitiesQueryCount=0;
     IOReturn getCARD_CAPABILITIES(OSObject*,apple80211_capability_data*);};
 ''' + enum + capabilities + r'''
 #define MIN(a,b) ((a)<(b)?(a):(b))

@@ -69,6 +69,28 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 ## Wi-Fi + AWDL coexistence (do not regress)
 
+- 1.0.11 native Mirroring cache diagnostics (2026-11-05): runtime ioctl164
+  fails after 3000 ms, consistent with the native event8 cache wait; exact
+  runtime branch is unproven. Atomic `MTKAWDLCache*` request/firmware/post/event
+  observations are published on the controller watchdog gate, also after
+  sync disables the AWDL scheduler. The reportDataPathEvents override forwards
+  original arguments and status. No packet/scheduling/cache/auth behavior
+  changes. `scripts/test-awdl-cache-diagnostics.py` tests real Rust cache
+  ownership and native forwarding under ASan/UBSan. The existing MI extraction
+  fixture remains broken and additionally lacks the new diagnostic stubs.
+  Hardware verification needs installation/reboot; see docs/IPHONE-MIRRORING.md.
+
+- 1.0.10 iPhone Mirroring diagnostics (2026-11-04): native discovery sees
+  Dino but filters its remote Rapport flags for missing WiFiP2P 0x200;
+  this is distinct from local CARD_CAPABILITIES AWDL bit 32. Power, STATE
+  and capability getters now record atomic counters/last replies, published
+  on the existing watchdog gate (`MTKWiFiQueryDiagnosticVersion=1`). No
+  capability, scheduling or packet behavior changed. Capture with
+  `scripts/capture-mirroring-wifi.py`; see docs/IPHONE-MIRRORING.md. Build,
+  capability and kernel checks pass. Upstream MI host fixture still fails
+  to compile for missing inputNativeView, also against unchanged HEAD.
+  New diagnostics need installation/reboot hardware verification.
+
 - MT7922 campus report (2026-10-31, 1.0.6): join scans omitted the SSID
   despite WCL supplying it, and Enterprise BSD output waited for RSN port
   authorization even though user-space EAP must precede it. Join scans now
