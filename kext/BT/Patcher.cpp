@@ -49,8 +49,18 @@ volatile SInt32 readClockRewritten, aclPbRewritten;
 volatile SInt32 leCommands, leCompletions, leErrors;
 bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 bool rpaPatchEnabled, rpaHelpersReady;
-// kern.osversion is written by launchd after the kext starts: 0 unknown, 1 25G332, -1 other.
-volatile SInt32 rpaBuildState;
+// -mtkbtanybuild: ScopeKnownBuild sites also on builds not verified offline.
+bool anyBuildPatches;
+// kern.osversion, written by launchd after the kext starts (BluetoothdBuild).
+// Pattern scopes key on it; read at bluetoothd's first page, then cached.
+enum BluetoothdBuild : SInt32 { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3 };
+volatile SInt32 bluetoothdBuild;
+char bluetoothdBuildName[16];
+volatile SInt32 bluetoothdSitesAmbiguous;
+// bluetoothd pages left native: no verifier restore, or no patch-range room.
+volatile SInt32 bluetoothdPagesUnpatched;
+// Per-feature decision for the current bluetoothd vnode (FeatureLatch), under pageLock.
+uint8_t featureLatch[3];
 volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 volatile SInt32 bluetoothdWbsPatched, bluetoothdHfpFillPatched;
 volatile SInt32 bluetoothdRpaHelpersPatched, bluetoothdRpaLegacyPatched, bluetoothdRpaScanPatched;
@@ -155,7 +165,21 @@ void publishCounters()
     number("BluetoothdExtAdvPatched", (uint32_t)bluetoothdPatched);
     number("BluetoothdAdvAddressPatched", (uint32_t)bluetoothdAddressPatched);
     number("BluetoothdAdvAddressRetryPatched", (uint32_t)bluetoothdAddressRetryPatched);
-    d->setObject("BluetoothdRpaEnabled", rpaPatchEnabled && verifyFixRouted && rpaBuildState > 0 ? kOSBooleanTrue : kOSBooleanFalse);
+    const SInt32 build = __atomic_load_n(&bluetoothdBuild, __ATOMIC_ACQUIRE);
+    if (build != BuildUnread) {
+        if (OSString *v = OSString::withCString(bluetoothdBuildName)) {
+            d->setObject("BluetoothdBuild", v);
+            v->release();
+        }
+    }
+    d->setObject("BluetoothdBuildKnown", build == Build25G241 || build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdAnyBuild", anyBuildPatches ? kOSBooleanTrue : kOSBooleanFalse);
+    // 2 bits per feature (adv, mSBC, RPA): 0 undecided, 1 on, 2 off.
+    number("BluetoothdPatchFeatures", (uint32_t)(featureLatch[0] | featureLatch[1] << 2 | featureLatch[2] << 4));
+    number("BluetoothdSitesAmbiguous", (uint32_t)bluetoothdSitesAmbiguous);
+    number("BluetoothdPagesUnpatched", (uint32_t)bluetoothdPagesUnpatched);
+    d->setObject("BluetoothdRpaEnabled",
+                 rpaPatchEnabled && verifyFixRouted && build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
     d->setObject("BluetoothdRpaHelpersReady",
         __atomic_load_n(&rpaHelpersReady, __ATOMIC_ACQUIRE) ? kOSBooleanTrue : kOSBooleanFalse);
     number("BluetoothdRpaHelpersPatched", (uint32_t)bluetoothdRpaHelpersPatched);
@@ -772,10 +796,11 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
  * MediaTek reports LE Extended Advertising (LE feature bit 12) and takes the
  * standard 0x2036-0x2039 commands, as BlueZ uses on Linux. Make the
  * extended-advertising check return true; bluetoothd then forces BT-spec
- * advertising sets on as well. x86_64 bluetoothd of macOS 26.7.1 (25G241):
- * the whole 77-byte function, unique in the binary (its BT-spec-sets twin
- * differs only in sete/setae) and inside one page (offset 0x6ec), so a
- * per-page search finds it; other versions do not match. Boot-arg
+ * advertising sets on as well. x86_64 bluetoothd of macOS 26.7.1 (25G241)
+ * and 26.7.2 (25G332, 0x10033abec): the whole 77-byte function, exact, unique
+ * in the binary (its BT-spec-sets twin differs only in sete/setae at +54) and
+ * inside one page, so a per-page search finds it. It has no displacements;
+ * it stops matching only if Apple changes the chip ranges. Boot-arg
  * -mtkbtnoextadv disables it.
  */
 const uint8_t extAdvFind[] {
@@ -801,23 +826,27 @@ static_assert(sizeof(extAdvFind) == sizeof(extAdvReplace), "patch size");
  * if the global scanning address (0x2005) is already set. Preserve the
  * default gate by removing only that disabling call, keeping the remaining
  * chip-specific setup intact. macOS still owns the address and ordering.
- * Exact 25G241 x86_64 sequence at 0x100510e99, inside one page.
+ * 25G332 x86_64 at 0x100511239 (25G241: 0x100510e99), inside one page. Both
+ * call displacements are wildcards (they are all that differs between the
+ * two builds). The NOPed call's target cannot be checked from this page, so
+ * this site is limited to builds whose setter/gate
+ * scripts/test-bt-page-patches.py verified (ScopeKnownBuild).
  */
 const uint8_t advAddressFind[] {
-    0xe8, 0xd4, 0x30, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
-    0x31, 0xff, 0xe8, 0x3e, 0x6b, 0xce, 0xff};
-const uint8_t advAddressReplace[] {
-    0xe8, 0xd4, 0x30, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
-    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-static_assert(sizeof(advAddressFind) == sizeof(advAddressReplace), "address patch size");
-/* Same sequence in 26.7.2 25G332 at 0x100511239 (call displacements moved). */
-const uint8_t advAddressFind25G332[] {
     0xe8, 0x34, 0x32, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
     0x31, 0xff, 0xe8, 0x1e, 0x6c, 0xce, 0xff};
-const uint8_t advAddressReplace25G332[] {
+const uint8_t advAddressFindMask[] {
+    0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
+const uint8_t advAddressReplace[] {
     0xe8, 0x34, 0x32, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
     0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-static_assert(sizeof(advAddressFind25G332) == sizeof(advAddressReplace25G332), "address patch size");
+const uint8_t advAddressReplaceMask[] {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+static_assert(sizeof(advAddressFind) == sizeof(advAddressReplace) && sizeof(advAddressFind) == sizeof(advAddressFindMask) &&
+                  sizeof(advAddressFind) == sizeof(advAddressReplaceMask),
+              "address patch size");
 
 /* 0.1.8 HCI capture: macOS sends 0x2035 for handles 0/2 before
  * 0x2036 creates them. MediaTek returns Unknown Advertising Identifier (42),
@@ -830,27 +859,42 @@ static_assert(sizeof(advAddressFind25G332) == sizeof(advAddressReplace25G332), "
  * here is redundant with advAddress above (default true, sole false setter
  * removed); these patches are enabled/disabled together. No HCI reply is
  * synthesized; the existing callback waits for the real controller result.
- * 25G241 x86_64 0x1001fa20d..0x1001fa24d, 64 bytes inside one page.
+ * 25G332 x86_64 0x1001fa68d (25G241: 0x1001fa20d), 64 bytes inside one page.
+ * Wildcards: the gate's RIP-relative offset (+34, overwritten by the guard)
+ * and the trailing call displacement (+60, kept). The guard's short branches
+ * re-encode the native +26/+39 targets, so those stay exact. ScopeKnownBuild
+ * (with advAddress): natively, a false gate jumps straight to the
+ * continuation; the patched guard instead calls a helper that checks the same
+ * gate and returns 0 without sending HCI 0xcb or calling the callback, so
+ * with advAddress unpatched (gate false) the set start waits for a completion
+ * that never comes (verified against 25G332: gate 0x100b1cd00, helper
+ * 0x1001f75bb, continuation 0x1001fa743).
  */
 const uint8_t advAddressRetryFind[] {
     0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
     0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0x44, 0x09, 0xc2, 0x0f, 0x84, 0x80, 0x00, 0x00, 0x00,
-    0x80, 0x3d, 0xcc, 0x2a, 0x92, 0x00, 0x00, 0x74, 0x77, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
+    0x80, 0x3d, 0x4c, 0x26, 0x92, 0x00, 0x00, 0x74, 0x77, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
     0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
+const uint8_t advAddressRetryFindMask[] {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
 const uint8_t advAddressRetryReplace[] {
     0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
     0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0xf6, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x01, 0x75,
     0x08, 0x44, 0x09, 0xc2, 0x74, 0x7a, 0x90, 0x90, 0x90, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
     0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
-static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace), "address retry patch size");
-/* 25G332 at 0x1001fa68d: only the gate's RIP-relative offset differs, and
- * the replacement guard overwrites it, so advAddressRetryReplace applies. */
-const uint8_t advAddressRetryFind25G332[] {
-    0x44, 0x8b, 0x04, 0x3a, 0x44, 0x33, 0x84, 0x08, 0x0e, 0x0d, 0x00, 0x00, 0x8b, 0x54, 0x3a, 0x03,
-    0x33, 0x94, 0x08, 0x11, 0x0d, 0x00, 0x00, 0x44, 0x09, 0xc2, 0x0f, 0x84, 0x80, 0x00, 0x00, 0x00,
-    0x80, 0x3d, 0x4c, 0x26, 0x92, 0x00, 0x00, 0x74, 0x77, 0x48, 0x8d, 0x3c, 0x08, 0x48, 0x81, 0xc7,
-    0x0e, 0x0d, 0x00, 0x00, 0x48, 0x8d, 0x15, 0x7b, 0x00, 0x00, 0x00, 0xe8, 0xee, 0xce, 0xff, 0xff};
-static_assert(sizeof(advAddressRetryFind25G332) == sizeof(advAddressRetryReplace), "address retry patch size");
+// Only the guard (+23..+40) is written.
+const uint8_t advAddressRetryReplaceMask[] {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace) &&
+                  sizeof(advAddressRetryFind) == sizeof(advAddressRetryFindMask) &&
+                  sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplaceMask),
+              "address retry patch size");
 
 /* Instant Hotspot / outgoing BLE, x86_64 26.7.2 (25G332).
  * The host AH resolver replaces a peer RPA with its identity in scan reports,
@@ -882,8 +926,9 @@ static_assert(sizeof(advAddressRetryFind25G332) == sizeof(advAddressRetryReplace
  * The helper page is not touched at launch, so child sites cannot wait for
  * it: a page validated before it would stay native forever (1.0.10 patched
  * only 2 of 7 sites). Children are patched whenever their page is validated
- * on 25G332 (kern.osversion); their first call faults the helper page in,
- * and validation installs the helpers before that call executes.
+ * on 25G332 (kern.osversion, ScopeRpaBuild); their first call faults the
+ * helper page in, and validation installs the helpers before that call
+ * executes. The feature is decided once per vnode (featureOn).
  */
 const uint8_t rpaHelpersFind25G332[] {
     0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1027,7 +1072,9 @@ static_assert(sizeof(rpaUpdateFind25G332) == sizeof(rpaUpdateReplace25G332), "RP
 
 /* HFP wideband gate: bluetoothd enables mSBC only for known chip IDs; a
  * THIRD_PARTY_DONGLE (chip 0) is outside the range. Accept chip 0, only while
- * the USB mSBC bridge is ready (-mtkbtnomsbc off). 25G241 x86_64, exact signature.
+ * the USB mSBC bridge is ready (-mtkbtnomsbc off). Same bytes in 25G241 and
+ * 25G332 (0x100374738); the controller-lookup call displacement (+5) is a
+ * wildcard. Only +17 and +19 are written.
  */
 const uint8_t wbsFind[] {
     0x55, 0x48, 0x89, 0xe5, 0xe8, 0x31, 0xfd, 0x01, 0x00, 0x8b, 0x88, 0x34, 0x03, 0x00, 0x00, 0x8d,
@@ -1041,26 +1088,43 @@ const uint8_t wbsReplace[] {
     0xb8, 0xf3, 0x01, 0x00, 0x00, 0xd3, 0xe8, 0xeb, 0x1f, 0x8d, 0x91, 0x30, 0xf8, 0xff, 0xff, 0xb0,
     0x01, 0x81, 0xfa, 0xd0, 0x07, 0x00, 0x00, 0x72, 0x0f, 0x81, 0xc1, 0x60, 0xf0, 0xff, 0xff, 0x81,
     0xf9, 0xd0, 0x07, 0x00, 0x00, 0x0f, 0x92, 0xc0, 0x24, 0x01, 0x5d, 0xc3};
-static_assert(sizeof(wbsFind) == sizeof(wbsReplace), "wideband patch size");
+const uint8_t wbsFindMask[] {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+const uint8_t wbsReplaceMask[] {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static_assert(sizeof(wbsFind) == sizeof(wbsReplace) && sizeof(wbsFind) == sizeof(wbsFindMask) &&
+                  sizeof(wbsFind) == sizeof(wbsReplaceMask),
+              "wideband patch size");
 
 /* HFP sender: read one complete PCM chunk per timer tick (drop the imul), so
  * no oversized burst or partial tail overflows the outstanding-byte counter.
+ * 25G332 at 0x100337505; 25G241 differs only in the PCM-read call
+ * displacement (+8). That and the local branch displacement (+17) are
+ * wildcards; only the imul (+0..+3) is written.
  */
 const uint8_t hfpFillFind[] {
-    0x48, 0x0f, 0xaf, 0xd0, 0x4c, 0x89, 0xf6, 0xe8, 0x3b, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
-    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
-const uint8_t hfpFillReplace[] {
-    0x0f, 0x1f, 0x40, 0x00, 0x4c, 0x89, 0xf6, 0xe8, 0x3b, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
-    0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
-static_assert(sizeof(hfpFillFind) == sizeof(hfpFillReplace), "HFP fill patch size");
-/* 25G332, 0x100337505: the native PCM-read call displacement differs by eight bytes. */
-const uint8_t hfpFillFind25G332[] {
     0x48, 0x0f, 0xaf, 0xd0, 0x4c, 0x89, 0xf6, 0xe8, 0x33, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
     0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
-const uint8_t hfpFillReplace25G332[] {
+const uint8_t hfpFillFindMask[] {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+const uint8_t hfpFillReplace[] {
     0x0f, 0x1f, 0x40, 0x00, 0x4c, 0x89, 0xf6, 0xe8, 0x33, 0x2f, 0xfd, 0xff, 0x48, 0x85, 0xc0, 0x0f,
     0x84, 0x83, 0x00, 0x00, 0x00, 0x49, 0x89, 0xc4, 0x48, 0x89, 0x83, 0xd0, 0x00, 0x00, 0x00};
-static_assert(sizeof(hfpFillFind25G332) == sizeof(hfpFillReplace25G332), "HFP fill patch size");
+const uint8_t hfpFillReplaceMask[] {
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static_assert(sizeof(hfpFillFind) == sizeof(hfpFillReplace) && sizeof(hfpFillFind) == sizeof(hfpFillFindMask) &&
+                  sizeof(hfpFillFind) == sizeof(hfpFillReplaceMask),
+              "HFP fill patch size");
 
 mach_vm_address_t orgCsValidatePage;
 
@@ -1167,7 +1231,11 @@ void *const *vnodeOpsFields(vnode_t vp)
     return reinterpret_cast<void *const *>(reinterpret_cast<uintptr_t>(vp) + vnodeOpsOffset);
 }
 constexpr size_t kPatchRangeMax = 96;
-constexpr uint32_t kPatchRanges = 32;
+// Ours need ~16 on 25G332, BlueToolFixup ~5; re-validated pages reuse theirs.
+constexpr uint32_t kPatchRanges = 128;
+// A page is patched only with this much room left, so our bytes are never
+// in a page without their recorded originals.
+constexpr uint32_t kPageRangeHeadroom = 16;
 struct PatchRange {
     uint64_t fileOffset;
     uint32_t length;
@@ -1178,6 +1246,10 @@ PatchRange patchRanges[kPatchRanges];
 IOLock *pageLock;
 uint8_t *pageSnapshot;
 vnode_t bluetoothdVnode;
+// Restored copies for the verifier, preallocated: no allocation on page-in.
+constexpr size_t kVerifyCopySize = 64 * 1024;
+IOLock *verifyCopyLock;
+uint8_t *verifyCopy;
 
 // Caller holds pageLock.
 void recordPatchRange(uint64_t fileOffset, const uint8_t *original, const uint8_t *patched, uint32_t length)
@@ -1280,7 +1352,9 @@ errno_t verifyBluetoothdBlock(vnode_t vp, off_t offset, uint8_t *buf, size_t siz
         }
         return err;
     }
-    auto copy = static_cast<uint8_t *>(IOMalloc(size));
+    // The preallocated copy when free (try only: pageLock is held), else the heap.
+    const bool pooled = verifyCopy && size <= kVerifyCopySize && IOLockTryLock(verifyCopyLock);
+    auto copy = pooled ? verifyCopy : static_cast<uint8_t *>(IOMalloc(size));
     if (!copy) {
         OSIncrementAtomic(&verifyRestoreFailed);
         errno_t err = verify(buf);
@@ -1297,7 +1371,10 @@ errno_t verifyBluetoothdBlock(vnode_t vp, off_t offset, uint8_t *buf, size_t siz
     // The private copy no longer depends on the mutable file-cache pages.
     IOLockUnlock(pageLock);
     errno_t err = verify(copy);
-    IOFree(copy, size);
+    if (pooled)
+        IOLockUnlock(verifyCopyLock);
+    else
+        IOFree(copy, size);
     OSIncrementAtomic(err ? &verifyRestoreFailed : &verifyRestored);
     publishLater();
     return err;
@@ -1312,9 +1389,13 @@ int verifyOp(void *arg)
                                  [ap, org](uint8_t *buf) {
         if (buf == ap->a_buf)
             return org(ap);
-        VnopVerifyArgs copy = *ap;
-        copy.a_buf = buf;
-        return org(&copy);
+        // Swap only the buffer: no copy of an argument struct whose tail
+        // another kernel may extend.
+        uint8_t *const shared = ap->a_buf;
+        ap->a_buf = buf;
+        const int err = org(ap);
+        ap->a_buf = shared;
+        return err;
     });
 }
 
@@ -1352,7 +1433,7 @@ void installVerifyOp(vnode_t vp)
     SYSLOG(DRV_NAME, "bluetoothd verify-block fix state %d (v_op at 0x%x)", (int)state, vnodeOpsOffset);
 }
 
-void patchBluetoothdPage(const void *data);
+bool patchBluetoothdPage(void *data);
 
 // Lilu's user patcher is off on Big Sur and later (kern_start.cpp), so
 // onProcLoad never fires there. Patch bluetoothd's pages as the kernel
@@ -1372,127 +1453,172 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
         IOLockUnlock(pageLock);
         publishLater();
     }
+    // Fail closed: without the verifier restore, a patched page that stays
+    // resident makes every later page-in of its 16 KB block fail (bluetoothd
+    // SIGBUS, Bluetooth dead until reboot). Leave all pages native.
     if (!verifyFixRouted) {
         org(vp, pager, pageOffset, data, validated, tainted, nx);
-        patchBluetoothdPage(data);
+        OSIncrementAtomic(&bluetoothdPagesUnpatched);
         return;
     }
     IOLockLock(pageLock);
+    if (__atomic_load_n(&bluetoothdVnode, __ATOMIC_RELAXED) != vp)
+        memset(featureLatch, 0, sizeof(featureLatch));
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
     memcpy(pageSnapshot, data, PAGE_SIZE);
     org(vp, pager, pageOffset, data, validated, tainted, nx);
-    patchBluetoothdPage(data);
+    bool patched = false;
+    if (__atomic_load_n(&patchRangeCount, __ATOMIC_RELAXED) + kPageRangeHeadroom <= kPatchRanges)
+        patched = patchBluetoothdPage(const_cast<void *>(data));
+    else
+        OSIncrementAtomic(&bluetoothdPagesUnpatched);
     if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0)
         recordPageDiff(pageOffset, pageSnapshot, static_cast<const uint8_t *>(data));
     IOLockUnlock(pageLock);
+    if (patched)
+        publishLater();
 }
 
-// Empty until launchd sets it, so only call this once bluetoothd runs.
-bool isBluetoothdRpaBuild()
+// Empty until launchd sets it, so only call this once bluetoothd runs. An
+// empty value is not cached; every build-scoped site waits for it.
+SInt32 readBluetoothdBuild()
 {
-    SInt32 state = __atomic_load_n(&rpaBuildState, __ATOMIC_ACQUIRE);
-    if (state == 0) {
-        char build[16] {};
-        size_t size = sizeof(build) - 1;
-        if (sysctlbyname("kern.osversion", build, &size, nullptr, 0) != 0 || build[0] == 0)
-            return false;
-        state = strcmp(build, "25G332") == 0 ? 1 : -1;
-        __atomic_store_n(&rpaBuildState, state, __ATOMIC_RELEASE);
-    }
-    return state > 0;
+    SInt32 state = __atomic_load_n(&bluetoothdBuild, __ATOMIC_ACQUIRE);
+    if (state != BuildUnread)
+        return state;
+    char build[sizeof(bluetoothdBuildName)] {};
+    size_t size = sizeof(build) - 1;
+    if (sysctlbyname("kern.osversion", build, &size, nullptr, 0) != 0 || build[0] == 0)
+        return BuildUnread;
+    state = strcmp(build, "25G332") == 0 ? Build25G332 : strcmp(build, "25G241") == 0 ? Build25G241 : BuildOther;
+    memcpy(bluetoothdBuildName, build, sizeof(build));
+    __atomic_store_n(&bluetoothdBuild, state, __ATOMIC_RELEASE);
+    return state;
 }
 
-void patchBluetoothdRpaPage(const void *data)
+/*
+ * Every bluetoothd page patch, in the order they are searched. Per macOS build
+ * (kern.osversion):
+ *  - ScopeAnyBuild: the pattern alone identifies a site that is safe to patch
+ *    on any Tahoe build; no match means no patch. extAdv only.
+ *  - ScopeKnownBuild: masked against displacement-only changes, but part of
+ *    its correctness is outside the page (advAddress's setter, the mSBC pair),
+ *    so only builds checked with scripts/test-bt-page-patches.py are listed in
+ *    readBluetoothdBuild. -mtkbtanybuild also allows unlisted builds.
+ *  - ScopeRpaBuild: injected code with fixed rel32s into native code, 25G332.
+ * A site must match exactly once in the page (ambiguous: left native).
+ */
+enum PatchFeature : uint8_t { FeatureAdv, FeatureMsbc, FeatureRpa, FeatureCount };
+static_assert(FeatureCount == sizeof(featureLatch), "one latch per feature");
+enum SiteScope : uint8_t { ScopeAnyBuild, ScopeKnownBuild, ScopeRpaBuild };
+enum FeatureLatch : uint8_t { LatchUndecided = 0, LatchOn = 1, LatchOff = 2 };
+
+struct BluetoothdSite {
+    const char *name;
+    PatchFeature feature;
+    SiteScope scope;
+    mtk_bt_page_site site;
+    volatile SInt32 *counter;
+};
+
+#define BLUETOOTHD_SITE(name, feature, scope, find, findMask, replace, replaceMask, counter) \
+    {name, feature, scope, {find, findMask, replace, replaceMask, sizeof(find)}, &counter}
+#define BLUETOOTHD_RPA_SITE(name, prefix, counter)                                                         \
+    BLUETOOTHD_SITE(name, FeatureRpa, ScopeRpaBuild, prefix##Find25G332, nullptr, prefix##Replace25G332, \
+                    nullptr, counter)
+
+const BluetoothdSite bluetoothdSites[] {
+    BLUETOOTHD_RPA_SITE("RPA helpers", rpaHelpers, bluetoothdRpaHelpersPatched),
+    BLUETOOTHD_RPA_SITE("RPA legacy", rpaLegacy, bluetoothdRpaLegacyPatched),
+    BLUETOOTHD_RPA_SITE("RPA scan", rpaScan, bluetoothdRpaScanPatched),
+    BLUETOOTHD_RPA_SITE("RPA decode", rpaDecode, bluetoothdRpaDecodePatched),
+    BLUETOOTHD_RPA_SITE("RPA device", rpaDevice, bluetoothdRpaDevicePatched),
+    BLUETOOTHD_RPA_SITE("RPA connect", rpaConnect, bluetoothdRpaConnectPatched),
+    BLUETOOTHD_RPA_SITE("RPA update", rpaUpdate, bluetoothdRpaUpdatePatched),
+    BLUETOOTHD_SITE("HFP wideband gate", FeatureMsbc, ScopeKnownBuild, wbsFind, wbsFindMask, wbsReplace,
+                    wbsReplaceMask, bluetoothdWbsPatched),
+    BLUETOOTHD_SITE("HFP complete PCM chunks", FeatureMsbc, ScopeKnownBuild, hfpFillFind, hfpFillFindMask,
+                    hfpFillReplace, hfpFillReplaceMask, bluetoothdHfpFillPatched),
+    BLUETOOTHD_SITE("extended-advertising check", FeatureAdv, ScopeAnyBuild, extAdvFind, nullptr, extAdvReplace,
+                    nullptr, bluetoothdPatched),
+    BLUETOOTHD_SITE("per-set advertising address gate", FeatureAdv, ScopeKnownBuild, advAddressFind,
+                    advAddressFindMask, advAddressReplace, advAddressReplaceMask, bluetoothdAddressPatched),
+    BLUETOOTHD_SITE("random address before enable", FeatureAdv, ScopeKnownBuild, advAddressRetryFind,
+                    advAddressRetryFindMask, advAddressRetryReplace, advAddressRetryReplaceMask,
+                    bluetoothdAddressRetryPatched),
+};
+
+bool siteScopeAllows(SiteScope scope, SInt32 build)
 {
-    if (!rpaPatchEnabled || !verifyFixRouted || !isBluetoothdRpaBuild())
-        return;
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaHelpersFind25G332, sizeof(rpaHelpersFind25G332),
-                                      rpaHelpersReplace25G332, sizeof(rpaHelpersReplace25G332))) {
-        __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
-        OSIncrementAtomic(&bluetoothdRpaHelpersPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA helpers path (25G332)");
+    switch (scope) {
+    case ScopeAnyBuild:
+        return true;
+    case ScopeKnownBuild:
+        return build == Build25G241 || build == Build25G332 || (build == BuildOther && anyBuildPatches);
+    case ScopeRpaBuild:
+        return build == Build25G332;
     }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaLegacyFind25G332, sizeof(rpaLegacyFind25G332),
-                                      rpaLegacyReplace25G332, sizeof(rpaLegacyReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaLegacyPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA legacy path (25G332)");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaScanFind25G332, sizeof(rpaScanFind25G332),
-                                      rpaScanReplace25G332, sizeof(rpaScanReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaScanPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA scan path (25G332)");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaDecodeFind25G332, sizeof(rpaDecodeFind25G332),
-                                      rpaDecodeReplace25G332, sizeof(rpaDecodeReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaDecodePatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA decode path (25G332)");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaDeviceFind25G332, sizeof(rpaDeviceFind25G332),
-                                      rpaDeviceReplace25G332, sizeof(rpaDeviceReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaDevicePatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA device path (25G332)");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaConnectFind25G332, sizeof(rpaConnectFind25G332),
-                                      rpaConnectReplace25G332, sizeof(rpaConnectReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaConnectPatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA connect path (25G332)");
-    }
-    if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE,
-                                      rpaUpdateFind25G332, sizeof(rpaUpdateFind25G332),
-                                      rpaUpdateReplace25G332, sizeof(rpaUpdateReplace25G332))) {
-        OSIncrementAtomic(&bluetoothdRpaUpdatePatched);
-        SYSLOG(DRV_NAME, "patched bluetoothd RPA update path (25G332)");
-    }
+    return false;
 }
 
-void patchBluetoothdPage(const void *data)
+bool featureWanted(PatchFeature feature)
 {
-    patchBluetoothdRpaPage(data);
-    if (msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband()) {
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, wbsFind, sizeof(wbsFind),
-                                          wbsReplace, sizeof(wbsReplace))) {
-            OSIncrementAtomic(&bluetoothdWbsPatched);
-            SYSLOG(DRV_NAME, "enabled MediaTek HFP wideband with USB mSBC bridge ready");
-        }
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, hfpFillFind, sizeof(hfpFillFind),
-                                          hfpFillReplace, sizeof(hfpFillReplace)) ||
-            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, hfpFillFind25G332,
-                                          sizeof(hfpFillFind25G332), hfpFillReplace25G332,
-                                          sizeof(hfpFillReplace25G332))) {
-            OSIncrementAtomic(&bluetoothdHfpFillPatched);
-            SYSLOG(DRV_NAME, "limited MediaTek HFP sender to complete PCM chunks");
-        }
+    switch (feature) {
+    case FeatureAdv:
+        return extAdvPatchEnabled;
+    case FeatureMsbc:
+        return msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband();
+    case FeatureRpa:
+        return rpaPatchEnabled;
+    case FeatureCount:
+        break;
     }
-    if (extAdvPatchEnabled) {
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, extAdvFind, sizeof(extAdvFind),
-                                          extAdvReplace, sizeof(extAdvReplace))) {
-            OSIncrementAtomic(&bluetoothdPatched);
-            SYSLOG(DRV_NAME, "patched bluetoothd extended-advertising check");
+    return false;
+}
+
+/*
+ * Caller holds pageLock. A feature is decided at its first matching site in
+ * this bluetoothd vnode and kept until the vnode changes: its patched pages
+ * stay resident across bluetoothd relaunches, so a later flip of a gate
+ * (mSBC readiness, controller scope) must not leave one site of a pair
+ * patched and the other native (WBS on with the native sender overflowing).
+ */
+bool featureOn(PatchFeature feature)
+{
+    if (featureLatch[feature] == LatchUndecided)
+        featureLatch[feature] = featureWanted(feature) ? LatchOn : LatchOff;
+    return featureLatch[feature] == LatchOn;
+}
+
+// Caller holds pageLock; data is one validated bluetoothd page.
+bool patchBluetoothdPage(void *data)
+{
+    auto *page = static_cast<uint8_t *>(data);
+    const SInt32 build = readBluetoothdBuild();
+    bool patched = false;
+    for (const BluetoothdSite &s : bluetoothdSites) {
+        if (!siteScopeAllows(s.scope, build))
+            continue;
+        const int32_t at = mtk_bt_page_find(page, PAGE_SIZE, &s.site);
+        if (at == MTK_BT_PAGE_NO_MATCH)
+            continue;
+        if (at < 0) {
+            // Not specific enough for this build: never decide on it.
+            if (featureLatch[s.feature] == LatchUndecided)
+                featureLatch[s.feature] = LatchOff;
+            OSIncrementAtomic(&bluetoothdSitesAmbiguous);
+            SYSLOG(DRV_NAME, "bluetoothd %s: ambiguous (%d), left native", s.name, (int)at);
+            continue;
         }
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind,
-                                          sizeof(advAddressFind), advAddressReplace, sizeof(advAddressReplace)) ||
-            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressFind25G332,
-                                          sizeof(advAddressFind25G332), advAddressReplace25G332,
-                                          sizeof(advAddressReplace25G332))) {
-            OSIncrementAtomic(&bluetoothdAddressPatched);
-            SYSLOG(DRV_NAME, "patched bluetoothd per-set advertising address gate");
-        }
-        if (KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind,
-                                          sizeof(advAddressRetryFind), advAddressRetryReplace,
-                                          sizeof(advAddressRetryReplace)) ||
-            KernelPatcher::findAndReplace(const_cast<void *>(data), PAGE_SIZE, advAddressRetryFind25G332,
-                                          sizeof(advAddressRetryFind25G332), advAddressRetryReplace,
-                                          sizeof(advAddressRetryReplace))) {
-            OSIncrementAtomic(&bluetoothdAddressRetryPatched);
-            SYSLOG(DRV_NAME, "patched bluetoothd random address initialization before enable");
-        }
+        if (!featureOn(s.feature) || !mtk_bt_page_apply(page, PAGE_SIZE, (size_t)at, &s.site))
+            continue;
+        if (s.counter == &bluetoothdRpaHelpersPatched)
+            __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
+        OSIncrementAtomic(s.counter);
+        SYSLOG(DRV_NAME, "patched bluetoothd %s (page offset 0x%x)", s.name, (unsigned)at);
+        patched = true;
     }
+    return patched;
 }
 
 void processPatcher(void *, KernelPatcher &patcher)
@@ -1535,15 +1661,19 @@ void Patcher::init(uint32_t rustSelfTestFailed)
                              !checkKernelArgument("-mtkbtnolereadymask");
         extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
         // Child sites call into the helper page; some of their signatures also
-        // match 25G241, which has no helpers, so patchBluetoothdRpaPage also
-        // requires the exact build (kern.osversion is still empty here).
+        // match 25G241, which has no helpers, so RPA sites also require the
+        // exact build (ScopeRpaBuild; kern.osversion is still empty here).
         rpaPatchEnabled = extAdvPatchEnabled && getKernelVersion() == KernelVersion::Tahoe &&
                           !checkKernelArgument("-mtkbtnorpa");
         msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && !checkKernelArgument("-mtkbtnomsbc");
+        anyBuildPatches = checkKernelArgument("-mtkbtanybuild");
+        // Page patches need the verifier restore (fail closed without it).
         verifyFixEnabled = !checkKernelArgument("-mtkbtnoverifyfix");
         if (verifyFixEnabled) {
             pageLock = IOLockAlloc();
             pageSnapshot = static_cast<uint8_t *>(IOMalloc(PAGE_SIZE));
+            verifyCopyLock = IOLockAlloc();
+            verifyCopy = verifyCopyLock ? static_cast<uint8_t *>(IOMalloc(kVerifyCopySize)) : nullptr;
             publishCall = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { publishCounters(); },
                                                nullptr);
         }

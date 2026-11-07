@@ -34,11 +34,11 @@ def array(name):
     return declaration, bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", declaration))
 
 
-names = ("wbsFind", "wbsReplace", "hfpFillFind", "hfpFillReplace",
-         "hfpFillFind25G332", "hfpFillReplace25G332",
-         "extAdvFind", "extAdvReplace", "advAddressFind", "advAddressReplace",
-         "advAddressRetryFind", "advAddressRetryReplace", "advAddressFind25G332",
-         "advAddressReplace25G332", "advAddressRetryFind25G332")
+names = ("wbsFind", "wbsFindMask", "wbsReplace", "wbsReplaceMask",
+         "hfpFillFind", "hfpFillFindMask", "hfpFillReplace", "hfpFillReplaceMask",
+         "extAdvFind", "extAdvReplace",
+         "advAddressFind", "advAddressFindMask", "advAddressReplace", "advAddressReplaceMask",
+         "advAddressRetryFind", "advAddressRetryFindMask", "advAddressRetryReplace", "advAddressRetryReplaceMask")
 rpa_prefixes = ("rpaHelpers", "rpaLegacy", "rpaScan", "rpaDecode", "rpaDevice", "rpaConnect", "rpaUpdate")
 names += tuple(prefix + kind + "25G332" for prefix in rpa_prefixes for kind in ("Find", "Replace"))
 arrays = {name: array(name)[1] for name in names}
@@ -49,11 +49,23 @@ assert [(i, a, b) for i, (a, b) in enumerate(zip(wbs, wbs_patch)) if a != b] == 
 assert len(fill) == len(fill_patch) == 31
 assert fill[:4] == bytes.fromhex("480fafd0") and fill_patch[:4] == bytes.fromhex("0f1f4000")
 assert fill[4:] == fill_patch[4:]
-fill332, fill332_patch = arrays["hfpFillFind25G332"], arrays["hfpFillReplace25G332"]
-assert len(fill332) == len(fill332_patch) == len(fill)
-assert fill332[:4] == fill[:4] and fill332_patch[:4] == fill_patch[:4]
-assert fill332[4:] == fill332_patch[4:]
-assert [(i, a, b) for i, (a, b) in enumerate(zip(fill, fill332)) if a != b] == [(8, 0x3b, 0x33)]
+# Historical exact 25G241 signatures (the canonical arrays are 25G332's):
+# the masked sites must turn them into their historical replacements.
+history = {
+    "advAddress241": ("e8d430e8ff83b83403000003772a31ffe83e6bceff", "e8d430e8ff83b83403000003772a90909090909090"),
+    "advAddressRetry241": (
+        "448b043a443384080e0d00008b543a03339408110d00004409c20f8480000000"
+        "803dcc2a9200007477488d3c084881c70e0d0000488d157b000000e8eeceffff",
+        "448b043a443384080e0d00008b543a03339408110d0000f684080e0d00000175"
+        "084409c2747a909090488d3c084881c70e0d0000488d157b000000e8eeceffff"),
+    "hfpFill241": ("480fafd04c89f6e83b2ffdff4885c00f848300000049" "89c4488983d0000000",
+                   "0f1f40004c89f6e83b2ffdff4885c00f848300000049" "89c4488983d0000000"),
+}
+history_code = "".join(
+    f"const uint8_t {name}{kind}[] {{{','.join(str(b) for b in bytes.fromhex(data))}}};\n"
+    for name, pair in history.items() for kind, data in zip(("Find", "Replace"), pair))
+assert [(i, a, b) for i, (a, b) in enumerate(zip(bytes.fromhex(history["hfpFill241"][0]), fill)) if a != b] == \
+    [(8, 0x3b, 0x33)]
 assert "-btlfxmtkwbs" not in source and "-smbtmsbc" not in source
 assert 'number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);' in source
 assert 'number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);' in source
@@ -64,6 +76,7 @@ for prefix in rpa_prefixes:
 mock = r'''
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <cstddef>
@@ -97,12 +110,17 @@ constexpr size_t PAGE_SIZE = 4096;
 namespace KernelVersion { enum { Monterey = 21, Tahoe = 25 }; }
 int kernel;
 bool flag, noExtAdv, noVerifyFix, msbcReady, extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
-bool noRpa, rpaPatchEnabled, rpaHelpersReady, leReadyMaskEnabled, noLeReadyMask;
-int32_t rpaBuildState;
+bool noRpa, rpaPatchEnabled, rpaHelpersReady, leReadyMaskEnabled, noLeReadyMask, anyBuild;
+bool anyBuildPatches;
+enum BluetoothdBuild : int32_t { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3 };
+int32_t bluetoothdBuild;
+char bluetoothdBuildName[16];
+int32_t bluetoothdSitesAmbiguous, bluetoothdPagesUnpatched;
+uint8_t featureLatch[3];
 const char *osBuild = "25G332";
 int osversionReads;
 int sysctlbyname(const char *name, void *out, size_t *size, void *, size_t) {
-    assert(!strcmp(name, "kern.osversion") && *size >= strlen(osBuild)); ++osversionReads;
+    assert(!strcmp(name, "kern.osversion") && *size >= strlen(osBuild) && *size < 16); ++osversionReads;
     memcpy(out, osBuild, strlen(osBuild)); *size = strlen(osBuild); return 0;
 }
 MsbcControllerScope msbcControllerScope;
@@ -116,7 +134,8 @@ int32_t patchRangeOverflow, verifyRestored, verifyRestoreFailed, verifyFailed, v
 uint64_t verifyLastFailOffset;
 uint32_t vnodeOpsOffset;
 bool verifyFixEnabled, verifyFixRouted;
-int publishes;
+// thread_call_enter is safe from any thread.
+std::atomic<int> publishes;
 void publishLater() { ++publishes; }
 thread_call_t publishCall;
 thread_call_t thread_call_allocate(void (*)(thread_call_param_t, thread_call_param_t), thread_call_param_t) {
@@ -137,23 +156,36 @@ bool checkKernelArgument(const char *name) {
     if (!strcmp(name, "-mtkbtnoverifyfix")) return noVerifyFix;
     if (!strcmp(name, "-mtkbtnorpa")) return noRpa;
     if (!strcmp(name, "-mtkbtnolereadymask")) return noLeReadyMask;
+    if (!strcmp(name, "-mtkbtanybuild")) return anyBuild;
     assert(!strcmp(name, "-mtkbtnoextadv")); return noExtAdv;
 }
-void *IOLockAlloc() { return reinterpret_cast<void *>(1); }
+uintptr_t lockAllocs;
+void *IOLockAlloc() { return reinterpret_cast<void *>(++lockAllocs); }
+extern IOLock *verifyCopyLock;
 thread_local int lockDepth;
 std::mutex pageMutex, raceMutex;
 std::condition_variable raceCondition;
 thread_local bool watchLockAttempt;
 bool lockAttempted, operationFinished, operationPaused, releaseOperation;
-void IOLockLock(IOLock *) {
+void IOLockLock(IOLock *lock) {
+    assert(lock && lock != verifyCopyLock);
     if (watchLockAttempt) {
         std::lock_guard<std::mutex> guard(raceMutex);
         lockAttempted = true; raceCondition.notify_all();
     }
     assert(!lockDepth); pageMutex.lock(); lockDepth = 1;
 }
-void IOLockUnlock(IOLock *) { assert(lockDepth-- == 1); pageMutex.unlock(); }
-void (*afterReplacement)();
+// verifyCopyLock: only ever tried under pageLock, released after the hash.
+std::mutex copyMutex; int copyTries, copyBusy, copyHeld;
+void IOLockUnlock(IOLock *lock) {
+    if (lock && lock == verifyCopyLock) { assert(copyHeld-- == 1); copyMutex.unlock(); return; }
+    assert(lockDepth-- == 1); pageMutex.unlock();
+}
+bool IOLockTryLock(IOLock *lock) {
+    assert(lock && lock == verifyCopyLock && lockDepth == 1); ++copyTries;
+    if (copyMutex.try_lock()) { ++copyHeld; return true; }
+    ++copyBusy; return false;
+}
 void (*beforeHash)();
 void pauseOperation() {
     std::unique_lock<std::mutex> guard(raceMutex);
@@ -162,9 +194,26 @@ void pauseOperation() {
 }
 void *IOMalloc(size_t size) { return malloc(size); }
 void IOFree(void *p, size_t) { free(p); }
-void OSIncrementAtomic(int32_t *value) { ++*value; }
+void OSIncrementAtomic(volatile int32_t *value) { ++*value; }
+
 void publishCounters() {}
 int pathError, validations, searches;
+// The real Rust matcher, wrapped: count searches and pause after a write.
+#include "mtk_bt.h"
+int pageFinds;
+int32_t harnessPageFind(const uint8_t *page, size_t len, const mtk_bt_page_site *site) {
+    assert(validations && len == PAGE_SIZE && lockDepth == 1); ++searches; ++pageFinds;
+    return mtk_bt_page_find(page, len, site);
+}
+void (*afterReplacement)();
+bool harnessPageApply(uint8_t *page, size_t len, size_t offset, const mtk_bt_page_site *site) {
+    assert(lockDepth == 1);
+    const bool ok = mtk_bt_page_apply(page, len, offset, site);
+    if (ok && afterReplacement) afterReplacement();
+    return ok;
+}
+#define mtk_bt_page_find harnessPageFind
+#define mtk_bt_page_apply harnessPageApply
 int vn_getpath(vnode_t path, char *out, int *length) {
     if (pathError) return pathError;
     assert(strlen(path) + 1 <= size_t(*length)); strcpy(out, path); return 0;
@@ -305,7 +354,10 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     fakeFields[0] = fakeOps; fakeFields[1] = &fakeMount; fakeFields[2] = &fakeData;
     writeVerifyCode(0x70);
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
-    noRpa = rpaPatchEnabled = rpaHelpersReady = false; rpaBuildState = 0;
+    noRpa = rpaPatchEnabled = rpaHelpersReady = false; bluetoothdBuild = BuildUnread; bluetoothdBuildName[0] = 0;
+    anyBuild = anyBuildPatches = false; bluetoothdSitesAmbiguous = bluetoothdPagesUnpatched = 0;
+    memset(featureLatch, 0, sizeof(featureLatch)); free(verifyCopy); verifyCopy = nullptr; verifyCopyLock = nullptr;
+    copyTries = copyBusy = 0; pageFinds = 0;
     noLeReadyMask = leReadyMaskEnabled = false;
     bluetoothdRpaHelpersPatched = bluetoothdRpaLegacyPatched = bluetoothdRpaScanPatched = 0;
     bluetoothdRpaDecodePatched = bluetoothdRpaDevicePatched = bluetoothdRpaConnectPatched = bluetoothdRpaUpdatePatched = 0;
@@ -343,15 +395,15 @@ void rpaTests() {
     reset(25, true, false, false); noRpa = false; osversionReads = 0; Patcher::init(0);
     assert(rpaPatchEnabled && !osversionReads);
     { Page helpers = helperPage(), original = helpers; apply(helpers);
-      assert(!rpaHelpersReady && helpers == original && rpaBuildState == 0 && osversionReads == 1); }
+      assert(!rpaHelpersReady && helpers == original && bluetoothdBuild == BuildUnread && osversionReads == 1); }
     osBuild = "25G332";
-    { Page helpers = helperPage(); apply(helpers); assert(rpaHelpersReady && rpaBuildState == 1);
+    { Page helpers = helperPage(); apply(helpers); assert(rpaHelpersReady && bluetoothdBuild == Build25G332);
       const int reads = osversionReads; apply(helpers); assert(osversionReads == reads); }
     osBuild = "25G241";
     reset(25, true, false, false); noRpa = false; Patcher::init(0);
     assert(rpaPatchEnabled);
     { Page helpers = helperPage(), original = helpers; apply(helpers);
-      assert(!rpaHelpersReady && !bluetoothdRpaHelpersPatched && helpers == original && rpaBuildState == -1); }
+      assert(!rpaHelpersReady && !bluetoothdRpaHelpersPatched && helpers == original && bluetoothdBuild == Build25G241); }
     for (size_t i = 1; i < std::size(rpaSites); ++i) {
         const auto &site = rpaSites[i];
         Page page {}; memcpy(page.data() + site.pageOffset, site.find, site.length);
@@ -462,6 +514,74 @@ void rpaTests() {
     assert(verifyRestoreFailed == 1);
     puts("PASS: RPA build/boot/verify gates, page boundaries, counters and full verify-block restoration");
 }
+// Build scopes: masked sites on 25G241, unlisted builds and -mtkbtanybuild,
+// ambiguous matches, and the per-vnode feature decision.
+void buildTests() {
+    osBuild = "25G241";
+    reset(25, true, false); Patcher::init(0);
+    Page page {};
+    memcpy(page.data() + 310, advAddress241Find, sizeof(advAddress241Find));
+    memcpy(page.data() + 410, advAddressRetry241Find, sizeof(advAddressRetry241Find));
+    apply(page);
+    assert(!memcmp(page.data() + 310, advAddress241Replace, sizeof(advAddress241Replace)));
+    assert(!memcmp(page.data() + 410, advAddressRetry241Replace, sizeof(advAddressRetry241Replace)));
+    assert(bluetoothdAddressPatched == 1 && bluetoothdAddressRetryPatched == 1 && bluetoothdBuild == Build25G241);
+    // Unlisted build: only ScopeAnyBuild sites, unless -mtkbtanybuild; never RPA.
+    for (bool any : {false, true}) {
+        osBuild = "25H100";
+        reset(25, true, false); anyBuild = any; Patcher::init(0); msbcReady = true;
+        Patcher::observeMsbcController(true);
+        assert(anyBuildPatches == any);
+        assert(!bluetoothdAddressRetryPatched);  // known-build scope, like advAddress
+        Page p = originals(), expected = p;
+        memcpy(expected.data() + 210, extAdvReplace, sizeof(extAdvReplace));
+        if (any) {
+            memcpy(expected.data() + 10, wbsReplace, sizeof(wbsReplace));
+            memcpy(expected.data() + 110, hfpFillReplace, sizeof(hfpFillReplace));
+            memcpy(expected.data() + 310, advAddressReplace, sizeof(advAddressReplace));
+            memcpy(expected.data() + 410, advAddressRetryReplace, sizeof(advAddressRetryReplace));
+        }
+        apply(p);
+        assert(p == expected && bluetoothdBuild == BuildOther && !strcmp(bluetoothdBuildName, "25H100"));
+        assert(bluetoothdPatched == 1 && bluetoothdAddressRetryPatched == any);
+        // Retry without advAddress stalls the set start: its guard calls a
+        // helper that returns 0 without sending HCI or calling the callback
+        // when the gate is false (verified on 25G332). ScopeKnownBuild, like advAddress.
+        assert(bluetoothdAddressPatched == any && bluetoothdWbsPatched == any && bluetoothdHfpFillPatched == any);
+        Page helpers = helperPage(); const Page original = helpers; apply(helpers);
+        assert(helpers == original && !rpaHelpersReady && !bluetoothdRpaHelpersPatched);
+    }
+    osBuild = "25G332";
+    // Two matches in one page: neither is patched, and the feature is off for this vnode.
+    reset(25, true, false); Patcher::init(0);
+    page = {};
+    memcpy(page.data() + 100, advAddressRetryFind, sizeof(advAddressRetryFind));
+    memcpy(page.data() + 1000, advAddressRetryFind, sizeof(advAddressRetryFind));
+    Page before = page; apply(page);
+    assert(page == before && bluetoothdSitesAmbiguous == 1 && !bluetoothdAddressRetryPatched);
+    assert(featureLatch[FeatureAdv] == LatchOff);
+    page = originals(); apply(page); assert(page == originals() && !bluetoothdPatched);
+    // A new vnode (bluetoothd recycled) decides again.
+    static char recycled[] = "/usr/sbin/bluetoothd";
+    csValidatePage(recycled, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
+    assert(bluetoothdPatched == 1 && featureLatch[FeatureAdv] == LatchOn && bluetoothdVnode == recycled);
+    // mSBC: the wideband gate page decided before the bridge was ready keeps
+    // the sender page native too; never one of the pair alone.
+    reset(25, true, true); Patcher::init(0);
+    page = {}; memcpy(page.data() + 10, wbsFind, sizeof(wbsFind)); before = page; apply(page);
+    assert(page == before && featureLatch[FeatureMsbc] == LatchOff && !bluetoothdWbsPatched);
+    msbcReady = true; Patcher::observeMsbcController(true);
+    Page fill {}; memcpy(fill.data() + 110, hfpFillFind, sizeof(hfpFillFind)); before = fill; apply(fill);
+    assert(fill == before && !bluetoothdHfpFillPatched);
+    csValidatePage(recycled, nullptr, 0, fill.data(), nullptr, nullptr, nullptr);
+    assert(bluetoothdHfpFillPatched == 1 && featureLatch[FeatureMsbc] == LatchOn);
+    // Decided on: a later controller veto cannot leave the gate native beside a patched sender.
+    Patcher::observeMsbcController(false);
+    page = {}; memcpy(page.data() + 10, wbsFind, sizeof(wbsFind));
+    csValidatePage(recycled, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
+    assert(bluetoothdWbsPatched == 1);
+    puts("PASS: masked sites patch 25G241 as before; unlisted builds get only build-independent sites (or all but RPA with -mtkbtanybuild); ambiguous and per-vnode decisions");
+}
 // One 16 KB verify block: page 1 holds our and a foreign patch site, page 0 none.
 void verifyTests() {
     const char *btd = "/usr/sbin/bluetoothd", *other = "/usr/sbin/BlueTool";
@@ -490,6 +610,18 @@ void verifyTests() {
     // Page-in of a neighbour hashes the block with the resident patched page.
     assert(verify(btd, 0, cache.data(), cache.size()) == 0 && verifyRestored == 1 && cache == patched);
     assert(verify(btd, PAGE_SIZE, cache.data() + PAGE_SIZE, PAGE_SIZE) == 0 && verifyRestored == 2);
+    // Restored copies use the preallocated buffer; a busy one falls back to the heap.
+    assert(copyTries == 2 && !copyBusy && !copyHeld);
+    copyMutex.lock();
+    assert(verify(btd, 0, cache.data(), cache.size()) == 0 && verifyRestored == 3 && copyBusy == 1);
+    copyMutex.unlock();
+    // verifyOp hands APFS the restored copy through the caller's arguments,
+    // then gives the caller its own buffer back.
+    {
+        VnopVerifyArgs args {&fakeDesc, btd, 0, cache.data(), cache.size(), &verifyBlockSize, nullptr, 0, &fakeContext, nullptr};
+        assert(fakeOps[fakeDesc.vdesc_offset](&args) == 0 && args.a_buf == cache.data() && verifyRestored == 4);
+    }
+    verifyRestored = 2;
     // Untouched page, other vnode, non-default flags, digest-only call: pass through unchanged.
     assert(verify(btd, 0, cache.data(), PAGE_SIZE) == 0 && verifyRestored == 2);
     assert(verify(other, 0, cache.data(), cache.size()) == 94);
@@ -504,14 +636,19 @@ void verifyTests() {
     std::vector<uint8_t> fresh = file;
     assert(verify(btd, 0, fresh.data(), fresh.size()) == 0 && verifyRestored == 2 && fresh == file);
 
-    // Range table full: later ranges are counted, not stored.
-    reset(25, true, true); Patcher::init(0);
-    for (int round = 0; round < 40; ++round) {
+    // Range table full: later (foreign) ranges are counted, not stored, and
+    // ours stop kPageRangeHeadroom early: never patched without originals.
+    reset(25, true, false); Patcher::init(0);
+    for (int round = 0; round < 140; ++round) {
         std::vector<uint8_t> page(PAGE_SIZE, 0);
-        memcpy(page.data() + round * 100, foreignFind, sizeof(foreignFind));
-        csValidatePage(btd, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
+        memcpy(page.data() + (round % 40) * 100, foreignFind, sizeof(foreignFind));
+        if (round >= 100) memcpy(page.data() + 4000 - sizeof(extAdvFind), extAdvFind, sizeof(extAdvFind));
+        csValidatePage(btd, nullptr, uint64_t(round) * PAGE_SIZE, page.data(), nullptr, nullptr, nullptr);
     }
-    assert(patchRangeCount == 32 && patchRangeOverflow == 8);
+    // Rounds 100..106 patch (2 ranges each) while 16 slots remain: 114; the
+    // foreign ranges fill the table at round 120, the last 19 overflow.
+    assert(patchRangeCount == kPatchRanges && patchRangeOverflow == 19);
+    assert(bluetoothdPatched == 7 && bluetoothdPagesUnpatched == 33);
 
     // Long differences split into ranges of at most kPatchRangeMax bytes.
     reset(25, true, true); Patcher::init(0);
@@ -520,11 +657,13 @@ void verifyTests() {
     assert(patchRangeCount == 3 && patchRanges[0].length == 96 && patchRanges[2].length == 8);
     assert(patchRanges[0].fileOffset == 100 && patchRanges[2].fileOffset == 292);
 
-    // Opt-out and route failure leave the plain page hook.
+    // Opt-out and route failure fail closed: no page patch without the restore
+    // (a wrapped foreign patcher still runs; it is not ours to refuse).
     reset(25, true, false, true); Patcher::init(0);
-    assert(!verifyFixRouted && extAdvPatchRouted && !pageSnapshot);
+    assert(!verifyFixRouted && extAdvPatchRouted && !pageSnapshot && !verifyCopy);
     cache = file; csValidatePage(btd, nullptr, PAGE_SIZE, cache.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
-    assert(bluetoothdPatched == 1 && patchRangeCount == 0 && !bluetoothdVnode);
+    assert(!bluetoothdPatched && patchRangeCount == 0 && !bluetoothdVnode && bluetoothdPagesUnpatched == 1);
+    assert(!memcmp(cache.data() + PAGE_SIZE + 210, extAdvFind, sizeof(extAdvFind)) && !pageFinds);
     assert(!verifyOpState && fakeOps[kVerifyIndex] == apfsVerify && !writingRounds);
     reset(25, true, false); verifySymbolsMissing = true; Patcher::init(0);
     assert(!verifyFixRouted && extAdvPatchRouted);
@@ -587,7 +726,7 @@ void verifyOpTests() {
         assert(helpers == unpatched && !rpaHelpersReady && !patchRangeCount && !writing);
         assert(fakeOps[kVerifyIndex] == (step == VerifyOpNoEntry ? nullptr : apfsVerify));
         assert(writingRounds == (step == VerifyOpNoWrite));
-        page = originals(); apply(page); assert(bluetoothdPatched == 1 && !patchRangeCount);
+        page = originals(); apply(page); assert(!bluetoothdPatched && !patchRangeCount && page == originals());
     }
     puts("PASS: verifyOp replaces vnop_verify in the bluetoothd vnode's operations vector once, at its first page");
 }
@@ -706,10 +845,13 @@ int main() {
     }
     reset(25, true, true); Patcher::init(0); msbcReady = true;
     Patcher::observeMsbcController(true);
-    // Same HFP fill behavior on 25G332; only the native call displacement differs.
-    Page fill332 {}; memcpy(fill332.data() + 110, hfpFillFind25G332, sizeof(hfpFillFind25G332));
-    apply(fill332); assert(!memcmp(fill332.data() + 110, hfpFillReplace25G332, sizeof(hfpFillReplace25G332)));
-    assert(bluetoothdHfpFillPatched == 1); apply(fill332); assert(bluetoothdHfpFillPatched == 1);
+    // The masked HFP fill site still patches 25G241 (other call displacement)
+    // exactly as its old exact signature did.
+    osBuild = "25G241";
+    Page fill241 {}; memcpy(fill241.data() + 110, hfpFill241Find, sizeof(hfpFill241Find));
+    apply(fill241); assert(!memcmp(fill241.data() + 110, hfpFill241Replace, sizeof(hfpFill241Replace)));
+    assert(bluetoothdHfpFillPatched == 1); apply(fill241); assert(bluetoothdHfpFillPatched == 1);
+    osBuild = "25G332";
     for (bool fill : {false, true}) {
         const uint8_t *find = fill ? hfpFillFind : wbsFind;
         const uint8_t *replace = fill ? hfpFillReplace : wbsReplace;
@@ -734,6 +876,7 @@ int main() {
     Patcher::observeMsbcController(false); Patcher::observeMsbcController(true);
     Page blocked = originals(); apply(blocked);
     assert(blocked == originals() && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
+    buildTests();
     verifyTests();
     verifyOpTests();
     rpaTests();
@@ -788,24 +931,32 @@ else:
     real_code = "const uint8_t realVerifyCode[1] {};\nconst uint64_t realVerifyAddress = 0, realDescAddress = 0;\n" \
                 "constexpr bool realKernel = false;\n"
 state_start = source.index("constexpr size_t kPatchRangeMax")
-state = source[state_start:source.index("\n", source.index("vnode_t bluetoothdVnode;"))]
-wrappers = "\n\n".join(function(name) for name in (
+state = source[state_start:source.index("\n", source.index("uint8_t *verifyCopy;"))]
+site_table = source[source.index("enum PatchFeature : uint8_t"):source.index("bool siteScopeAllows(")]
+forward = "bool patchBluetoothdPage(void *data);\n"
+wrappers = forward + "\n\n".join(function(name) for name in (
     "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "static __attribute__((noinline)) bool isBluetoothdPath(", "bool isBluetoothd(",
     "uint32_t decodeVnodeOpsOffset(", "void noteVerifyFailure(", "template <typename Verify>\nerrno_t verifyBluetoothdBlock(",
-    "int verifyOp(void *arg)", "void installVerifyOp(", "bool isBluetoothdRpaBuild()", "void patchBluetoothdRpaPage(", "void patchBluetoothdPage(const void *data)\n{", "void csValidatePage(", "void processPatcher(",
+    "int verifyOp(void *arg)", "void installVerifyOp(", "void csValidatePage(", "SInt32 readBluetoothdBuild()",
+    "bool siteScopeAllows(", "bool featureWanted(", "bool featureOn(", "bool patchBluetoothdPage(void *data)\n{",
+    "void processPatcher(",
     "void Patcher::observeMsbcController(", "void Patcher::init("))
 compiler = shutil.which("clang++")
 assert compiler, "clang++ is required"
+# The real masked page matcher (mtk_bt::page_patch) through its C ABI.
+rust_host = ROOT / "build/rust-bt-host"
+subprocess.run(["cargo", "build", "-q", "-p", "mtk-ffi", "--features", "bt", "--target-dir", str(rust_host)],
+               cwd=ROOT / "rust", check=True)
 with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     directory = Path(directory)
     cpp, binary = directory / "pages.cpp", directory / "pages"
     scope_include = '#include "' + str(ROOT / "kext/BT/msbc/MsbcControllerScope.hpp") + '"\n'
-    cpp.write_text(scope_include + mock + declarations + state + "\n" + types + vop_mock + real_code + "\n" +
-                   wrappers + tests)
+    cpp.write_text(scope_include + mock + declarations + history_code + state + "\n" + types + vop_mock +
+                   real_code + "\n" + site_table + wrappers + tests)
     sanitizer = [] if args.no_sanitize else ["-fsanitize=" + ("thread" if args.thread_sanitize else "address,undefined"),
                                             "-fno-sanitize-recover=all"]
-    subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror",
-                    *sanitizer, str(cpp), "-o", str(binary)], check=True)
+    subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "kext/BT"), "-I", str(ROOT / "kext/include"),
+                    *sanitizer, str(cpp), str(rust_host / "debug/libmtk_ffi.a"), "-o", str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
 
     if platform.machine() == "x86_64":
@@ -841,16 +992,7 @@ int main() {
         print("SKIP: native WBS instruction test requires x86_64")
 
 if args.binary:
-    data = args.binary.read_bytes()
-    for label, original, replacement in (("WBS", wbs, wbs_patch), ("HFP fill", fill, fill_patch)):
-        if label == "HFP fill" and data.count(original) + data.count(replacement) == 0:
-            original, replacement = fill332, fill332_patch
-        originals, replacements = data.count(original), data.count(replacement)
-        assert originals + replacements == 1, label + ": expected one original or live-cache-patched signature"
-        offset = data.index(original if originals else replacement)
-        assert offset % 4096 + len(original) <= 4096, label + ": signature crosses validation page"
-        print(f"PASS: {label} unique same-page signature at file offset {offset:#x}" +
-              (" (live file cache already patched)" if replacements else ""))
+    # Masked WBS/HFP fill (and every other site) uniqueness and page checks.
     subprocess.run([sys.executable, str(ROOT / "scripts/test-bt-page-patches.py"),
                     "--binary", str(args.binary)], check=True)
 

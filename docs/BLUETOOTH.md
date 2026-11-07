@@ -98,6 +98,46 @@ python3 scripts/test-bt-msbc-integration.py
 python3 scripts/test-bt-msbc-page-patches.py
 ```
 
+## Page patches across macOS builds
+
+Every bluetoothd page patch is one entry in `bluetoothdSites`
+(`kext/BT/Patcher.cpp`), searched with a masked matcher in Rust
+(`mtk_bt::page_patch`): rel32/RIP displacements that move between builds are
+wildcards, and a site must match exactly once in its page or it is left
+native. Each site has a scope, keyed on `kern.osversion` (ioreg
+`BluetoothdBuild`):
+
+| Scope | Sites | Builds |
+|---|---|---|
+| any build | extended-advertising check, random address before enable | any Tahoe build where the pattern matches |
+| known build | per-set address gate, HFP wideband gate, HFP sender | 25G241, 25G332; others with boot-arg `-mtkbtanybuild` |
+| RPA | Instant Hotspot helpers and their 6 call sites | 25G332 only |
+
+A feature (advertising, mSBC, RPA) is decided at its first matching site and
+kept for the bluetoothd vnode, so a gate that flips later (mSBC bridge
+readiness, controller scope) cannot leave one site of a pair patched.
+`BluetoothdPatchFeatures` shows the decisions, 2 bits each (advertising,
+mSBC, RPA): 1 on, 2 off. `BluetoothdSitesAmbiguous` counts sites refused for
+matching twice.
+
+Page patches now fail closed: without the verifier restore (hook state not
+1, or `-mtkbtnoverifyfix`) no page is patched (`BluetoothdPagesUnpatched`),
+since a resident patched page breaks its neighbours' page-ins.
+
+To add a new macOS build to the known list, check an unpatched copy of its
+bluetoothd (the live one may show patched cache pages):
+
+```sh
+python3 scripts/test-bt-page-patches.py --binary /path/to/bluetoothd
+```
+
+It checks every masked site for exactly one same-page match, that the masked
+sites turn the historical 25G241 signatures into their old patches, and that
+the NOPed address call still targets the default-true gate setter. If it
+passes, add the build to `readBluetoothdBuild`. RPA still needs its own arrays
+per build. `-mtkbtanybuild` lets a user try the known-build sites before
+that; RPA is never enabled by it.
+
 ## Page patches and the sealed volume
 
 bluetoothd's page patches (MtkWirelessBT's and BlueToolFixup's) modify pages

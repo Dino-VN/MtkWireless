@@ -64,41 +64,105 @@ def array(name):
 
 patched = bytearray(binary)
 locations = {}
-# Per-build variants: name suffix '' is 25G241, '25G332' is 26.7.2.
-def variant(prefix):
-    for suffix in ('', '25G332'):
-        if 'const uint8_t ' + prefix + 'Find' + suffix + '[]' not in source:
-            continue
-        find = array(prefix + 'Find' + suffix)
-        try:
-            replacement = array(prefix + 'Replace' + suffix)
-        except TypeError:
-            replacement = array(prefix + 'Replace')
-        if binary.count(find) + binary.count(replacement) == 1:
-            return suffix, find, replacement
-    return '', array(prefix + 'Find'), array(prefix + 'Replace')
-suffixes = {}
-for prefix in ('extAdv', 'advAddress', 'advAddressRetry'):
-    suffix, find, replacement = variant(prefix)
-    suffixes[prefix] = suffix
-    assert len(find) == len(replacement)
-    originals, replacements = binary.count(find), binary.count(replacement)
+
+
+def optional_array(name, length):
+    try:
+        data = array(name)
+    except TypeError:
+        return b'\xff' * length
+    assert len(data) == length, name + ': mask length'
+    return data
+
+
+def site(prefix):
+    """find, find mask, replace, replace mask, as Patcher.cpp's BLUETOOTHD_SITE."""
+    find, replace = array(prefix + 'Find'), array(prefix + 'Replace')
+    assert len(find) == len(replace), prefix + ': size'
+    find_mask = optional_array(prefix + 'FindMask', len(find))
+    replace_mask = optional_array(prefix + 'ReplaceMask', len(find))
+    assert set(find_mask) <= {0, 0xff} and set(replace_mask) <= {0, 0xff}, prefix + ': whole-byte masks'
+    assert find_mask[0] == 0xff, prefix + ': first byte must be exact (Rust anchor)'
+    return find, find_mask, replace, replace_mask
+
+
+def pattern(find, find_mask, replace=None, replace_mask=None):
+    """Regex for the masked site; with replace, for its already-patched form."""
+    out = b''
+    for i, (f, m) in enumerate(zip(find, find_mask)):
+        if replace is not None and replace_mask[i]:
+            out += re.escape(bytes([replace[i]]))
+        else:
+            out += re.escape(bytes([f])) if m else b'.'
+    return re.compile(out, re.S)
+
+
+def applied(window, replace, replace_mask):
+    return bytes((w & ~m) | (r & m) for w, r, m in zip(window, replace, replace_mask))
+
+
+def matches(regex, data):
+    # Overlapping matches count too: the kext refuses a page with two.
+    return [m.start() for m in re.finditer(b'(?=' + regex.pattern + b')', data, re.S)]
+
+
+# Historical exact 25G241 (26.7.1) signatures, removed from Patcher.cpp when
+# the sites became masked. Each masked site must still turn every historical
+# find into exactly its historical replacement.
+HISTORY = {
+    'advAddress': [(
+        '25G241',
+        bytes.fromhex('e8d430e8ff83b83403000003772a31ffe83e6bceff'),
+        bytes.fromhex('e8d430e8ff83b83403000003772a90909090909090'))],
+    'advAddressRetry': [(
+        '25G241',
+        bytes.fromhex('448b043a443384080e0d00008b543a033394081 10d00004409c20f8480000000'
+                      '803dcc2a9200007477488d3c084881c70e0d0000488d157b000000e8eeceffff'.replace(' ', '')),
+        bytes.fromhex('448b043a443384080e0d00008b543a03339408110d0000f684080e0d00000175'
+                      '084409c2747a909090488d3c084881c70e0d0000488d157b000000e8eeceffff'))],
+    'hfpFill': [(
+        '25G241',
+        bytes.fromhex('480fafd04c89f6e83b2ffdff4885c00f848300000049 89c4488983d0000000'.replace(' ', '')),
+        bytes.fromhex('0f1f40004c89f6e83b2ffdff4885c00f848300000049 89c4488983d0000000'.replace(' ', '')))],
+}
+SITES = ('extAdv', 'advAddress', 'advAddressRetry', 'wbs', 'hfpFill')
+sites = {prefix: site(prefix) for prefix in SITES}
+for prefix, (find, find_mask, replace, replace_mask) in sites.items():
+    # The canonical (25G332) arrays: masking changes nothing there.
+    assert applied(find, replace, replace_mask) == replace, prefix + ': replace mask drops a change'
+    regex = pattern(find, find_mask)
+    for build, old_find, old_replace in HISTORY.get(prefix, []):
+        assert len(old_find) == len(find) and regex.fullmatch(old_find), f'{prefix}: misses {build}'
+        assert applied(old_find, replace, replace_mask) == old_replace, f'{prefix}: {build} result differs'
+    originals = matches(regex, binary)
+    replacements = matches(pattern(find, find_mask, replace, replace_mask), binary)
     # cs_validate_page patches can be visible through the live vnode cache.
-    assert originals + replacements == 1, prefix + ': target must match exactly once'
-    off = binary.index(find if originals else replacement)
+    assert len(originals) + len(replacements) == 1, f'{prefix}: target must match exactly once'
+    off = (originals or replacements)[0]
     if replacements:
         print(prefix + ': live file cache already contains this patch')
     va = virtual(off)
     assert va // 4096 == (va + len(find) - 1) // 4096, 'Pattern crosses page'
-    patched[off:off + len(find)] = replacement
+    window = binary[off:off + len(find)]
+    patched[off:off + len(find)] = applied(window, replace, replace_mask)
     locations[prefix] = va
-    print(f'{prefix}: unique pattern at 0x{va:x}, fits validation page')
+    print(f'{prefix}: unique masked pattern at 0x{va:x}, fits validation page')
+# Applying again must be a no-op; a page cannot repeatedly match.
+for prefix, (find, find_mask, _, _) in sites.items():
+    assert not matches(pattern(find, find_mask), bytes(patched)), prefix + ': patch must be idempotent'
 
 # Extended-advertising check returns true, with balanced stack, exactly.
 assert array('extAdvReplace')[:8] == bytes.fromhex('55 48 89 e5 b0 01 5d c3')
 # Remove only the false setter call. Keep chip lookup, comparison and branch.
-a, b = variant('advAddress')[1:]
-assert a[:14] == b[:14] and b[14:] == b'\x90' * 7
+a, _, b, b_mask = sites['advAddress']
+assert a[:14] == b[:14] and b[14:] == b'\x90' * 7 and b_mask == bytes(14) + b'\xff' * 7
+live = read_virtual(locations['advAddress'], len(a))  # this build's bytes (displacements)
+if pattern(a, sites['advAddress'][1]).fullmatch(live):
+    a = live
+else:
+    # The live file cache holds the NOPed call; its displacement is gone.
+    print('advAddress: live cache patched; checking the canonical 25G332 setter call')
+    assert uuid == bytes.fromhex('7ef7ef4d9b0e355abba8f34713b2580a'), 'Check an unpatched copy of this build'
 assert a[14:17] == bytes.fromhex('31 ff e8')
 call_end = locations['advAddress'] + len(a)
 setter = call_end + struct.unpack_from('<i', a, 17)[0]
@@ -107,14 +171,15 @@ assert setter_code[:7] == bytes.fromhex('55 48 89 e5 40 88 3d')
 assert setter_code[11:] == bytes.fromhex('5d c3')
 gate = setter + 11 + struct.unpack_from('<i', setter_code, 7)[0]
 assert read_virtual(gate, 1) == b'\x01', 'Address gate must default true'
-# Applying again must be a no-op; a page cannot repeatedly match.
-for prefix in ('extAdv','advAddress','advAddressRetry'):
-    assert variant(prefix)[1] not in patched
+# The retry guard replaced the same gate's check (cmpb $0, gate(%rip)).
+retry = read_virtual(locations['advAddressRetry'], 64)
+if retry[32:34] == bytes.fromhex('80 3d'):
+    assert locations['advAddressRetry'] + 39 + struct.unpack_from('<i', retry, 34)[0] == gate, 'Retry gate differs'
 print(f'Per-set address gate defaults true at 0x{gate:x}; false setter alone removed')
 # Execute the actual replacement guard instructions on the x86_64 host.
 # Its fall-through address is +18; unchanged public addresses jump to +137.
-a, b = variant('advAddressRetry')[1:]
-assert a[:23] == b[:23] and a[41:] == b[41:]
+a, _, b, b_mask = sites['advAddressRetry']
+assert a[:23] == b[:23] and a[41:] == b[41:] and b_mask == bytes(23) + b'\xff' * 18 + bytes(23)
 guard = b[23:41]
 assert guard == bytes.fromhex('f6 84 08 0e 0d 00 00 01 75 08 44 09 c2 74 7a 90 90 90')
 assert 10 + struct.unpack('b', guard[9:10])[0] == 18
@@ -427,4 +492,9 @@ def validate_le_ready_mask_contract():
     print(f'PASS: 25G332 generic mask {old_mask:#x} disables DLE/PHY; HCI repair is {old_mask | 0x840:#x}; native readiness evidence checked')
 
 validate_le_ready_mask_contract()
+# Patcher.cpp's ScopeKnownBuild sites (advAddress, wbs, hfpFill) apply only to
+# builds listed in readBluetoothdBuild, or with -mtkbtanybuild. A new build
+# passing every check above (on an unpatched copy, e.g. from its installer)
+# can be listed there; RPA still needs its own arrays.
+print('bluetoothd x86_64 LC_UUID ' + (uuid.hex().upper() if uuid else 'missing'))
 print('Bluetooth page patch validation passed')

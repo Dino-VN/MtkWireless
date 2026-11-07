@@ -69,6 +69,17 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
 
 ## Wi-Fi + AWDL coexistence (do not regress)
 
+- 1.0.14 native Mirroring RX (2026-11-07): Dino's TID 7 media MSDUs
+  carry RFC1042 IPv6 directly, both plain QoS and A-MSDU, without an AWDL
+  sequence header. Do not interpret EtherType 0x86dd as an LLC envelope
+  length. Preserve whole-aggregate/MAC/BSSID/IPv6/MTU validation and the
+  unchanged DataView ABI. Native RX has a separate 128-entry retry cache
+  keyed by source, TID, MPDU sequence and MSDU content; hardware-split MSDUs
+  may share one MPDU sequence. Do not feed these into legacy AWDL sequence
+  windows. Tests: Rust protocol tests and scripts/test-native-mirroring-rx.py
+  (production branch/ABI under ASan/UBSan). Hardware validation after kext
+  installation/reboot remains pending; see docs/IPHONE-MIRRORING.md.
+
 - 1.0.11 native Mirroring cache diagnostics (2026-11-05): runtime ioctl164
   fails after 3000 ms, consistent with the native event8 cache wait; exact
   runtime branch is unproven. Atomic `MTKAWDLCache*` request/firmware/post/event
@@ -286,6 +297,15 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   instructions on host. 0.1.9 hardware AirDrop verification pending.
 - The core's `sse` future-incompat warning from `core` is expected on a
   soft-float target and harmless.
+- bluetoothd page patches are one table (`bluetoothdSites`, Patcher.cpp)
+  matched by `mtk_bt::page_patch` (masked: displacements are wildcards; one
+  match per page or none). Scopes by `kern.osversion` (`readBluetoothdBuild`):
+  extAdv + advAddressRetry on any build; advAddress, wbs, hfpFill only on
+  listed builds (25G241, 25G332) or with `-mtkbtanybuild`; RPA 25G332 only.
+  Features latch per bluetoothd vnode (`featureLatch`). No verifier restore
+  means no page patch at all (fail closed, `BluetoothdPagesUnpatched`). New
+  build: run `scripts/test-bt-page-patches.py --binary` on an unpatched copy,
+  then list it. Canonical arrays are 25G332's; 25G241's live in the tests.
 
 ## Rules
 

@@ -97,6 +97,19 @@ void mtk_bt_le_ready_usb_status(uint32_t command, uint32_t status);
 bool mtk_bt_le_ready_events(uint64_t id, const uint8_t *events, size_t len);
 void mtk_bt_le_ready_snapshot(mtk_bt_le_ready_diagnostics *out);
 
+/* Masked bluetoothd page-patch sites (Patcher.cpp). A zero find_mask byte is
+ * a wildcard; replace_mask selects the bits written. Masks may be NULL
+ * (exact). The first find byte must be exact. */
+typedef struct mtk_bt_page_site {
+    const uint8_t *find, *find_mask, *replace, *replace_mask;
+    uint32_t len;
+} mtk_bt_page_site;
+enum { MTK_BT_PAGE_NO_MATCH = -1, MTK_BT_PAGE_AMBIGUOUS = -2, MTK_BT_PAGE_BAD_SITE = -3 };
+/* Offset of the only match, or MTK_BT_PAGE_*; a site never spans pages. */
+int32_t mtk_bt_page_find(const uint8_t *page, size_t len, const mtk_bt_page_site *site);
+/* Writes the site at offset if it still matches there. */
+bool mtk_bt_page_apply(uint8_t *page, size_t len, size_t offset, const mtk_bt_page_site *site);
+
 #ifdef __cplusplus
 }
 #endif

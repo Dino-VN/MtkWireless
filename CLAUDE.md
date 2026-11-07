@@ -359,6 +359,15 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   published from a thread call so they update while bluetoothd crashes.
   Test: `scripts/test-bt-msbc-page-patches.py` (decodes this host's kernel).
   Unverified on hardware.
+- bluetoothd page patches are one table (`bluetoothdSites`, Patcher.cpp)
+  matched by `mtk_bt::page_patch` (masked: displacements are wildcards; one
+  match per page or none). Scopes by `kern.osversion` (`readBluetoothdBuild`):
+  extAdv + advAddressRetry on any build; advAddress, wbs, hfpFill only on
+  listed builds (25G241, 25G332) or with `-mtkbtanybuild`; RPA 25G332 only.
+  Features latch per bluetoothd vnode (`featureLatch`). No verifier restore
+  means no page patch at all (fail closed, `BluetoothdPagesUnpatched`). New
+  build: run `scripts/test-bt-page-patches.py --binary` on an unpatched copy,
+  then list it. Canonical arrays are 25G332's; 25G241's live in the tests.
 - HFP wideband (Tahoe, on unless `-mtkbtnomsbc`; USB `13d3:3610` and
   `0489:e0cd` only, `UsbMsbcScope.hpp`; `kext/BT/msbc`):
   bluetoothd keeps a 33-byte PCM SCO view; `UsbMsbcBridge` maps interface 1

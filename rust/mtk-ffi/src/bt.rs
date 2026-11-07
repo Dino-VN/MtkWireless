@@ -421,3 +421,73 @@ pub unsafe extern "C" fn mtk_bt_le_receive(
         original: r.original,
     }
 }
+
+/// One masked bluetoothd page-patch site (kext/BT/Patcher.cpp). Masks may be
+/// NULL (exact); all arrays are `len` bytes.
+#[repr(C)]
+pub struct MtkBtPageSite {
+    pub find: *const u8,
+    pub find_mask: *const u8,
+    pub replace: *const u8,
+    pub replace_mask: *const u8,
+    pub len: u32,
+}
+
+/// `mtk_bt_page_find` results below zero.
+pub const MTK_BT_PAGE_NO_MATCH: i32 = -1;
+pub const MTK_BT_PAGE_AMBIGUOUS: i32 = -2;
+pub const MTK_BT_PAGE_BAD_SITE: i32 = -3;
+
+unsafe fn page_site<'a>(site: *const MtkBtPageSite) -> Option<mtk_bt::page_patch::Site<'a>> {
+    let s = unsafe { site.as_ref() }?;
+    let n = s.len as usize;
+    if s.find.is_null() || s.replace.is_null() || n == 0 {
+        return None;
+    }
+    Some(mtk_bt::page_patch::Site {
+        find: unsafe { bytes(s.find, n) },
+        find_mask: unsafe { bytes(s.find_mask, n) },
+        replace: unsafe { bytes(s.replace, n) },
+        replace_mask: unsafe { bytes(s.replace_mask, n) },
+    })
+}
+
+/// Offset of the site's only match in the page, or a negative
+/// `MTK_BT_PAGE_*` value. Never writes.
+///
+/// # Safety
+/// `page` must point to `len` readable bytes; `site` to a valid site.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_page_find(page: *const u8, len: usize, site: *const MtkBtPageSite) -> i32 {
+    use mtk_bt::page_patch::Match;
+    let Some(site) = (unsafe { page_site(site) }) else {
+        return MTK_BT_PAGE_BAD_SITE;
+    };
+    if len > i32::MAX as usize {
+        return MTK_BT_PAGE_BAD_SITE;
+    }
+    match site.find_in(unsafe { bytes(page, len) }) {
+        Ok(Match::One(at)) => at as i32,
+        Ok(Match::None) => MTK_BT_PAGE_NO_MATCH,
+        Ok(Match::Many) => MTK_BT_PAGE_AMBIGUOUS,
+        Err(_) => MTK_BT_PAGE_BAD_SITE,
+    }
+}
+
+/// Applies the site at `offset` (from `mtk_bt_page_find`); false, and the
+/// page unchanged, unless it still matches there.
+///
+/// # Safety
+/// `page` must point to `len` writable bytes; `site` to a valid site.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_page_apply(
+    page: *mut u8,
+    len: usize,
+    offset: usize,
+    site: *const MtkBtPageSite,
+) -> bool {
+    let Some(site) = (unsafe { page_site(site) }) else {
+        return false;
+    };
+    site.apply_at(unsafe { bytes_mut(page, len) }, offset).is_ok()
+}

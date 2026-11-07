@@ -152,7 +152,7 @@
 			<key>idVendor</key>
 			<integer>3725</integer>
 		</dict>
-		<key>MtkWirelessBT_MediaTek_0e8d_223c</key>
+		<key>MtkWirelessBT_MT7922_0e8d_223c</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
 			<string>com.dinovn.MtkWirelessBT</string>
