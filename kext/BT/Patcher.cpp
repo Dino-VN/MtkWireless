@@ -1290,6 +1290,33 @@ void recordPageDiff(uint64_t pageOffset, const uint8_t *before, const uint8_t *a
     }
 }
 
+/*
+ * A patched bluetoothd page lives on in the shared file cache, so when the
+ * page is evicted and faulted in again cs_validate_page receives a buffer
+ * that already carries our patch. AMFI hashes that copy, marks the page
+ * invalid and kills bluetoothd at the page's first instruction
+ * (2026-11-05: every crash at bluetoothd+0x33a39e, the extended-advertising
+ * page patched 172 times). Put the recorded originals back for the duration
+ * of the check; patchBluetoothdPage re-applies them immediately after.
+ * Caller holds pageLock.
+ */
+void restorePatchedPageLocked(memory_object_offset_t pageOffset, const void *data)
+{
+    if (!data)
+        return;
+    uint8_t *page = const_cast<uint8_t *>(reinterpret_cast<const uint8_t *>(data));
+    const uint64_t base = (uint64_t)pageOffset;
+    const uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_ACQUIRE);
+    for (uint32_t i = 0; i < count; i++) {
+        const PatchRange &r = patchRanges[i];
+        if (r.fileOffset < base || r.fileOffset - base + r.length > PAGE_SIZE)
+            continue;
+        uint8_t *dst = page + (r.fileOffset - base);
+        if (memcmp(dst, r.patched, r.length) == 0)
+            memcpy(dst, r.original, r.length);
+    }
+}
+
 static __attribute__((noinline)) bool isBluetoothdPath(vnode_t vp)
 {
     static constexpr char bluetoothd[] = "/usr/sbin/bluetoothd";
@@ -1457,6 +1484,11 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     // resident makes every later page-in of its 16 KB block fail (bluetoothd
     // SIGBUS, Bluetooth dead until reboot). Leave all pages native.
     if (!verifyFixRouted) {
+        if (pageLock) {
+            IOLockLock(pageLock);
+            restorePatchedPageLocked(pageOffset, data);
+            IOLockUnlock(pageLock);
+        }
         org(vp, pager, pageOffset, data, validated, tainted, nx);
         OSIncrementAtomic(&bluetoothdPagesUnpatched);
         return;
@@ -1465,6 +1497,9 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     if (__atomic_load_n(&bluetoothdVnode, __ATOMIC_RELAXED) != vp)
         memset(featureLatch, 0, sizeof(featureLatch));
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+    // The page may already hold our patch from an earlier fault; hand the
+    // signature check the original bytes so the page never validates dirty.
+    restorePatchedPageLocked(pageOffset, data);
     memcpy(pageSnapshot, data, PAGE_SIZE);
     org(vp, pager, pageOffset, data, validated, tainted, nx);
     bool patched = false;
