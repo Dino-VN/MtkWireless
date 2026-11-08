@@ -760,11 +760,10 @@ void AirportMtkSkywalkInterface::applyJoinCompat()
         ic->ic_des_esslen == joinCompatSsidLength &&
         !memcmp(ic->ic_des_essid, joinCompatSsid, joinCompatSsidLength))
         level = joinCompatLevel;
-    // Retain the existing compatibility experiment for a locally
-    // administered target BSSID. Later 1.0.26/1.0.27 captures still stall
-    // at level 3, so neither this profile nor a first-association rule is
-    // established as a remedy. A local BSSID alone does not identify iOS.
-    if (joinBssidSpecified && (joinBSSID[0] & 0x02) && joinHotspotLevel > level)
+    // A locally administered BSSID is also used by ordinary APs.
+    // Preemptive compatibility requires a WCL Instant Hotspot indication.
+    if (ic->ic_wcl_hotspot_flag && joinBssidSpecified &&
+        (joinBSSID[0] & 0x02) && joinHotspotLevel > level)
         level = joinHotspotLevel;
     if (!level)
         return;
@@ -829,7 +828,18 @@ void AirportMtkSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reason,
             mtk_join_record_failure(&d, &ic->ic_join_failed, &ic->ic_join_assoc_failed);
         }
     }
-    WCL_LOG("join finished status=%u reason=%u driver=0x%x\n", status, reason, driverStatus);
+    // 1.0.21 diagnostic: the first join after boot always fails once
+    // (0xe00002bc = not associated) and costs a full rescan. Record what the
+    // driver thought the target was at that moment.
+    {
+        auto ic = fHalService->get80211Controller();
+        WCL_LOG("join finished status=%u reason=%u driver=0x%x state=%d bss=%s des_bssid=%d node_flags=0x%x port=%d\n",
+            status, reason, driverStatus, ic->ic_state,
+            ic->ic_bss ? ether_sprintf(ic->ic_bss->ni_bssid) : "none",
+            (ic->ic_flags & IEEE80211_F_DESBSSID) != 0,
+            ic->ic_bss ? ic->ic_bss->ni_flags : 0,
+            ic->ic_bss ? ic->ic_bss->ni_port_valid : 0);
+    }
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
