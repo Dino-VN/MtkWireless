@@ -114,8 +114,15 @@ pub fn parse_sequence(p: &[u8]) -> Option<Sequence> {
     }
     let used = 6 + count * width;
     // Bound padding separately from TLV framing; never accept nonzero
-    // extension bytes.
-    if n - used > 3 || p[used..].iter().any(|&b| b != 0) {
+    // extension bytes. iOS 26/27 append a 2-byte trailer after the last
+    // channel entry (observed 0x20 0xe4 on iPhone18,2 / iOS 27); only the
+    // remaining legacy padding has to be zero.
+    let tail = n - used;
+    if tail > 3 {
+        return None;
+    }
+    let legacy = tail.saturating_sub(2);
+    if p[used..used + legacy].iter().any(|&b| b != 0) {
         return None;
     }
     let mut s = Sequence {
@@ -2196,6 +2203,36 @@ pub fn receive_roc_grant(
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    /// Captured from an iPhone18,2 on iOS 27 (sync TLV kind 4, p[33..], 40
+    /// bytes). iOS 26/27 append a 2-byte trailer (0x20 0xe4) after the 16
+    /// channel entries; rejecting it kept the peer out of `state.peers`, so
+    /// AirDrop stayed on "Waiting…" forever. 1.0.9 returned None here.
+    #[test]
+    fn accepts_ios27_embedded_sequence_trailer() {
+        let s: [u8; 40] = [
+            0x0f, 0x01, 0x00, 0x03, 0xff, 0xff, 0x2b, 0x06, //
+            0x00, 0x00, 0x1d, 0x97, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x06, //
+            0x00, 0x00, 0x1d, 0x97, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xe4, //
+        ];
+        let parsed = parse_sequence(&s).expect("iOS 27 trailer must be tolerated");
+        assert_eq!(parsed.count, 16);
+        assert_eq!(parsed.step, 3);
+        assert_eq!(parsed.channels[0], 6);
+    }
+
+    /// The legacy rule still applies to real garbage past the trailer.
+    #[test]
+    fn rejects_oversized_sequence_padding() {
+        let mut s: [u8; 44] = [0; 44];
+        s[0] = 0x0f;
+        s[3] = 0x03;
+        s[4] = 0xff;
+        s[5] = 0xff;
+        assert!(parse_sequence(&s).is_none());
+    }
 
     fn native_ipv6_frame(size: usize, aggregate: bool) -> (Vec<u8>, Vec<u8>) {
         let (envelope, eth) = qos_llc_frame(size);
