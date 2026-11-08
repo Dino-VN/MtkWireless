@@ -57,6 +57,12 @@ struct Hal{
   assert(grant.grant(token,c,ms,clockUS));}
 };
 struct Event{unsigned id;std::vector<uint8_t> bytes;};
+ static bool awdlAmsduEnabled(){return true;}
+ // Boot-arg defaults from the production helpers: strict peer window, 8 ms
+ // slack (unused at gate 1) and no station renew.
+ static int awdlPeerGateMode(){return 1;}
+ static unsigned awdlPeerGateSlackUS(){return 8000;}
+ static int awdlRenewStationOnNoPeer(){return 0;}
 struct AirportMtkAwdlInterface{
  Hal radio;Hal*hal=&radio;Timer t;Timer*timer=&t;
  bool enabled=true,stopping=false,trafficActive=false,trafficPeerInstalled=false;
@@ -69,6 +75,9 @@ struct AirportMtkAwdlInterface{
  uint8_t requestedChannel=0,grantedChannel=0;uint64_t requestDeadline=0;
  unsigned reserveDuration=0;IOReturn reserveStatus=0,actionStatus=0,miStatus=0;
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
+ uint64_t dataTxNotReady=0,dataTxNoGrantTicks=0;
+ uint64_t amsduFrames=0,amsduSubframes=0,amsduBytes=0,amsduAllocFailed=0;
+ mbuf_t buildAmsdu(mbuf_t,uint8_t,uint64_t,unsigned&){return nullptr;}
  uint64_t serviceTicks=0,reserveAttempts=0,grantObservations=0,awStartNotifications=0,
  nextAction=0,actionSubmitted=0,actionFailed=0,miStart=0,miSubmitted=0,miFailed=0;
  uint64_t reserveWaitUS=0,reserveMaxWaitUS=0,reserveInvalidations=0;uint32_t reserveInvalidReason=0;

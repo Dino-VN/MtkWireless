@@ -43,7 +43,7 @@ struct Gate{
 thread_local unsigned Gate::depth=0;
 Gate*_fCommandGate=&gate;
 using mbuf_t=int*;void mbuf_freem(mbuf_t m){delete m;}
-struct Timer{bool active=false;void setTimeoutMS(unsigned){active=true;}void cancelTimeout(){active=false;}};
+struct Timer{bool active=false;void setTimeoutMS(unsigned){active=true;}void cancelTimeout(){active=false;}void enable(){}};
 struct Hal{
  bool on=false;unsigned calls=0,status=0,inFlight=0;std::vector<bool> history;
  mtkawdl::Reservation grant{};
@@ -55,6 +55,7 @@ struct Hal{
 struct AirportMtkAwdlInterface:OSObject{
  Hal radio;Hal*hal=&radio;Timer clock;Timer*timer=&clock;
  struct{void reset(){}}dataPeers;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;bool stopping=false,enabled=false;IOThread syncOwner=nullptr;
+ bool readyGatePending=false,readyGateBypassed=false,readyGateForce=false;static constexpr uint64_t kReadyGateMaxUS=180ull*1000*1000;uint64_t readyGateStartUS=0,readyGateWaitedUS=0,readyGateBypassCount=0,readyGateCompletions=0,readyGateChecks=0;bool awdlSystemReady(){return true;}
  uint64_t syncRequests=0,syncWaits=0,syncFailures=0;
  struct{uint8_t mac[6]={2,1,2,3,4,5};void holdClock(uint64_t){}void discardControls(){}}state;
  uint64_t nextAction=0,requestDeadline=0;unsigned requestedChannel=0,grantedChannel=0,queueCount=0,queueHead=0;

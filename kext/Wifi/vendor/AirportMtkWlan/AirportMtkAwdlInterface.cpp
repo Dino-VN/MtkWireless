@@ -5,6 +5,7 @@
 #include <IOKit/IOCommandGate.h>
 #include <sys/kpi_mbuf.h>
 #include <sys/errno.h>
+#include <pexpert/pexpert.h>
 #include <Airport/macOS26/IO80211Buffer.h>
 
 #define super IO80211AWDLProtocol
@@ -54,6 +55,9 @@ IOReturn AirportMtkAwdlInterface::recordCacheControlResult(IOReturn status,uint6
     return status;
 }
 
+// Defined with the protocol helpers below; submitNative() runs before them.
+static uint32_t awdlTickUS();
+static void awdlScheduleService(IOTimerEventSource*);
 bool AirportMtkAwdlInterface::start(IOService *provider)
 {
     if(!owner || provider!=owner || !hal || stopping || nativeStarted) return false;
@@ -307,7 +311,7 @@ unsigned AirportMtkAwdlInterface::submitNative(OSObject *target,IOSkywalkTxSubmi
         // updates its outstanding count only after invoking this callback.
         self->completions[self->completionCount++]=packet;
     }
-    if(consumed && self->timer) self->timer->setTimeoutMS(1);
+    if(consumed && self->timer) awdlScheduleService(self->timer);
     return consumed;
 }
 void AirportMtkAwdlInterface::drainCompletions()
@@ -609,6 +613,44 @@ void AirportMtkAwdlInterface::finishAvailabilityWindowForDisable()
     setProperty("MTKAWDLDisableAWWaitUS",now-waitedAt,64);
     if(awTimeline.open) notifyAvailabilityWindowEnd(now);
 }
+// 1.0.41: NVRM resizes BAR1 from 64 MB to 8192 MB during boot and holds PCIe
+// and the registry busy for tens of seconds. Creating the AWDL firmware
+// context inside that window is a race we can lose badly enough that peers
+// never register (AirDrop stays at "waiting"). Wait for the accelerator to
+// publish its profile instead of racing it, so a fast boot enables early and
+// a slow one still ends up in a working state.
+bool AirportMtkAwdlInterface::awdlSystemReady()
+{
+    // The HAL rejects awdlEnable unless the infra link is in RUN, and airportd
+    // never retries a rejected request. Wait for the join here instead: the
+    // request is acknowledged and completed later from service().
+    if(!hal) return false;
+    if(!hal->awdlInfraChannel()) return false;
+    // nvrm-gpu-profile is published on the GPU's IOPCIDevice node once NVRM
+    // has finished sizing/remapping BAR1; the accelerator nubs do not carry
+    // it (verified on this machine: IOPCIDevice=1, IOAccelerator=0).
+    OSDictionary *matching=IOService::serviceMatching("IOPCIDevice");
+    if(!matching) return true;
+    OSIterator *iter=IOService::getMatchingServices(matching);
+    matching->release();
+    if(!iter) return true;
+    bool nvidia=false, profile=false;
+    OSObject *object=NULL;
+    while((object=iter->getNextObject())) {
+        IOService *service=OSDynamicCast(IOService,object);
+        if(!service) continue;
+        if(service->getProperty("nvrm-gpu-profile")) profile=true;
+        OSData *vendor=OSDynamicCast(OSData,service->getProperty("vendor-id"));
+        if(vendor && vendor->getLength()>=2) {
+            const uint8_t *bytes=(const uint8_t *)vendor->getBytesNoCopy();
+            if(bytes[0]==0xde && bytes[1]==0x10) nvidia=true;   // 0x10de NVIDIA
+        }
+    }
+    iter->release();
+    // Only machines running NVRM have a BAR1 bring-up worth waiting for.
+    // Everywhere else the profile never appears; do not stall AirDrop 180 s.
+    return !nvidia || profile;
+}
 IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
 {
     if(stopping || !hal || !timer || !_fCommandGate) return kIOReturnNotReady;
@@ -627,7 +669,29 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     }
     syncOwner=caller;
     setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
+    // 1.0.41: hold the first enable until the GPU bring-up stops reconfiguring
+    // PCIe. Airportd never retries a rejected request, so acknowledge it and
+    // finish the firmware enable from service() once the accelerator is up.
+    if(value && !enabled && !readyGateBypassed && !readyGateForce) {
+        if(!readyGatePending) { readyGatePending=true; readyGateStartUS=awdlNow(); }
+        uint64_t waited=awdlNow()-readyGateStartUS;
+        if(waited<kReadyGateMaxUS && !awdlSystemReady()) {
+            readyGateWaitedUS=waited;
+            setProperty("MTKAWDLReadyGate","waiting");
+            setProperty("MTKAWDLReadyGateWaitedUS",readyGateWaitedUS,64);
+            setProperty("MTKAWDLSyncTransition","deferred");
+            if(timer) { timer->enable(); timer->setTimeoutMS(500); }
+            syncOwner=NULL;
+            _fCommandGate->commandWakeup(&syncOwner,false);
+            return kIOReturnSuccess;
+        }
+        if(waited>=kReadyGateMaxUS) ++readyGateBypassCount;
+        readyGatePending=false; readyGateBypassed=true;
+        setProperty("MTKAWDLReadyGate",waited>=kReadyGateMaxUS ? "bypassed" : "ready");
+        setProperty("MTKAWDLReadyGateBypass",readyGateBypassCount,64);
+    }
     if(!value) {
+        readyGatePending=false;
         enabled=false;
         finishAvailabilityWindowForDisable();
         state.discardControls(); state.holdClock(0);
@@ -668,6 +732,250 @@ mbuf_t AirportMtkAwdlInterface::makeFrame(const uint8_t *data,size_t length)
     memcpy(mbuf_data(m),data,length); mbuf_setlen(m,length); mbuf_pkthdr_setlen(m,length);
     return m;
 }
+
+static bool awdlAmsduEnabled()
+{
+    // 1.0.11 shipped with this on by default and hard-hung the machine; the
+    // build in the field without this path (1.0.10) never did. Keep it opt-in
+    // until buildAmsdu's buffer/queue handling is proven under load.
+    // Enable for an experiment with -amtk_awdl_amsdu=1.
+    // 1.0.20: enable by default again, but only after the multi-segment and
+    // allocation guards above. Disable with -amtk_awdl_amsdu=0.
+    int value=1;
+    if(!PE_parse_boot_argn("amtk_awdl_amsdu",&value,sizeof(value))) value=1;
+    return value!=0;
+}
+
+// 1.0.49: the native submission callback and output() only enqueue, then
+// wake the service timer after 1ms. Returning completions and submitting the
+// next batch therefore costs a full millisecond per round. Default keeps
+// 1.0.48 behaviour; -amtk_awdl_tick_us=250 shortens the pipeline without
+// touching aggregation or the radio schedule.
+static uint32_t awdlTickUS()
+{
+    static int value=-1;
+    if(value<0) {
+        value=1000;
+        PE_parse_boot_argn("amtk_awdl_tick_us",&value,sizeof(value));
+        if(value<50) value=50;
+        if(value>2000) value=2000;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+// The default path keeps the exact 1ms call; only the opt-in knob uses µs.
+static void awdlScheduleService(IOTimerEventSource *timer)
+{
+    uint32_t us=awdlTickUS();
+    if(us==1000) timer->setTimeoutMS(1);
+    else timer->setTimeoutUS(us);
+}
+
+// 1.0.50: peer-window gate for AWDL data TX. The peer advertises its own
+// channel sequence; when it is not on our data channel the frame is
+// requeued and MTKAWDLDataTxNotReady grows (68399 vs 105399 submitted on
+// 1.0.49). Mode 1 (default) keeps 1.0.49 behaviour. Mode 2 also accepts a
+// peer whose window starts or ends within +/-amtk_awdl_peer_gate_slack_us
+// (default 8 ms, matching the 10 TU grant tolerance). Mode 0 drops the peer
+// test and sends whenever the local ROC grant is valid (the P3 experiment:
+// it can use gaps the advertisement does not describe, at the cost of ACK
+// failures and rate-ladder steps when the peer really is off channel).
+static int awdlPeerGateMode()
+{
+    static int value=-1;
+    if(value<0) {
+        value=1;
+        PE_parse_boot_argn("amtk_awdl_peer_gate",&value,sizeof(value));
+        if(value<0) value=0;
+        if(value>2) value=2;
+    }
+    return value;
+}
+static unsigned awdlPeerGateSlackUS()
+{
+    static int value=-1;
+    if(value<0) {
+        value=8000;
+        PE_parse_boot_argn("amtk_awdl_peer_gate_slack_us",&value,sizeof(value));
+        if(value<100) value=100;
+        if(value>20000) value=20000;
+    }
+    return static_cast<unsigned>(value);
+}
+
+// 1.0.52: MTKAWDLTXNoPeer == MTKAWDLDataTxDeferred (15888/15888 after a
+// 149 MB transfer): the firmware station table lost the iPhone, and every
+// such frame was requeued instead of sent. Re-register the destination once
+// and retry before falling back to the requeue. Off by default.
+static int awdlRenewStationOnNoPeer()
+{
+    static int value=-1;
+    if(value<0) {
+        value=0;
+        PE_parse_boot_argn("amtk_awdl_renew_station",&value,sizeof(value));
+        if(value<0) value=0;
+        if(value>1) value=1;
+    }
+    return value;
+}
+
+// iOS 26/27 transmits AWDL data as QoS A-MSDU. Each subframe carries an
+// RFC1042 LLC header, a big-endian MSDU length, then the normal AWDL SNAP
+// payload. Mirror that layout on TX so one RF acknowledgement covers several
+// queued IPv6 packets instead of paying DIFS/backoff/ACK for every packet.
+// 1.0.21: mbuf_allocpacket almost always returns a chain, so every write has
+// to walk it. `off` is the absolute offset inside the chain; after a partial
+// segment the next segment starts at offset 0.
+static void amsduZero(mbuf_t m)
+{
+    for(; m; m=mbuf_next(m)) if(mbuf_data(m)) memset(mbuf_data(m),0,mbuf_len(m));
+}
+static bool amsduWrite(mbuf_t m,size_t off,const void *src,size_t len)
+{
+    const uint8_t *s=(const uint8_t *)src;
+    for(; m && len; m=mbuf_next(m)) {
+        size_t seg=mbuf_len(m);
+        if(!mbuf_data(m)) return false;
+        if(off>=seg) { off-=seg; continue; }
+        size_t n=seg-off; if(n>len) n=len;
+        memcpy((uint8_t *)mbuf_data(m)+off,s,n);
+        s+=n; len-=n; off=0;
+    }
+    return len==0;
+}
+
+mbuf_t AirportMtkAwdlInterface::buildAmsdu(mbuf_t first,uint8_t channel,
+    uint64_t now,unsigned &subframes)
+{
+    /* 1.0.22: 7935 bytes never got allocated under MBUF_DONTWAIT (466 fails,
+     * 0 frames on 1.0.20; 43 fails, 0 frames on 1.0.21). Ask for a size that
+     * fits one or two clusters instead, so aggregation actually happens. */
+    /* 1.0.48: back to 2560/4. 8000/8 is now the freeze suspect: both 1.0.46
+     * (80 MHz) and 1.0.47 (20 MHz) froze with it, while 2560/4 ran stable. */
+    static constexpr size_t maxBytes=2560;
+    static constexpr unsigned maxSubframes=4;
+    static const uint8_t rfc1042[6]={0xaa,0xaa,3,0,0,0};
+    subframes=0;
+    if(!first) return NULL;
+    const uint8_t *base=(const uint8_t *)mbuf_data(first);
+    size_t baseLength=mbuf_pkthdr_len(first);
+    if(baseLength<40 || base[0]!=8 || (base[4]&1)) return NULL;
+    /* 1.0.20: mbuf_data() only exposes the first segment, but the copy below
+     * walks baseLength bytes. A multi-segment frame would read past that
+     * segment - the likely cause of the 1.0.11 hard hang. Aggregate only
+     * single-segment frames. */
+    if(mbuf_next(first)!=NULL) return NULL;
+
+    size_t total=26, previousUsed=0;
+    unsigned count=0;
+    while(count<maxSubframes) {
+        unsigned queueIndex=0;
+        mbuf_t candidate=first;
+        if(count) {
+            if(count-1>=queueCount) break;
+            queueIndex=(queueHead+count-1)%kDataQueueSize;
+            candidate=queue[queueIndex];
+        }
+        if(!candidate) break;
+        /* 1.0.20: same multi-segment guard as above. */
+        if(mbuf_next(candidate)!=NULL) break;
+        const uint8_t *f=(const uint8_t *)mbuf_data(candidate);
+        size_t n=mbuf_pkthdr_len(candidate);
+        if(n<40 || f[0]!=8 || memcmp(f+4,base+4,6) || memcmp(f+10,base+10,6)) break;
+        size_t body=n-24;
+        if(body<56 || body>1516) break;
+        if(count) {
+            if(now>=queueDeadline[queueIndex]) break;
+            int peer=state.find(f+4);
+            if(peer<0 || state.peers[peer].channel(now)!=channel) break;
+        }
+        size_t used=14+8+body;
+        size_t next=total+(count ? (4-previousUsed%4)%4 : 0)+used;
+        if(next>maxBytes) break;
+        total=next; previousUsed=used; ++count;
+    }
+    if(count<2) return NULL;
+
+    unsigned chunks=1;
+    mbuf_t aggregate=NULL;
+    /* 1.0.23: DONTWAIT never gets the aggregate buffer (466/43/54 failures, 0
+     * frames across three versions), and shrinking maxBytes did not help, so
+     * the failure is not about size. Retry once with MBUF_WAITOK. output() runs
+     * on the interface's workloop, not in an interrupt filter, so a blocking
+     * allocation is permitted here. */
+    if(mbuf_allocpacket(MBUF_DONTWAIT,total,&chunks,&aggregate) || !aggregate) {
+        chunks=1; aggregate=NULL;
+        if(mbuf_allocpacket(MBUF_WAITOK,total,&chunks,&aggregate) || !aggregate) {
+            ++amsduAllocFailed;
+            return NULL;
+        }
+    }
+    /* 1.0.21: write through the mbuf chain instead of assuming one contiguous
+     * segment. amsduAllocFailed==466 proved allocpacket returns a chain. */
+    /* 1.0.40 (ported from 1.0.26): mbuf_allocpacket only records the packet
+     * length in mbuf_pkthdr_len(); the continuation segments still report
+     * mbuf_len()==0, so summing mbuf_len() can never reach `total` and every
+     * attempt bailed out here (AllocFailed=50 with 0 frames on 1.0.25).
+     * Hand out the length to each segment ourselves. */
+    size_t left=total;
+    for(mbuf_t q=aggregate;q&&left;q=mbuf_next(q)) {
+        size_t cap=mbuf_maxlen(q);
+        size_t use=left<cap?left:cap;
+        mbuf_setlen(q,use);
+        left-=use;
+    }
+    if(left) {
+        ++amsduAllocFailed;
+        mbuf_freem(aggregate);
+        return NULL;
+    }
+    amsduZero(aggregate);
+    uint8_t hdr[26];
+    memcpy(hdr,base,24);
+    hdr[0]=0x88;       // QoS data
+    hdr[24]=0x80;      // TID 0, A-MSDU present
+    hdr[25]=0;
+    if(!amsduWrite(aggregate,0,hdr,26)) { mbuf_freem(aggregate); return NULL; }
+
+    size_t offset=26; previousUsed=0;
+    for(unsigned i=0;i<count;++i) {
+        mbuf_t candidate=i ? queue[(queueHead+i-1)%kDataQueueSize] : first;
+        const uint8_t *f=(const uint8_t *)mbuf_data(candidate);
+        size_t n=mbuf_pkthdr_len(candidate), body=n-24;
+        if(i) offset+=(4-previousUsed%4)%4;
+        size_t msdu=8+body;
+        uint8_t len2[2]={static_cast<uint8_t>(msdu>>8),static_cast<uint8_t>(msdu)};
+        uint8_t body2[2]={static_cast<uint8_t>(body>>8),static_cast<uint8_t>(body)};
+        bool ok=amsduWrite(aggregate,offset,f+4,6) &&
+                amsduWrite(aggregate,offset+6,f+10,6) &&
+                amsduWrite(aggregate,offset+12,len2,2) &&
+                amsduWrite(aggregate,offset+14,rfc1042,6) &&
+                amsduWrite(aggregate,offset+20,body2,2) &&
+                amsduWrite(aggregate,offset+22,f+24,body);
+        if(!ok) { mbuf_freem(aggregate); return NULL; }
+        previousUsed=14+msdu;
+        offset+=previousUsed;
+    }
+    if(offset!=total) {
+        mbuf_freem(aggregate);
+        return NULL;
+    }
+    /* 1.0.21: never mbuf_setlen() a chain to `total` - that rewrites the first
+     * segment's length and corrupts the tail. Only the packet header changes. */
+    mbuf_pkthdr_setlen(aggregate,total);
+
+    // The caller frees `first`; consume only the additional queued frames.
+    for(unsigned i=1;i<count;++i) {
+        mbuf_t old=queue[queueHead];
+        queue[queueHead]=NULL;
+        queueTime[queueHead]=queueDeadline[queueHead]=0;
+        queueHead=(queueHead+1)%kDataQueueSize;
+        --queueCount;
+        if(old) mbuf_freem(old);
+    }
+    subframes=count;
+    return aggregate;
+}
 UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
 {
     if(!m) return kIOReturnOutputDropped;
@@ -687,7 +995,7 @@ UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
     uint64_t now=awdlNow();
     queue[pos]=m; queueTime[pos]=now;
     queueDeadline[pos]=now+mtkawdl::dataQueueLifetimeUs(state,frame+4); ++queueCount;
-    timer->setTimeoutMS(1);
+    awdlScheduleService(timer);
     return kIOReturnOutputSuccess;
 }
 void AirportMtkAwdlInterface::tick(OSObject *o,IOTimerEventSource*)
@@ -696,7 +1004,33 @@ void AirportMtkAwdlInterface::tick(OSObject *o,IOTimerEventSource*)
 }
 void AirportMtkAwdlInterface::service()
 {
-    retain(); drainTxStatus(); drainCompletions(); serviceInGate(); release();
+    retain(); drainTxStatus(); drainCompletions();
+    // 1.0.41: finish the enable that was acknowledged while the GPU bring-up
+    // still owned PCIe. service() only runs from the timer, so taking the
+    // command gate from here cannot deadlock with the sync owner.
+    if(readyGatePending && !enabled && !stopping) {
+        ++readyGateChecks;
+        bool ready=awdlSystemReady();
+        bool expire=awdlNow()-readyGateStartUS>=kReadyGateMaxUS;
+        setProperty("MTKAWDLReadyGateChecks",readyGateChecks,64);
+        setProperty("MTKAWDLReadyGateWaitedUS",awdlNow()-readyGateStartUS,64);
+        if(ready || expire) {
+            readyGatePending=false;
+            ++readyGateCompletions;
+            setProperty("MTKAWDLReadyGate",expire && !ready ? "bypassed" : "completed");
+            setProperty("MTKAWDLReadyGateCompletions",readyGateCompletions,64);
+            if(expire && !ready) ++readyGateBypassCount;
+            setProperty("MTKAWDLReadyGateBypass",readyGateBypassCount,64);
+            // The deferred request must not re-enter the gate below.
+            readyGateForce=true;
+            setSync(true);
+            readyGateForce=false;
+        } else if(timer) {
+            timer->setTimeoutMS(500);
+        }
+    }
+    serviceInGate();
+    release();
 }
 
 void AirportMtkAwdlInterface::txStatus(void *context, const uint8_t *address,
@@ -841,6 +1175,18 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataTxFailed",dataTxFailed,64);
     setProperty("MTKAWDLDataTxDeferred",dataTxDeferred,64);
     setProperty("MTKAWDLDataTxExpired",dataTxExpired,64);
+    setProperty("MTKAWDLDataTxNotReady",dataTxNotReady,64);
+    setProperty("MTKAWDLDataTxNoGrantTicks",dataTxNoGrantTicks,64);
+    // 1.0.49: sample the registered traffic peer's advertised channel. A value
+    // other than the data channel at service time explains "peer not ready".
+    int trafficPeerIndex=trafficPeerInstalled ? state.find(installedTrafficPeer) : -1;
+    uint8_t trafficPeerChannel=trafficPeerIndex>=0 ?
+        state.peers[static_cast<unsigned>(trafficPeerIndex)].channel(now) : 0;
+    setProperty("MTKAWDLTrafficPeerChannel",static_cast<uint64_t>(trafficPeerChannel),32);
+    setProperty("MTKAWDLAmsduFrames",amsduFrames,64);
+    setProperty("MTKAWDLAmsduSubframes",amsduSubframes,64);
+    setProperty("MTKAWDLAmsduBytes",amsduBytes,64);
+    setProperty("MTKAWDLAmsduAllocFailed",amsduAllocFailed,64);
     setProperty("MTKAWDLUMISubmitted",umiSubmitted,64);
     setProperty("MTKAWDLUMIFailed",umiFailed,64);
     setProperty("MTKAWDLUMIExpired",umiExpired,64);
@@ -1367,6 +1713,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         miCounter=eaw; miCounterValid=true;
     }
     unsigned pending=queueCount;
+    if(queueCount && !hal->awdlCanTransmit(channel)) ++dataTxNoGrantTicks;
     while(pending-- && queueCount && hal->awdlCanTransmit(channel)) {
         mbuf_t m=queue[queueHead]; uint64_t time=queueTime[queueHead], expiry=queueDeadline[queueHead];
         const uint8_t *f=(const uint8_t *)mbuf_data(m);
@@ -1374,7 +1721,24 @@ void AirportMtkAwdlInterface::serviceInGate()
         bool ready=(f[4]&1) && mtkawdl::multicastReady(state,now);
         if(peer>=0) {
             const mtkawdl::Peer &p=state.peers[peer];
-            ready=p.channel(now)==channel;
+            int gate=awdlPeerGateMode();
+            if(gate==0) {
+                // Only the local ROC grant bounds this frame (P3 experiment).
+                ready=true;
+            } else {
+                ready=p.channel(now)==channel;
+                if(!ready && gate==2) {
+                    unsigned slack=awdlPeerGateSlackUS();
+                    ready=p.channel(now+slack)==channel ||
+                          (now>slack && p.channel(now-slack)==channel);
+                }
+            }
+        } else if(!(f[4]&1) && awdlPeerGateMode()==0) {
+            // 1.0.53: a unicast frame whose destination is not in state.peers
+            // (peer<0) never reaches the gate above, so it kept the original
+            // ready=false and was requeued forever (51% of NotReady on
+            // 1.0.52). In gate=0 mode the local grant is the only bound.
+            ready=true;
         }
         // Block Ack responses are sent as built; only native MIs are rebuilt.
         bool blockAck=f[0]==0xd0 && f[24]==mtkawdl::blockAckCategory;
@@ -1386,6 +1750,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         queueHead=(queueHead+1)%kDataQueueSize; --queueCount;
         if(now<expiry && !ready) {
             unsigned tail=(queueHead+queueCount)%kDataQueueSize; queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
+            ++dataTxNotReady;
             continue;
         }
         if(now>=expiry) {
@@ -1415,12 +1780,34 @@ void AirportMtkAwdlInterface::serviceInGate()
                 }
                 mbuf_freem(m); m=replacement;
             }
+            unsigned amsduCount=0;
+            size_t amsduLength=0;
+            if(!unicastMI && !blockAck && peer>=0 && ready && f[0]==8 && awdlAmsduEnabled()) {
+                mbuf_t aggregate=buildAmsdu(m,channel,now,amsduCount);
+                if(aggregate) {
+                    amsduLength=mbuf_pkthdr_len(aggregate);
+                    mbuf_freem(m);
+                    m=aggregate;
+                }
+            }
             IOReturn txStatus=hal->awdlTryTransmit(&m,channel);
             if(unicastMI) umiStatus=txStatus; else if(!blockAck) dataTxStatus=txStatus;
             if(m) {
                 // No firmware ownership on a transient failure. Keep the
                 // original payload/sequence and its bounded queue lifetime.
                 if(txStatus==kIOReturnNotFound) {
+                    // 1.0.52: firmware dropped the station (MTKAWDLTXNoPeer);
+                    // re-register it once and retry before requeueing.
+                    if(awdlRenewStationOnNoPeer()) {
+                        const uint8_t *dst=(const uint8_t *)mbuf_data(m)+4;
+                        if(hal->awdlPeer(dst,true)==kIOReturnSuccess)
+                            txStatus=hal->awdlTryTransmit(&m,channel);
+                        if(txStatus==kIOReturnSuccess) {
+                            if(m) mbuf_freem(m);
+                            ++submitted;
+                            continue;
+                        }
+                    }
                     // One missing station must not block multicast/other peers.
                     unsigned tail=(queueHead+queueCount)%kDataQueueSize;
                     queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
@@ -1433,7 +1820,14 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // Busy/grant/ring pressure applies to the rest of this batch.
                 break;
             }
-            if(txStatus==kIOReturnSuccess) ++submitted; else ++failed;
+            if(txStatus==kIOReturnSuccess) {
+                ++submitted;
+                if(amsduCount) {
+                    ++amsduFrames;
+                    amsduSubframes+=amsduCount;
+                    amsduBytes+=amsduLength;
+                }
+            } else ++failed;
         }
     }
     if(!hal->awdlCanTransmit(channel)) { requestedChannel=0; grantedChannel=0; }

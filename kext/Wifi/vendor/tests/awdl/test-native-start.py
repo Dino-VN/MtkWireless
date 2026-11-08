@@ -157,7 +157,8 @@ struct WorkLoop {
  IOReturn addEventSource(IOSkywalkPacketQueue*q){if(++add==failAdd)return 9;q->added=true;return 0;}
  void removeEventSource(IOSkywalkPacketQueue*q){assert(q->added);q->added=false;}
 };
-struct Timer {bool pending=false;void setTimeoutMS(unsigned){pending=true;} void cancelTimeout(){pending=false;}};
+struct Timer {bool pending=false;void setTimeoutMS(unsigned){pending=true;} void cancelTimeout(){pending=false;} void enable(){}};
+template<typename T> static void awdlScheduleService(T *timer){timer->setTimeoutMS(1);}
 using mbuf_t=std::vector<uint8_t>*;
 std::vector<uint8_t> lastFrame;
 void mbuf_freem(mbuf_t m){delete m;}
@@ -188,6 +189,8 @@ struct IOSkywalkEthernetInterface {struct RegistrationInfo {uint8_t bytes[0x130]
 struct AirportMtkWlan;
 struct AirportMtkAwdlInterface:NativeProtocol {
  AirportMtkWlan *owner=nullptr;MtkMwx *hal=nullptr;bool trafficActive=false,trafficPeerInstalled=false;uint8_t installedTrafficPeer[6]{};uint8_t discoveryTxPeers[3][6]{};struct AddbaDecline{uint8_t request[24+9];bool valid;}addbaPending[4]{};uint64_t addbaRequests=0,addbaQueued=0,addbaSubmitted=0,addbaFailed=0,addbaExpired=0,addbaDeferred=0,addbaDropped=0,delbaReceived=0;mtkawdl::DataPeers dataPeers;bool stopping=false,nativeStarted=false,nativeRegistered=false,dataPathEnabled=false,enabled=false;
+ bool readyGatePending=false,readyGateBypassed=false,readyGateForce=false;static constexpr uint64_t kReadyGateMaxUS=180ull*1000*1000;uint64_t readyGateStartUS=0,readyGateWaitedUS=0,readyGateBypassCount=0,readyGateCompletions=0,readyGateChecks=0;
+ bool awdlSystemReady(){return true;}
  IOSkywalkPacketBufferPool *txPool=nullptr,*rxPool=nullptr;
  IOSkywalkTxSubmissionQueue *txSubmit=nullptr;IOSkywalkTxCompletionQueue *txComplete=nullptr;IOSkywalkRxCompletionQueue *rxComplete=nullptr;
  unsigned queuesAdded=0,completionCount=0,queueCount=0;IOSkywalkPacket *completions[128]={};

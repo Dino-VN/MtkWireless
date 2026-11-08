@@ -161,8 +161,23 @@ private:
     static IOReturn syncGated(OSObject*,void*,void*,void*,void*);
     IOReturn setSyncInGate(bool);
     mbuf_t makeFrame(const uint8_t*, size_t);
+    // Build one QoS A-MSDU from consecutive ready unicast data frames.
+    // On success only the following queue entries are consumed; the caller
+    // still owns `first`. Returns NULL to keep the legacy one-MPDU path.
+    mbuf_t buildAmsdu(mbuf_t first, uint8_t channel, uint64_t now, unsigned &subframes);
     AirportMtkWlan *owner = NULL; MtkMwx *hal = NULL;
     IOTimerEventSource *timer = NULL; bool timerAdded = false, stopping = false, enabled = false;
+    // 1.0.41: the first firmware enable must not race NVRM's BAR1 remap, which
+    // holds PCIe and the registry busy for tens of seconds at boot. The request
+    // is acknowledged (airportd never retries) and completed from service().
+    // 1.0.44: also wait for the infra link to reach RUN. The HAL gate that used
+    // to reject the request (1.0.25) assumed airportd retries; it does not, so
+    // a single early request left AWDL dead for the whole boot.
+    bool awdlSystemReady();
+    bool readyGatePending = false, readyGateBypassed = false, readyGateForce = false;
+    uint64_t readyGateStartUS = 0, readyGateWaitedUS = 0;
+    uint64_t readyGateBypassCount = 0, readyGateCompletions = 0, readyGateChecks = 0;
+    static constexpr uint64_t kReadyGateMaxUS = 180ull * 1000 * 1000;
     // Firmware commandSleep releases the controller gate. Serialize sync
     // transitions across that interval, including duplicate native requests.
     IOThread syncOwner = NULL;
@@ -178,6 +193,10 @@ private:
     unsigned completionCount = 0;
     uint64_t nativeTx = 0, nativeRx = 0, nativeDrops = 0;
     uint64_t dataTxSubmitted = 0, dataTxFailed = 0, dataTxExpired = 0, dataTxDeferred = 0;
+    // 1.0.49 diagnostics: distinguish "no ROC grant" from "peer not on this
+    // channel". Both currently look like an empty service tick.
+    uint64_t dataTxNotReady = 0, dataTxNoGrantTicks = 0;
+    uint64_t amsduFrames = 0, amsduSubframes = 0, amsduBytes = 0, amsduAllocFailed = 0;
     // Stations prepared for discovery unicast before native cache registration.
     uint8_t discoveryTxPeers[3][6] = {};
     uint64_t dataRxFrames = 0, dataRxInvalid = 0, dataRxUnknownPeer = 0;
