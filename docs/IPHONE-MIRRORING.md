@@ -190,3 +190,88 @@ layout/protocol/native-control/window/sync tests pass. The already broken
 MI discovery extraction fixture now also lacks the new diagnostic fields,
 helper method and IOReturn post stub; its upstream file remains unchanged.
 The dedicated cache test executes those paths with real Rust cache ownership.
+
+## 1.0.13 UMI completion bridge (2026-11-07)
+
+Static IO80211Family analysis showed that RTG registration waits for native peer-manager event 9. The native event-0x45 path consumes a seven-byte status payload: peer MAC at bytes 0..5 and ACK/failure at byte 6. Before 1.0.13 the AWDL HAL submitted UMI frames and counted hardware TXS, but never forwarded a correlated firmware result, so the native wait expired as `AWDL degraded`.
+
+The Wi-Fi kext now reserves one of 32 private TX PIDs (80..111) for each unicast native MI, records destination MAC/WCID/frame sequence/current AWDL epoch, and overrides only the matching TXWI. A firmware TXS completes a slot only when PID, WCID, sequence and MPDU format match; failures use the TXS ACK error bits. Stale epochs, duplicates, unrelated WCIDs/PIDs and PPDU summaries are discarded. The completion is queued on the AWDL interface workloop and posted to IO80211Family as event 0x45; no synthetic ACK, native wait bypass or registration flag mutation is used.
+
+Build/check: `scripts/build.sh Release`, kernel symbol/SSE checks and Rust workspace tests pass. The known upstream MI extraction fixture remains broken; its generated test lacks the existing cache diagnostic stubs and now also needs the new completion setter fields. Release artifact: `dist/MtkWireless-1.0.13-RELEASE.zip`. Installed into the boot EFI with a backup at `/Users/dino/Desktop/MtkWireless-backup-20261107-111853`; reboot is required before hardware validation.
+
+## 1.0.14 native media IPv6 RX (2026-11-07)
+
+The host session `20261107-124527` now completes authentication and creates
+satisfied video/audio UDP paths after installing the negotiated /128 ULA routes
+before native path evaluation. This fixes the earlier malformed `%llw0` address
+and missing-route gates. The 12:54:23 attempt activated audio; video stayed
+unactivated and Dino exited at 12:54:30 with `mediaTransportInterrupted`.
+
+The RX snapshot had `MTKAWDLDataRxInvalid=44690`, while UMI completions were
+96 with zero dropped/failed/expired completions. All 32 retained rejected
+prefixes came from Dino, TID 7: 31 A-MSDU and one non-aggregate QoS frame.
+They carry RFC1042 IPv6 directly (`aa aa 03 00 00 00 86 dd`), without the
+legacy AWDL SNAP/sequence header. IPv6 and subframe length declarations match
+the recorded frame lengths. The old parser treats EtherType 0x86dd as an outer
+LLC envelope length and rejects these before inspecting the unrecorded tail.
+This establishes that early rejection, not full hardware-packet validity.
+
+The Rust parser now accepts this bounded native IPv6 format alongside legacy
+AWDL and LLC-length framing. It retains MAC/BSSID/fragment checks, whole-
+aggregate validation, subframe source and boundary checks, IPv6 exact length
+and Ethernet MTU bounds. The shared DataView layout is unchanged. The native
+decoder copies directly into the Skywalk buffer with the correct Ethernet
+length. A separate heap-owned 128-entry, three-second retry cache uses sender,
+TID, MPDU sequence and MSDU content; different hardware-deaggregated MSDUs
+sharing a single MPDU sequence remain deliverable. Legacy AWDL sequence
+windows remain unchanged. New scalar observations are
+`MTKAWDLNativeIPv6Decoded` and `MTKAWDLNativeIPv6Duplicate`.
+
+Validation: 64 mtk-wlan tests and 114 Rust workspace tests pass. The production
+native RX branch passes ASan/UBSan through the Rust C ABI, including decode,
+retries, distinct hardware splits, expiry and ring wrap. Release build and
+kernel symbol/SSE/x87 checks pass; shared layout and upstream protocol tests
+pass. The unchanged upstream `test-mi-discovery.py` and `test-partial-init.py`
+fixtures still fail to compile because their generated classes lack prior
+1.0.13 cache/UMI completion fields and methods. Full upstream-suite success is
+not claimed.
+
+Evidence is retained in ignored `diagnostics/mirroring-rx-20261107-1254/`.
+The hardware trace retains only 192-byte prefixes; synthetic complete-frame
+tests cover the observed framing and every Ethernet size 54..1514, malformed
+headers, truncations and aggregate boundaries. They are not full-frame replay
+of the retained hardware packets.
+
+Wi-Fi-only archive: `dist/MtkWirelessWifi-1.0.14-mirroring-rx.zip`.
+Install its Wi-Fi kext into the actual boot EFI with a backup and reboot.
+The archive excludes Bluetooth changes. Then close the local Mirroring app,
+keep the existing SSH proxy alive and run `make start-routed` in
+`/Volumes/App/iphone-mirroring-hackintosh`.
+
+The 1.0.14 Wi-Fi driver is now loaded after reboot, UUID
+`C6237170-B37F-30A4-AC9B-3FC89F53D379`. The 14:29 snapshot has 34,251 native
+IPv6 frames decoded, ten duplicates and two invalid frames. This verifies
+the native IPv6 RX branch on hardware; complete stream delivery is not
+established by the counters. Mirroring authentication and satisfied native
+UDP paths succeed, but the real VideoProcessing decoder fails with
+`codecBadDataErr` (-8969), followed by `mediaTransportInterrupted` and
+AVConference cleanup crashes. Synthetic H.264 decoding at 1290×2796 works.
+Visible phone frames and input remain unverified; the next investigation
+belongs to the real stream/decoder path rather than an unverified new Wi-Fi
+change. Detailed follow-up is in
+`/Volumes/App/iphone-mirroring-hackintosh/docs/SESSION-20261107.md`.
+
+
+## 1.0.15 AWDL replay-window rollover (2026-11-07)
+
+PR #4 fixes a receive-side replay-window bug seen in iOS 27 Mirroring TID 5.
+The old window treated `0x2fff -> 0x219e` as a 16-bit backwards jump and then
+counted every subsequent packet as too old. The fix learns 12-bit rollover
+only when the upper nibble stays in the same domain, while retaining full
+16-bit handling across a real domain change. It does not alter authentication,
+UMI completion, packet encryption, or codec negotiation.
+
+The sanitized 500-packet replay fixture and the nonzero-domain rollover tests
+pass. This is a candidate follow-up to 1.0.14: it can reduce AWDL media loss,
+but it cannot by itself fix the separate VideoProcessing `-8969` decoder
+failure seen after the link is established.

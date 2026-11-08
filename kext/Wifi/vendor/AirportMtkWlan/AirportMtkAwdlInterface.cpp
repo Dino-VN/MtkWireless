@@ -363,9 +363,8 @@ void AirportMtkAwdlInterface::inputNative(const uint8_t *bytes,size_t length)
 void AirportMtkAwdlInterface::inputNativeView(const mtkawdl::DataView &view)
 {
     if(!dataPathEnabled || stopping || !rxPool || !rxComplete) return;
-    // Same bounds as mtk_awdl_decode_data_view; Ethernet length = payload - 2.
-    if(view.length<56 || view.length>1516) { ++nativeDrops; return; }
-    const size_t length=view.length-2;
+    const size_t length=mtkawdl::dataEthernetLength(view);
+    if(length<54 || length>1514) { ++nativeDrops; return; }
     IOSkywalkPacket *packet=NULL;
     if(rxPool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) { ++nativeDrops; return; }
     if(packet->prepareWithQueue(NULL,2,0)!=kIOReturnSuccess ||
@@ -386,6 +385,8 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
 {
     owner=controller; hal=transport; timer=NULL; bsd=NULL; timerAdded=false;
     stopping=enabled=false; queueHead=queueCount=0; templateLength=0;
+    txStatusLock=IOLockAlloc(); txStatusCount=txStatusDropped=0;
+    if(!txStatusLock) return false;
     // Configuration is tracked by the native peer manager; this backend keeps
     // the firmware context ready once registration succeeds.
     requestedChannel=grantedChannel=0; nextAction=requestDeadline=0;
@@ -453,6 +454,7 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     }
     timerAdded=true;
     hal->awdlSetReceiver(this,receive);
+    hal->awdlSetTxCompletion(this,txStatus);
     receiverRegistered=true;
     return true;
 }
@@ -496,6 +498,7 @@ void AirportMtkAwdlInterface::shutdownInGate()
     setDataPathEnabled(false);
     if(timer) { timer->cancelTimeout(); timer->disable(); }
     if(hal && receiverRegistered) {
+        hal->awdlSetTxCompletion(NULL,NULL);
         hal->awdlSetReceiver(NULL,NULL); receiverRegistered=false;
         hal->awdlEnable(NULL,false);
     }
@@ -516,6 +519,7 @@ void AirportMtkAwdlInterface::stop(IOService *provider)
 void AirportMtkAwdlInterface::free()
 {
     shutdown(); releaseDataPath(); OSSafeReleaseNULL(timer);
+    if(txStatusLock) { IOLockFree(txStatusLock); txStatusLock=NULL; }
     if(nativeBaseInitialized) super::free();
     else {
         // Never enter IO80211SkywalkInterface::free on an object whose base
@@ -692,7 +696,40 @@ void AirportMtkAwdlInterface::tick(OSObject *o,IOTimerEventSource*)
 }
 void AirportMtkAwdlInterface::service()
 {
-    retain(); drainCompletions(); serviceInGate(); release();
+    retain(); drainTxStatus(); drainCompletions(); serviceInGate(); release();
+}
+
+void AirportMtkAwdlInterface::txStatus(void *context, const uint8_t *address,
+    uint8_t failed, uint16_t wcid, uint16_t sequence, uint8_t pid, uint32_t epoch)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(context);
+    if(!self || !address || !self->txStatusLock) return;
+    IOLockLock(self->txStatusLock);
+    if(self->txStatusCount<32) {
+        auto &entry=self->txStatuses[self->txStatusCount++];
+        memcpy(entry.address,address,6); entry.failed=failed; entry.wcid=wcid;
+        entry.sequence=sequence; entry.pid=pid; entry.epoch=epoch;
+    } else ++self->txStatusDropped;
+    IOLockUnlock(self->txStatusLock);
+    if(self->timer) self->timer->setTimeoutMS(1);
+}
+
+void AirportMtkAwdlInterface::drainTxStatus()
+{
+    if(!txStatusLock || !txStatusCount) return;
+    TxStatus batch[32]; unsigned count;
+    IOLockLock(txStatusLock); count=txStatusCount;
+    memcpy(batch,txStatuses,count*sizeof(batch[0])); txStatusCount=0;
+    IOLockUnlock(txStatusLock);
+    for(unsigned i=0;i<count;++i) {
+        uint8_t message[7]; memcpy(message,batch[i].address,6);
+        message[6]=batch[i].failed ? 1 : 0;
+        IOReturn status=awdlControllerMessage(owner,this,0x45,message,sizeof(message),true);
+        ++txStatusCompletions;
+        setProperty("MTKAWDLLastUMICompletionStatus",static_cast<uint64_t>(status),32);
+        setProperty("MTKAWDLLastUMICompletionFailure",static_cast<uint64_t>(batch[i].failed),32);
+        setProperty("MTKAWDLUMICompletions",txStatusCompletions,64);
+    }
 }
 void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(uint8_t channel,uint64_t now)
 {
@@ -811,6 +848,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLUMIRequests",umiRequests,64);
     setProperty("MTKAWDLUMIQueued",umiQueued,64);
     setProperty("MTKAWDLUMIStatus",static_cast<uint64_t>(umiStatus),32);
+    setProperty("MTKAWDLUMICompletions",txStatusCompletions,64);
+    setProperty("MTKAWDLUMICompletionDropped",static_cast<uint64_t>(txStatusDropped),64);
     setProperty("MTKAWDLADDBARequests",addbaRequests,64);
     setProperty("MTKAWDLADDBAQueued",addbaQueued,64);
     setProperty("MTKAWDLADDBAAccepted",addbaAccepted,64);
@@ -837,6 +876,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataTxNextExpiryUS",nextExpiry,64);
     setProperty("MTKAWDLDataRxFrames",dataRxFrames,64);
     setProperty("MTKAWDLDataRxInvalid",dataRxInvalid,64);
+    setProperty("MTKAWDLNativeIPv6Decoded",nativeIPv6Decoded,64);
+    setProperty("MTKAWDLNativeIPv6Duplicate",nativeIPv6Duplicate,64);
     setProperty("MTKAWDLDataRxUnknownPeer",dataRxUnknownPeer,64);
     setProperty("MTKAWDLDataRxWrongDestination",dataRxWrongDestination,64);
     setProperty("MTKAWDLDataRxReplay",dataRxReplay,64);
@@ -1594,6 +1635,20 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         if(memcmp(view.destination,self->state.mac,6) && !(view.destination[0]&1)) {
             ++self->dataRxWrongDestination; continue;
         }
+        uint64_t nativeTag=mtkawdl::nativeRxTag(f,n,view);
+        if(nativeTag) {
+            bool duplicate=false;
+            for(unsigned i=0;i<128;++i)
+                if(self->nativeIPv6Tags[i]==nativeTag && now>=self->nativeIPv6TagTimes[i] &&
+                   now-self->nativeIPv6TagTimes[i]<3000000) { duplicate=true; break; }
+            if(duplicate) { ++self->nativeIPv6Duplicate; continue; }
+            unsigned slot=self->nativeIPv6TagNext++%128;
+            self->nativeIPv6Tags[slot]=nativeTag; self->nativeIPv6TagTimes[slot]=now;
+            ++self->nativeIPv6Decoded;
+            ++self->dataRxDecoded;
+            self->inputNativeView(view);
+            continue;
+        }
 #ifdef KERNEL
         // Metadata is retained in the heap-owned trace and published by the
         // scheduler once per second, never allocated/published in RX itself.
@@ -2049,9 +2104,19 @@ IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_a
     if(!d || d->version>APPLE80211_VERSION || d->active>1 || d->name_len>sizeof(d->name) ||
        (d->active && !mtkawdl::unicast(d->addr))) return kIOReturnBadArgument;
     uint64_t now=awdlNow();
-    if(d->active && !dataPeers.setTraffic(d->addr,true,now)) return kIOReturnNoResources;
-    if(trafficActive && (!d->active || memcmp(trafficPeer,d->addr,6)))
-        dataPeers.setTraffic(trafficPeer,false,now);
+    // Drop the previous owner before claiming a new one.  The old ordering
+    // tried to allocate the new entry first; with a full 16-entry native
+    // table that made a perfectly valid audio/video handoff return
+    // kIOReturnNoResources and left the stale peer marked active.
+    uint8_t previousPeer[6];
+    bool hadPrevious=trafficActive;
+    if(hadPrevious) memcpy(previousPeer,trafficPeer,6);
+    bool changed=hadPrevious && (!d->active || memcmp(previousPeer,d->addr,6));
+    if(changed) dataPeers.setTraffic(previousPeer,false,now);
+    if(d->active && !dataPeers.setTraffic(d->addr,true,now)) {
+        if(changed) dataPeers.setTraffic(previousPeer,true,now);
+        return kIOReturnNoResources;
+    }
     memcpy(trafficPeer,d->addr,6); trafficActive=d->active;
     // Expedite queued traffic during an active Continuity session; the
     // service loop also switches to dense presence (updatePresence).

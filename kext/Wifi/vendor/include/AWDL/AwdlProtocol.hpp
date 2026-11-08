@@ -261,6 +261,10 @@ struct DataView {
     const uint8_t *destination, *source, *payload;
     size_t length; uint16_t sequence;
 };
+extern "C" size_t mtk_awdl_data_ethernet_length(const DataView *view);
+extern "C" uint64_t mtk_awdl_native_rx_tag(const uint8_t *f,size_t n,const DataView *view);
+inline size_t dataEthernetLength(const DataView &view) { return mtk_awdl_data_ethernet_length(&view); }
+inline uint64_t nativeRxTag(const uint8_t *f,size_t n,const DataView &view) { return mtk_awdl_native_rx_tag(f,n,&view); }
 inline size_t dataView(const uint8_t *f,size_t n,size_t at,DataView &out) { return mtk_awdl_data_view(f,n,at,&out); }
 inline bool validDataFrame(const uint8_t *f,size_t n) { return mtk_awdl_valid_data_frame(f,n); }
 inline size_t decodeDataView(uint8_t *out,size_t capacity,const DataView &view) {

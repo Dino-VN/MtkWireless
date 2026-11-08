@@ -64,6 +64,9 @@ public:
     // awdlTransmit always consumes its mbuf, including on error.
     typedef bool (*AwdlReceive)(void *, const uint8_t *, size_t, uint8_t, int8_t);
     void awdlSetReceiver(void *context, AwdlReceive receiver);
+    typedef void (*AwdlTxCompletion)(void *, const uint8_t *, uint8_t,
+        uint16_t, uint16_t, uint8_t, uint32_t);
+    void awdlSetTxCompletion(void *context, AwdlTxCompletion completion);
     IOReturn awdlEnable(const uint8_t *address, bool enable);
     IOReturn awdlReserve(uint8_t channel, uint32_t durationMs);
     IOReturn awdlPrepareChannel(uint8_t channel);

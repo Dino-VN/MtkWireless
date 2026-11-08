@@ -191,9 +191,17 @@ export! {
         }
     }
     fn mtk_awdl_valid_data_frame(f: *const u8, n: usize) -> bool { !f.is_null() && p::valid_data_frame(bytes(f, n)) }
+    fn mtk_awdl_data_ethernet_length(view: *const DataView) -> usize {
+        view.as_ref().filter(|v| !v.payload.is_null() && v.length <= 1516)
+            .map_or(0, |v| p::data_ethernet_length(bytes(v.payload, v.length)))
+    }
+    fn mtk_awdl_native_rx_tag(f: *const u8, n: usize, view: *const DataView) -> u64 {
+        view.as_ref().filter(|v| !f.is_null() && !v.payload.is_null() && v.length <= 1516)
+            .map_or(0, |v| p::native_rx_tag(bytes(f, n), bytes(v.payload, v.length)))
+    }
     fn mtk_awdl_decode_data_view(out: *mut u8, capacity: usize, view: *const DataView) -> usize {
         let Some(v) = view.as_ref() else { return 0 };
-        if out.is_null() || v.payload.is_null() || v.source.is_null() || v.destination.is_null() || !(56..=1516).contains(&v.length) {
+        if out.is_null() || v.payload.is_null() || v.source.is_null() || v.destination.is_null() || !(48..=1516).contains(&v.length) {
             return 0;
         }
         // The view's pointers come from mtk_awdl_data_view on a live frame.

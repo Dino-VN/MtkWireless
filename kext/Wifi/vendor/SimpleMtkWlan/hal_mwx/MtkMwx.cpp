@@ -386,6 +386,15 @@ struct mwx_vif {
 	uint8_t			scan_seq_num;
 };
 
+struct mwx_awdl_native_tx_pending {
+    bool used;
+    uint8_t address[6];
+    uint16_t wcid;
+    uint16_t sequence;
+    uint8_t pid;
+    uint32_t epoch;
+};
+
 enum mwx_hw_type {
 	MWX_HW_MT7921,
 	MWX_HW_MT7922,
@@ -438,6 +447,12 @@ struct mwx_softc {
     int sc_awdl_tx_errno;
     void *sc_awdl_context;
     MtkMwx::AwdlReceive sc_awdl_receive;
+    void *sc_awdl_tx_context;
+    MtkMwx::AwdlTxCompletion sc_awdl_tx_completion;
+    mwx_awdl_native_tx_pending sc_awdl_native_tx[32];
+    struct mbuf *sc_awdl_native_tx_frame;
+    uint8_t sc_awdl_native_tx_pid;
+    bool sc_awdl_native_tx_override;
     uint8_t sc_awdl_address[6];
     bool sc_awdl_enabled, sc_awdl_configured, sc_awdl_filter_active;
     bool sc_awdl_scan_suspended;
@@ -5453,8 +5468,36 @@ mt7921_mcu_tx_done_event(struct mwx_softc *sc, struct mbuf *m)
 void
 mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 {
-	if (sc->sc_awdl_tx_status.observe(reinterpret_cast<const uint8_t *>(txs_data),32))
+	const uint8_t *raw=reinterpret_cast<const uint8_t *>(txs_data);
+	bool awdlStatus=sc->sc_awdl_tx_status.observe(raw,32);
+	if (awdlStatus) {
+		uint32_t status=le32toh(txs_data[0]);
+		uint16_t wcid=static_cast<uint16_t>((le32toh(txs_data[2])>>16)&0x3ff);
+		uint16_t sequence=static_cast<uint16_t>(le32toh(txs_data[1])>>20);
+		uint8_t pid=static_cast<uint8_t>(le32toh(txs_data[3])>>24);
+		// Native UMI PIDs are deliberately outside the three long-lived AWDL
+		// PIDs. Only a real MPDU TXS can complete one.
+		if (pid>=80 && pid<112 && ((status>>23)&3)<=1 && sc->sc_awdl_lock) {
+			uint8_t address[6]={}; uint32_t epoch=0; void *context=NULL;
+			MtkMwx::AwdlTxCompletion callback=NULL; bool matched=false;
+			IOLockLock(sc->sc_awdl_lock);
+			for (unsigned i=0;i<32;++i) {
+				auto &pending=sc->sc_awdl_native_tx[i];
+				if (!pending.used || pending.pid!=pid || pending.wcid!=wcid ||
+				    pending.sequence!=sequence) continue;
+				memcpy(address,pending.address,6); epoch=pending.epoch;
+				pending.used=false; matched=true; break;
+			}
+			bool current=matched && epoch==sc->sc_awdl_epoch &&
+				sc->sc_awdl_enabled && !sc->sc_awdl_stopping &&
+				!sc->sc_detaching && !sc->sc_resetting;
+			if (current) { callback=sc->sc_awdl_tx_completion; context=sc->sc_awdl_tx_context; }
+			IOLockUnlock(sc->sc_awdl_lock);
+			if (callback && current)
+				callback(context,address,(status&0x00070000)!=0,wcid,sequence,pid,epoch);
+		}
 		return;
+	}
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni = ic->ic_bss;
 	uint32_t txs = le32toh(txs_data[0]);
@@ -7092,6 +7135,8 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
     if(awdl) pid=(wh->i_fc[0]&IEEE80211_FC0_TYPE_MASK)==IEEE80211_FC0_TYPE_DATA ?
         (IEEE80211_IS_MULTICAST(wh->i_addr1) ? mtkawdl::txPidMulticast : mtkawdl::txPidUnicast) :
         mtkawdl::txPidAction;
+	if (awdl && sc->sc_awdl_native_tx_override && sc->sc_awdl_native_tx_frame==m)
+		pid=sc->sc_awdl_native_tx_pid;
     const mwx_vif *vif = awdl ? &sc->sc_awdl_vif : &sc->sc_vif;
 	omac_idx = vif->omac_idx << MT_TXD1_OWN_MAC_SHIFT;
 	wmm_idx = vif->wmm_idx;
@@ -9357,6 +9402,13 @@ void MtkMwx::awdlSetReceiver(void *context, AwdlReceive receiver)
     com->sc_awdl_receive=receiver;
 }
 
+void MtkMwx::awdlSetTxCompletion(void *context, AwdlTxCompletion completion)
+{
+    if (!com) return;
+    com->sc_awdl_tx_context=context;
+    com->sc_awdl_tx_completion=completion;
+}
+
 bool MtkMwx::awdlInterfaceReady()
 {
     if (!com || !com->sc_awdl_lock) return false;
@@ -10128,12 +10180,43 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
     if(mbuf_dup(frame,MBUF_DONTWAIT,&attempt)) {
         ++com->sc_awdl_tx_copy_failed; return kIOReturnNoMemory;
     }
+    const uint8_t *attemptBytes=static_cast<const uint8_t *>(mbuf_data(attempt));
+    bool nativeMI=attemptBytes[0]==0xd0 && !(attemptBytes[4]&1) && attemptBytes[24]==127;
+    int nativeSlot=-1; uint8_t nativePid=0;
+    if (nativeMI) {
+        if (!com->sc_awdl_lock) { mbuf_freem(attempt); return kIOReturnNotReady; }
+        IOLockLock(com->sc_awdl_lock);
+        for (unsigned i=0;i<32;++i) if (!com->sc_awdl_native_tx[i].used) {
+            nativeSlot=static_cast<int>(i); nativePid=static_cast<uint8_t>(80+i);
+            auto &pending=com->sc_awdl_native_tx[i];
+            pending.used=true; memcpy(pending.address,destination,6);
+            pending.wcid=static_cast<uint16_t>(((mwx_node *)node)->wcid);
+            uint16_t frameSequence=0;
+            memcpy(&frameSequence,static_cast<const uint8_t *>(mbuf_data(attempt))+22,2);
+            pending.sequence=static_cast<uint16_t>(le16toh(frameSequence)>>4);
+            pending.pid=nativePid; pending.epoch=operation.epoch;
+            break;
+        }
+        IOLockUnlock(com->sc_awdl_lock);
+        if (nativeSlot<0) { mbuf_freem(attempt); return kIOReturnNoResources; }
+    }
     node->ni_chan=&com->sc_ic.ic_channels[channel];
     // mwx_tx consumes attempt on every return, including mapping/ring failure.
     // Preserve the queued frame's bytes, sequence and timestamp until success.
+    com->sc_awdl_native_tx_frame=nativeMI ? attempt : NULL;
+    com->sc_awdl_native_tx_pid=nativePid;
+    com->sc_awdl_native_tx_override=nativeMI;
     int rv=mwx_tx(com,attempt,node);
+    com->sc_awdl_native_tx_override=false;
+    com->sc_awdl_native_tx_frame=NULL;
     com->sc_awdl_tx_errno=rv;
-    if(rv) { ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources; }
+    if(rv) {
+        if (nativeSlot>=0 && com->sc_awdl_lock) {
+            IOLockLock(com->sc_awdl_lock); com->sc_awdl_native_tx[nativeSlot].used=false;
+            IOLockUnlock(com->sc_awdl_lock);
+        }
+        ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources;
+    }
     ++com->sc_awdl_tx_submitted;
     mbuf_freem(frame); *packet=NULL; return kIOReturnSuccess;
 }

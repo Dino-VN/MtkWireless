@@ -9,6 +9,7 @@ use mtk_common::Reader;
 
 pub const BSSID: [u8; 6] = [0, 0x25, 0, 0xff, 0x94, 0x73];
 pub const SNAP: [u8; 8] = [0xaa, 0xaa, 3, 0, 0x17, 0xf2, 8, 0];
+pub const NATIVE_IPV6_SNAP: [u8; 8] = [0xaa, 0xaa, 3, 0, 0, 0, 0x86, 0xdd];
 pub const MAX_PEERS: usize = 16;
 pub const SLOTS: usize = 16;
 pub const PEER_LIFETIME_US: u64 = 3_000_000;
@@ -376,7 +377,8 @@ pub struct DataReplayWindow {
     pub last_rx: u64,
     pub sequence: u16,
     pub active: bool,
-    // 0: no rollover observed, 12: observed 4095 -> 0, 16: upper bits seen.
+    // 0: no rollover observed, 12: low counter rolls within a stable
+    // upper-nibble domain, 16: full-width counter until rollover is observed.
     pub sequence_bits: u8,
 }
 
@@ -391,20 +393,28 @@ impl DataReplayWindow {
             return true;
         }
         self.last_rx = now;
-        // The 2026-10-26 large-upload trace reaches 4095, then resumes at
-        // zero within the same active QoS stream. Treating it as a 16-bit
-        // counter pins the high-water mark and drops every later datagram.
-        // Learn this only at the boundary; streams using upper bits retain
-        // full 16-bit arithmetic (including the captured TID 1 at 4096).
-        if seq > 0xfff {
-            self.sequence_bits = 16;
-        } else if self.sequence_bits == 0 && self.sequence >= 0xfc0 && seq < 0x800 {
-            self.sequence_bits = 12;
+        // AirDrop rolls 0x0fff -> 0x0000; iOS 27 Mirroring TID 5 rolls
+        // within the nonzero 0x2xxx domain. Upper bits alone therefore do
+        // not prove a 16-bit counter. Learn only at the same narrow boundary
+        // as before, and only inside the identical upper-nibble domain.
+        // Crossing domains (0x2fff -> 0x3000, or 0xffff -> 0) continues to
+        // use full-width arithmetic. Do not alias packets from other domains.
+        let same_domain = (seq & 0xf000) == (self.sequence & 0xf000);
+        let mut sequence_bits = self.sequence_bits;
+        if !same_domain {
+            sequence_bits = 16;
+        } else if sequence_bits != 12 && (self.sequence & 0xfff) >= 0xfc0 && (seq & 0xfff) < 0x800 {
+            sequence_bits = 12;
+        } else if sequence_bits == 0 && seq > 0xfff {
+            sequence_bits = 16;
         }
-        let mask = if self.sequence_bits == 12 { 0xfff } else { u16::MAX };
+        let mask = if sequence_bits == 12 { 0xfff } else { u16::MAX };
         let forward = seq.wrapping_sub(self.sequence) & mask;
         let delta = if forward <= mask / 2 { forward as i32 } else { forward as i32 - (mask as i32 + 1) };
         if delta > 0 {
+            // A rejected or reordered foreign-domain packet must not change
+            // the modulus of the active high-water window.
+            self.sequence_bits = sequence_bits;
             self.bitmap = if delta >= 64 { 1 } else { (self.bitmap << delta) | 1 };
             self.sequence = seq;
             return true;
@@ -416,6 +426,7 @@ impl DataReplayWindow {
         self.bitmap |= 1u64 << back;
         true
     }
+
 }
 
 #[repr(C)]
@@ -1660,7 +1671,7 @@ pub fn data_header_length(f: &[u8]) -> usize {
 pub fn relocate_deaggregated_header(f: &mut [u8]) -> bool {
     let n = f.len();
     let hdr = data_header_length(f);
-    if hdr != 26 || f[24] & 0x80 == 0 || n < hdr + 2 + 14 + 56 {
+    if hdr != 26 || f[24] & 0x80 == 0 || n < hdr + 2 + 14 + 48 {
         return false;
     }
     f.copy_within(0..hdr, 2);
@@ -1705,7 +1716,7 @@ pub fn data_view(f: &[u8], at_: usize) -> Option<(usize, DataView)> {
         if used < n - at_ {
             let pad = (4 - used % 4) % 4;
             // Padding occurs only between complete subframes.
-            if n - at_ - used < pad + 14 + 56 {
+            if n - at_ - used < pad + 14 + 48 {
                 return None;
             }
             used += pad;
@@ -1714,6 +1725,15 @@ pub fn data_view(f: &[u8], at_: usize) -> Option<(usize, DataView)> {
         if at_ != hdr {
             return None;
         }
+    }
+    // Native iOS 27 Mirroring TID 7 uses RFC1042 IPv6 directly, without
+    // the AWDL SNAP/sequence header. 0x86dd is an EtherType, not the
+    // length of an outer LLC envelope. Keep the MSDU boundary exact.
+    if hdr == 26 && native_ipv6_payload(&f[p..p + len]) {
+        return Some((used, DataView {
+            destination: dst, source: src, payload: p, length: len,
+            sequence: le16(f, 22) >> 4,
+        }));
     }
     // iOS 27 captures: QoS RX carries RFC1042 LLC (zero OUI), a BE
     // length, then AWDL SNAP, also INSIDE each A-MSDU subframe. Bound the
@@ -1776,17 +1796,47 @@ pub fn decode_data_view(
     payload: &[u8],
 ) -> usize {
     let length = payload.len();
-    if !(56..=1516).contains(&length) || destination.len() < 6 || source.len() < 6 {
+    let native = native_ipv6_payload(payload);
+    if payload.starts_with(&NATIVE_IPV6_SNAP) && !native { return 0; }
+    if (!native && !(56..=1516).contains(&length)) || destination.len() < 6 || source.len() < 6 {
         return 0;
     }
-    let len = length - 2;
+    let len = if native { length + 6 } else { length - 2 };
     if out.len() < len {
         return 0;
     }
     out[..6].copy_from_slice(&destination[..6]);
     out[6..12].copy_from_slice(&source[..6]);
-    out[12..len].copy_from_slice(&payload[14..]);
+    out[12..len].copy_from_slice(&payload[if native { 6 } else { 14 }..]);
     len
+}
+
+pub fn native_ipv6_payload(payload: &[u8]) -> bool {
+    (48..=1508).contains(&payload.len()) && payload[..8] == NATIVE_IPV6_SNAP
+        && valid_ipv6(&payload[8..])
+}
+
+pub fn data_ethernet_length(payload: &[u8]) -> usize {
+    if native_ipv6_payload(payload) { payload.len() + 6 }
+    else if payload.starts_with(&NATIVE_IPV6_SNAP) { 0 }
+    else if (56..=1516).contains(&payload.len()) { payload.len() - 2 }
+    else { 0 }
+}
+
+/// Native MPDU sequence is shared by A-MSDU subframes and hardware-split
+/// copies. Include the validated MSDU bytes, sender and TID in the bounded
+/// retry cache tag, rather than feeding it into the legacy AWDL window.
+pub fn native_rx_tag(frame: &[u8], payload: &[u8]) -> u64 {
+    if data_header_length(frame) != 26 || !native_ipv6_payload(payload) { return 0; }
+    let mut tag = 0xcbf29ce484222325u64;
+    for byte in frame[10..16].iter().copied()
+        .chain((le16(frame, 22) >> 4).to_le_bytes())
+        .chain(core::iter::once(frame[24] & 15))
+        .chain(payload.iter().copied()) {
+        tag = (tag ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
+    // Zero marks an unused retry-cache entry.
+    if tag == 0 { 1 } else { tag }
 }
 
 /// Single-MSDU decode; fills `seq` on success.
@@ -2147,6 +2197,83 @@ mod tests {
     use super::*;
     use std::vec::Vec;
 
+    fn native_ipv6_frame(size: usize, aggregate: bool) -> (Vec<u8>, Vec<u8>) {
+        let (envelope, eth) = qos_llc_frame(size);
+        let mut frame = envelope[..26].to_vec();
+        frame[24] = 7 | if aggregate { 0x80 } else { 0 };
+        let msdu = [&NATIVE_IPV6_SNAP[..], &eth[14..]].concat();
+        if aggregate {
+            frame.extend_from_slice(&eth[..12]);
+            frame.extend_from_slice(&(msdu.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(&msdu);
+        (frame, eth)
+    }
+
+    #[test]
+    fn native_mirroring_ipv6_msdu_decodes_every_mtu_size() {
+        for size in 54..=1514 {
+            for aggregate in [false, true] {
+                let (frame, eth) = native_ipv6_frame(size, aggregate);
+                assert!(valid_data_frame(&frame), "size {size}, aggregate {aggregate}");
+                let (used, view) = data_view(&frame, 26).unwrap();
+                assert_eq!(26 + used, frame.len());
+                assert_eq!(view.sequence, le16(&frame, 22) >> 4);
+                let payload = &frame[view.payload..view.payload + view.length];
+                assert_eq!(data_ethernet_length(payload), size);
+                let mut out = std::vec![0; size];
+                assert_eq!(decode_data_view(&mut out, &frame[view.destination..view.destination+6],
+                    &frame[view.source..view.source+6], payload), size);
+                assert_eq!(out, eth);
+                assert_eq!(decode_data_view(&mut out[..size-1], &eth[..6], &eth[6..12], payload), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn native_mirroring_retries_keep_distinct_hardware_split_subframes() {
+        let (frame, _) = native_ipv6_frame(1390, true);
+        let (_, view) = data_view(&frame, 26).unwrap();
+        let payload = &frame[view.payload..view.payload + view.length];
+        let tag = native_rx_tag(&frame, payload);
+        assert_ne!(tag, 0);
+        let mut retry = frame.clone();
+        retry[1] |= 8;
+        assert_eq!(native_rx_tag(&retry, payload), tag);
+        // Hardware deaggregation can produce different MSDUs with identical
+        // MPDU sequence/TID; neither may suppress the other.
+        let mut different = payload.to_vec();
+        *different.last_mut().unwrap() ^= 1;
+        assert_ne!(native_rx_tag(&frame, &different), tag);
+        let mut other_tid = frame.clone();
+        other_tid[24] ^= 1;
+        assert_ne!(native_rx_tag(&other_tid, payload), tag);
+    }
+
+    #[test]
+    fn native_mirroring_rejects_bad_boundaries_and_non_ipv6() {
+        let (frame, _) = native_ipv6_frame(1370, true);
+        for size in 0..frame.len() { assert!(!valid_data_frame(&frame[..size]), "size {size}"); }
+        for offset in [10,16,22,25,32,38,39,40,41,42,43,44,45,46,47,48,52,53] {
+            let mut bad=frame.clone();
+            bad[offset] ^= if offset==48 { 0x10 } else { 1 };
+            assert!(!valid_data_frame(&bad), "offset {offset}");
+        }
+        let mut extra=frame.clone(); extra.push(0);
+        assert!(!valid_data_frame(&extra));
+        let mut aggregate=frame.clone();
+        let pad=(4-(aggregate.len()-26)%4)%4;
+        aggregate.resize(aggregate.len()+pad,0);
+        let (small, _) = native_ipv6_frame(54,true);
+        aggregate.extend_from_slice(&small[26..]);
+        assert!(valid_data_frame(&aggregate));
+        let (used, _) = data_view(&aggregate,26).unwrap();
+        let (_, v) = data_view(&aggregate,26+used).unwrap();
+        assert_eq!(data_ethernet_length(&aggregate[v.payload..v.payload+v.length]),54);
+        aggregate[26+used+14+8] ^= 0x10;
+        assert!(!valid_data_frame(&aggregate));
+    }
+
     fn qos_llc_frame(size: usize) -> (Vec<u8>, Vec<u8>) {
         let mut eth = std::vec![0; size];
         eth[..6].copy_from_slice(&[2, 1, 2, 3, 4, 5]);
@@ -2411,6 +2538,74 @@ mod tests {
         assert!(missed.accept(4095, 1));
         assert!(missed.accept(447, 2)); // first retained live rejection
         assert!(!missed.accept(447, 3));
+    }
+
+    #[test]
+    fn mirroring_rollover_with_nonzero_upper_nibble_preserves_duplicate_window() {
+        // Live iOS 27 Mirroring capture: TID 5 was pinned at 0x2fff;
+        // monotonically increasing 0x219e..0x2450 packets were all too-old.
+        let mut window = DataReplayWindow::default();
+        assert!(window.accept(0x2ffe, 1));
+        assert!(window.accept(0x2fff, 2));
+        assert!(window.accept(0x219e, 3));
+        assert!(!window.accept(0x219e, 4));
+        for (index, seq) in (0x219f..=0x2450).enumerate() {
+            let time = 5 + index as u64 * 2;
+            assert!(window.accept(seq, time));
+            assert!(!window.accept(seq, time + 1));
+        }
+        assert_eq!(window.sequence_bits, 12);
+        assert!(!window.accept(0x2000, 2000));
+        assert!(!window.accept(0x1451, 2001));
+    }
+
+    #[test]
+    fn captured_mirroring_tid5_rejections_are_accepted_once_after_prefix_rollover() {
+        let fixture = include_str!("../../tests/fixtures/mirroring-tid5-replay.csv");
+        let mut count = 0;
+        for line in fixture.lines().skip(1) {
+            let mut fields = line.split(',');
+            let seq = fields.next().unwrap().parse::<u16>().unwrap();
+            let previous = fields.next().unwrap().parse::<u16>().unwrap();
+            let bitmap = u64::from_str_radix(fields.next().unwrap().trim_start_matches("0x"), 16).unwrap();
+            let mut window = DataReplayWindow {
+                bitmap, last_rx: 100, sequence: previous, active: true, sequence_bits: 16,
+            };
+            assert!(window.accept(seq, 101), "captured sequence {seq:#x}");
+            assert!(!window.accept(seq, 102), "duplicate sequence {seq:#x}");
+            count += 1;
+        }
+        assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn narrow_counters_with_upper_domains_wrap_reorder_and_reject_duplicates() {
+        for domain in 0..16 {
+            let prefix = domain << 12;
+            let mut window = DataReplayWindow::default();
+            for packet in 0..12_000u64 {
+                let seq = prefix | (packet & 0xfff) as u16;
+                assert!(window.accept(seq, 100 + packet * 10));
+                assert!(!window.accept(seq, 101 + packet * 10));
+            }
+            assert_eq!(window.sequence_bits, 12);
+            let mut boundary = DataReplayWindow::default();
+            assert!(boundary.accept(prefix | 0xffe, 1));
+            assert!(boundary.accept(prefix, 2));
+            assert!(boundary.accept(prefix | 0xfff, 3));
+            assert!(!boundary.accept(prefix | 0xfff, 4));
+            assert!(!boundary.accept(prefix | 0xfc0, 5));
+            if domain > 0 {
+                assert!(!boundary.accept(prefix.wrapping_sub(0x1000), 6));
+                assert_eq!(boundary.sequence_bits, 12);
+                assert!(!boundary.accept(prefix | 0xfff, 7));
+            }
+        }
+        let mut wide = DataReplayWindow::default();
+        assert!(wide.accept(0x2fff, 1));
+        assert!(wide.accept(0x3000, 2));
+        assert!(!wide.accept(0x2000, 3));
+        assert_eq!(wide.sequence_bits, 16);
     }
 
     #[test]

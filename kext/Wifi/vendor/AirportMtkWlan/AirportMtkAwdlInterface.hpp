@@ -119,6 +119,8 @@ private:
     bool createDataPath();
     void releaseDataPath();
     void drainCompletions();
+    void drainTxStatus();
+    static void txStatus(void *, const uint8_t *, uint8_t, uint16_t, uint16_t, uint8_t, uint32_t);
     void inputNative(const uint8_t*,size_t);
     void inputNativeView(const mtkawdl::DataView&);
     static unsigned submitNative(OSObject*,IOSkywalkTxSubmissionQueue*,IOSkywalkPacket *const*,unsigned,void*);
@@ -145,6 +147,14 @@ private:
         uint64_t eventVersionOp=0, eventAddressTag=0, eventStatus=kIOReturnNotReady;
     };
     CacheDiagnostic cacheDiagnostic;
+    struct TxStatus {
+        uint8_t address[6]; uint8_t failed; uint16_t wcid; uint16_t sequence;
+        uint8_t pid; uint32_t epoch;
+    };
+    IOLock *txStatusLock = NULL;
+    TxStatus txStatuses[32] = {};
+    unsigned txStatusCount = 0, txStatusDropped = 0;
+    uint64_t txStatusCompletions = 0;
     void notifyAvailabilityWindowStart(uint8_t,uint64_t);
     void notifyAvailabilityWindowEnd(uint64_t);
     IOReturn setSync(bool);
@@ -198,6 +208,9 @@ private:
     InvalidDataRxSample dataRxInvalidTrace[32]={};
     InvalidDataRxSample dataRxWrongDestinationLast={};
     uint64_t dataRxInvalidTraceCount=0;
+    uint64_t nativeIPv6Tags[128]={},nativeIPv6TagTimes[128]={};
+    unsigned nativeIPv6TagNext=0;
+    uint64_t nativeIPv6Decoded=0,nativeIPv6Duplicate=0;
     void recordInvalidDataRx(const uint8_t *,size_t,uint64_t,uint8_t,int8_t,bool=false);
     IOReturn dataTxStatus = kIOReturnNotReady;
     uint64_t serviceTicks = 0, reserveAttempts = 0, grantObservations = 0, awStartNotifications = 0;
