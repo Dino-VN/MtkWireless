@@ -5603,7 +5603,12 @@ void
 mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 {
 	const uint8_t *raw=reinterpret_cast<const uint8_t *>(txs_data);
+	const uint64_t awdlDataBefore=sc->sc_awdl_tx_status.dataAcked+
+	    sc->sc_awdl_tx_status.dataFailed;
 	bool awdlStatus=sc->sc_awdl_tx_status.observe(raw,32);
+	// MtkWireless: beginWCLScan defers airportd scans while AWDL data flows.
+	if (sc->sc_awdl_tx_status.dataAcked+sc->sc_awdl_tx_status.dataFailed!=awdlDataBefore)
+		sc->sc_ic.ic_awdl_data_at=mtk_join_now();
 	if (awdlStatus) {
 		uint32_t status=le32toh(txs_data[0]);
 		uint16_t wcid=static_cast<uint16_t>((le32toh(txs_data[2])>>16)&0x3ff);
@@ -10320,6 +10325,7 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
     mwxController()->setProperty("MTKAWDLScanSuspended",com->sc_awdl_scan_suspended);
     mwxController()->setProperty("MTKAWDLScanPreempted",com->sc_awdl_scan_preempted,64);
+    mwxController()->setProperty("MTKAWDLScanDeferred",com->sc_ic.ic_awdl_scan_deferred,64);
     mwxController()->setProperty("MTKAWDLROCJoinBlocked",com->sc_awdl_roc_join_blocked,64);
     {
         static const char *names[3]={"MTKAWDLROCLatencyUnassoc","MTKAWDLROCLatencyAPChannel",

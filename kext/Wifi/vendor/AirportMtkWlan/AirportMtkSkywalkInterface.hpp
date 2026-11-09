@@ -369,6 +369,7 @@ private:
     void applyJoinCompat(bool pskJoin);
     void restoreJoinCompat();
     void finishWCLScan(IOReturn);
+    bool deferScanForAWDL(struct ieee80211com *ic);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     bool joinBssidMatches(const uint8_t *) const;
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);

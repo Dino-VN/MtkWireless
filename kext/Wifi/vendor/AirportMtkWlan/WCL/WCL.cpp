@@ -313,6 +313,8 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
         return kIOReturnBusy;
     if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
         return kIOReturnBusy;
+    if (deferScanForAWDL(ic))
+        return kIOReturnBusy;
     if (scan.channelCount) {
         bool usable = false;
         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
@@ -360,6 +362,41 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
         }
     }
     return kIOReturnSuccess;
+}
+
+// MtkWireless: while associated, a WCL scan aborts the AWDL ROC and holds
+// the one radio for seconds; an AirDrop to the iPhone then stalls (1.0.14,
+// ROCScanBlocked +70 in 2 s of transfer). Refuse it as busy while AWDL data
+// TX completed within the last 1.5 s, but let one through every 30 s so
+// airportd's roam/location view does not go stale. Joins and unassociated
+// scans are never deferred (that failed every join with -3905).
+// Boot-arg amtk_awdl_scan_defer=0 turns it off.
+bool AirportMtkSkywalkInterface::deferScanForAWDL(ieee80211com *ic)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        uint32_t value = 1;
+        enabled = PE_parse_boot_argn("amtk_awdl_scan_defer", &value, sizeof(value)) ? value != 0 : 1;
+    }
+    if (!enabled || ic->ic_state != IEEE80211_S_RUN || joinPending || roamPending ||
+        ic->ic_wcl_join_requested) {
+        ic->ic_awdl_scan_defer_since = 0;
+        return false;
+    }
+    uint64_t now = mtk_join_now();
+    uint64_t last = ic->ic_awdl_data_at;
+    if (!last || now < last || now - last > 1500000ull) {
+        ic->ic_awdl_scan_defer_since = 0;
+        return false;
+    }
+    if (!ic->ic_awdl_scan_defer_since)
+        ic->ic_awdl_scan_defer_since = now;
+    if (now - ic->ic_awdl_scan_defer_since >= 30000000ull) {
+        ic->ic_awdl_scan_defer_since = 0;
+        return false;
+    }
+    ++ic->ic_awdl_scan_deferred;
+    return true;
 }
 
 void AirportMtkSkywalkInterface::finishWCLScan(IOReturn status)

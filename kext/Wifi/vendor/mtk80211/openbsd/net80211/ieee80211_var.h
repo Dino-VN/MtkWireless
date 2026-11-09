@@ -490,6 +490,11 @@ struct ieee80211com {
     uint8_t ic_wcl_apple_ie;
     uint8_t ic_wcl_hotspot_flag;
     bool ic_wcl_scan_requested;
+    /* MtkWireless: last AWDL data TX status (mtk_join_now us, HAL) and
+     * WCL scans refused while it is recent (beginWCLScan). */
+    uint64_t ic_awdl_data_at;
+    uint64_t ic_awdl_scan_defer_since;
+    uint64_t ic_awdl_scan_deferred;
     bool ic_wcl_scan_inflight; /* A firmware scan, not just logical SCAN. */
     bool ic_wcl_scan_active;
     uint8_t ic_wcl_scan_ssid_length;

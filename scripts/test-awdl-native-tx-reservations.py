@@ -142,8 +142,8 @@ struct mwx_softc {
     mwx_vif sc_awdl_vif{};
     mwx_node sc_awdl_peers[3]{};bool sc_awdl_peer_used[3]={true,false,false};
     bool sc_awdl_station_pending[3]={true,false,false};
-    struct {char ic_channels[256];struct {unsigned if_flags=IFF_RUNNING;} ic_if;} sc_ic;
-    struct {uint32_t rates[3]={0x12345678,0,0};
+    struct {char ic_channels[256];struct {unsigned if_flags=IFF_RUNNING;} ic_if;uint64_t ic_awdl_data_at=0;} sc_ic;
+    struct {uint32_t rates[3]={0x12345678,0,0};uint64_t dataAcked=0,dataFailed=0;
         bool observe(const uint8_t *p,size_t){uint32_t v;memcpy(&v,p+8,4);return (v>>16)>=15 && (v>>16)<=18;}} sc_awdl_tx_status;
     mbuf *sc_awdl_native_tx_frame=nullptr;uint8_t sc_awdl_native_tx_pid=0;
     bool sc_awdl_native_tx_override=false;
@@ -156,6 +156,7 @@ struct mwx_softc {
     ~mwx_softc(){assert(!sc_awdl_busy && !sc_awdl_calls);IOLockFree(sc_awdl_lock);}
 };
 static bool mwx_awdl_current(mwx_softc *,uint32_t);
+static uint64_t mtk_join_now(){return 1;}
 static void mwx_awdl_reset_rate(mwx_softc *sc,unsigned index){sc->sc_awdl_tx_status.rates[index]=0;}
 ''' + operations + function(source, 'static bool mwx_awdl_current(mwx_softc *sc,') + r'''
 bool mwx_tx_full(mwx_softc *){return false;}

@@ -99,6 +99,7 @@ struct AirportMtkSkywalkInterface {
     Hal radio; Hal*fHalService=&radio; Timer timer; Timer*scanSource=&timer;
     bool scanPending=false,joinPending=false,roamPending=false,scanCompleted=false,scanSkipCompletion=false;
     IOReturn beginWCLScan(apple80211ScanRequest*);
+    bool deferScanForAWDL(ieee80211com*){return false;}
     void scanDone(){auto ic=&radio.ic;switch(IEEE80211_EVT_SCAN_DONE){
 ''' + completion + r'''
     }}
