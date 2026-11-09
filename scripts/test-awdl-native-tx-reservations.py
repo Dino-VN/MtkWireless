@@ -156,6 +156,7 @@ struct mwx_softc {
     ~mwx_softc(){assert(!sc_awdl_busy && !sc_awdl_calls);IOLockFree(sc_awdl_lock);}
 };
 static bool mwx_awdl_current(mwx_softc *,uint32_t);
+static void mwx_awdl_reset_rate(mwx_softc *sc,unsigned index){sc->sc_awdl_tx_status.rates[index]=0;}
 ''' + operations + function(source, 'static bool mwx_awdl_current(mwx_softc *sc,') + r'''
 bool mwx_tx_full(mwx_softc *){return false;}
 void mt7921_mac_add_txs(mwx_softc *sc,const uint32_t *txs_data){

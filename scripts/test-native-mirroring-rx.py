@@ -186,6 +186,8 @@ struct IOTimerEventSource : OSObject {
     void setTimeoutMS(unsigned){assert(controllerLoop.inGate());++ticks;}
     void cancelTimeout(){assert(controllerLoop.inGate());}
     void disable(){assert(controllerLoop.inGate());}
+    void enable(){assert(controllerLoop.inGate());}
+    void setTimeoutUS(unsigned){assert(controllerLoop.inGate());++ticks;}
 };
 struct PoolStats { unsigned id=++nextPoolID,allocations=0,reclaims=0,deletes=0; };
 struct QueueStats {
@@ -313,6 +315,10 @@ struct AirportMtkAwdlInterface : NativeInterface {
     mtkawdl::State state={};mtkawdl::DataPeers dataPeers;
     uint64_t dataRxAdmissionGeneration=1;unsigned dataRxPeerProgramming=0;
     IOThread syncOwner=nullptr;
+    bool readyGatePending=false,readyGateBypassed=true,readyGateForce=false;
+    static constexpr uint64_t kReadyGateMaxUS=180ull*1000*1000;
+    uint64_t readyGateStartUS=0,readyGateWaitedUS=0,readyGateBypassCount=0,readyGateCompletions=0,readyGateChecks=0;
+    bool awdlSystemReady(){return true;}
     uint64_t syncRequests=0,syncWaits=0,syncFailures=0,txSession=123;
     AirportMtkWlan controller;AirportMtkWlan *owner=&controller;
     MtkMwx radio;MtkMwx *hal=&radio;

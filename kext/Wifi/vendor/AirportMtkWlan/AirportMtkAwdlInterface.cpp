@@ -2051,7 +2051,7 @@ void AirportMtkAwdlInterface::serviceInGate()
                     // re-register it once and retry before requeueing.
                     if(awdlRenewStationOnNoPeer()) {
                         const uint8_t *dst=(const uint8_t *)mbuf_data(m)+4;
-                        if(hal->awdlPeer(dst,true)==kIOReturnSuccess)
+                        if(programDataPeer(dst,true)==kIOReturnSuccess)
                             txStatus=hal->awdlTryTransmit(&m,channel);
                         if(txStatus==kIOReturnSuccess) {
                             if(m) mbuf_freem(m);

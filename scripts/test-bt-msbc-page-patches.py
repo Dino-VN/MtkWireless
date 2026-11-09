@@ -427,7 +427,7 @@ void rpaTests() {
             if (enabled) memcpy(expected.data() + site.pageOffset, site.replacement, site.length);
             apply(page);
             assert(page == expected && *site.counter == enabled);
-            apply(page); assert(page == expected && *site.counter == enabled);
+            apply(page); assert(page == expected && *site.counter == 2 * enabled);
         }
     }
     // The helper page is faulted lazily (end of __TEXT): a child page
@@ -446,7 +446,7 @@ void rpaTests() {
             Page page {}; memcpy(page.data() + offset, site.find, site.length);
             const int previous = *site.counter; apply(page);
             assert(!memcmp(page.data() + offset, site.replacement, site.length) && *site.counter == previous + 1);
-            apply(page); assert(*site.counter == previous + 1);
+            apply(page); assert(*site.counter == previous + 2);
         }
         Page wrong {}; memcpy(wrong.data(), site.find, site.length); wrong[site.length - 1] ^= 1;
         Page page = wrong; const int previous = *site.counter; apply(page);
@@ -833,7 +833,10 @@ int main() {
         assert(verifyFixRouted == (version >= 21) && (fakeOps[kVerifyIndex] == verifyOp) == (version >= 21));
         assert(bluetoothdWbsPatched == wideband && bluetoothdHfpFillPatched == wideband);
         assert(bluetoothdPatched == adv && bluetoothdAddressPatched == adv && bluetoothdAddressRetryPatched == adv);
-        apply(page); assert(page == expected && bluetoothdWbsPatched == wideband && bluetoothdHfpFillPatched == wideband);
+        // A re-fault of an already patched page is restored to the recorded
+        // originals before cs_validate_page and patched again.
+        apply(page); assert(page == expected && bluetoothdWbsPatched == 2 * wideband && bluetoothdHfpFillPatched == 2 * wideband);
+        assert(bluetoothdPatched == 2 * adv && bluetoothdAddressPatched == 2 * adv && bluetoothdAddressRetryPatched == 2 * adv);
         for (const char *path : {"/usr/sbin/BlueTool", "/tmp/bluetoothd", "/usr/sbin/bluetoothd.backup"}) {
             page = originals(); const int previous = searches; apply(page, path);
             assert(page == originals() && searches == previous);
@@ -850,7 +853,7 @@ int main() {
     osBuild = "25G241";
     Page fill241 {}; memcpy(fill241.data() + 110, hfpFill241Find, sizeof(hfpFill241Find));
     apply(fill241); assert(!memcmp(fill241.data() + 110, hfpFill241Replace, sizeof(hfpFill241Replace)));
-    assert(bluetoothdHfpFillPatched == 1); apply(fill241); assert(bluetoothdHfpFillPatched == 1);
+    assert(bluetoothdHfpFillPatched == 1); apply(fill241); assert(bluetoothdHfpFillPatched == 2);
     osBuild = "25G332";
     for (bool fill : {false, true}) {
         const uint8_t *find = fill ? hfpFillFind : wbsFind;
@@ -935,7 +938,7 @@ state = source[state_start:source.index("\n", source.index("uint8_t *verifyCopy;
 site_table = source[source.index("enum PatchFeature : uint8_t"):source.index("bool siteScopeAllows(")]
 forward = "bool patchBluetoothdPage(void *data);\n"
 wrappers = forward + "\n\n".join(function(name) for name in (
-    "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "static __attribute__((noinline)) bool isBluetoothdPath(", "bool isBluetoothd(",
+    "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "void restorePatchedPageLocked(", "static __attribute__((noinline)) bool isBluetoothdPath(", "bool isBluetoothd(",
     "uint32_t decodeVnodeOpsOffset(", "void noteVerifyFailure(", "template <typename Verify>\nerrno_t verifyBluetoothdBlock(",
     "int verifyOp(void *arg)", "void installVerifyOp(", "void csValidatePage(", "SInt32 readBluetoothdBuild()",
     "bool siteScopeAllows(", "bool featureWanted(", "bool featureOn(", "bool patchBluetoothdPage(void *data)\n{",

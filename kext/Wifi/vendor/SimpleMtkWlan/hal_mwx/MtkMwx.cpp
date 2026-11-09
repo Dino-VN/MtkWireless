@@ -7072,6 +7072,13 @@ static int mwx_awdl_fixed_rate()
     return value;
 }
 
+// Reset one AWDL peer's rate ladder to the amtk_awdl_rate_start rung.
+static void mwx_awdl_reset_rate(struct mwx_softc *sc, unsigned index)
+{
+    sc->sc_awdl_tx_status.rates[index]={};
+    sc->sc_awdl_tx_status.rates[index].index=static_cast<uint8_t>(mwx_awdl_rate_start());
+}
+
 static uint16_t mwx_awdl_fixed_rate_value(int index)
 {
     // TXD6 rate layout matches TXS: mode bits 6..9, index 0..5, NSS 10..12.
@@ -10040,11 +10047,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
         IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
     }
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
-    int rateStart=mwx_awdl_rate_start();
-    for(unsigned i=0;i<3;++i) {
-        sc->sc_awdl_tx_status.rates[i]={};
-        sc->sc_awdl_tx_status.rates[i].index=static_cast<uint8_t>(rateStart);
-    }
+    for(unsigned i=0;i<3;++i) mwx_awdl_reset_rate(sc,i);
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
     sc->sc_awdl_native_session=mwx_awdl_native_new_session();
     sc->sc_awdl_enabled=true;
@@ -10605,8 +10608,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
     }
     com->sc_awdl_native_tx.cancel(wcid);
     memset(&node,0,sizeof(node)); node.wcid=wcid;
-    com->sc_awdl_tx_status.rates[index]={};
-    com->sc_awdl_tx_status.rates[index].index=static_cast<uint8_t>(mwx_awdl_rate_start());
+    mwx_awdl_reset_rate(com,index);
     if(add) memcpy(node.ni.ni_macaddr,address,6);
     com->sc_awdl_peer_used[index]=add;
     com->sc_awdl_station_pending[index]=add;

@@ -74,7 +74,7 @@ struct ieee80211com {
     uint8_t ic_des_essid[32]{},ic_des_bssid[6]{};
     mtk_join_diag ic_join_diag{};
     struct { unsigned if_flags=IFF_UP|IFF_RUNNING; } ic_if;
-    bool ic_wcl_mac_reconfig=false,ic_wcl_join_requested=false,ic_wcl_enterprise=false;
+    bool ic_wcl_mac_reconfig=false,ic_wcl_join_requested=false,ic_wcl_enterprise=false,ic_wcl_hotspot_flag=true;
     uint8_t ic_psk[32]{};bool saeForgotten=false;
 };
 void ieee80211_sae_forget(ieee80211com *ic){ic->saeForgotten=true;}
@@ -193,6 +193,13 @@ void testCompat(){
             assert(s.beginPolicy(request(auth)));compatible(s,level);
         }
     }
+    // A locally administered BSSID without WCL's Instant Hotspot indication
+    // is an ordinary AP: no preemptive compatibility level.
+    {AirportMtkSkywalkInterface s;auto &ic=s.hal.radio;ic.ic_wcl_hotspot_flag=false;
+     ic.ic_rsnakms=IEEE80211_AKM_PSK;
+     const auto flags=ic.ic_flags|IEEE80211_F_DESBSSID,caps=ic.ic_caps;
+     assert(s.beginPolicy(request(APPLE80211_AUTHTYPE_WPA2_PSK)));pristine(s,flags,caps);
+     assert(ic.ic_join_diag.Compat==0);}
     // A transition request carrying a PMK chooses PSK, not SAE. A password
     // may enable SAE; its configured mask must still veto the fallback.
     const uint32_t transition=APPLE80211_AUTHTYPE_WPA3_SAE|APPLE80211_AUTHTYPE_WPA2_PSK;
