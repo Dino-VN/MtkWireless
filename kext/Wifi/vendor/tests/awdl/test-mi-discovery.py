@@ -29,6 +29,7 @@ struct apple80211_channel{uint32_t version,channel,flags;};
 struct apple80211_peer_cache_control{uint8_t bytes[0x1d0];};
 '''+ '\n'.join(structs)+r'''
 struct Timer{unsigned ms=0;void setTimeoutMS(unsigned n){ms=n;}void setTimeoutUS(unsigned n){ms=(n+999)/1000;}void cancelTimeout(){}};
+template<typename T> static void awdlScheduleService(T *timer){timer->setTimeoutMS(1);}
 struct Packet{std::vector<uint8_t> bytes;};using mbuf_t=Packet*;
 void mbuf_freem(mbuf_t m){delete m;}void *mbuf_data(mbuf_t m){return m->bytes.data();}
 unsigned mbuf_flags(mbuf_t){return MBUF_PKTHDR;}
@@ -86,6 +87,14 @@ struct AirportMtkAwdlInterface{
  int32_t lastActionRSSI=0;unsigned reserveDuration=0,requestedChannel=0,grantedChannel=0;
  IOReturn reserveStatus=0,actionStatus=0,miStatus=0;static constexpr unsigned kDataQueueSize=256;mbuf_t queue[kDataQueueSize]{};
  uint64_t dataTxSubmitted=0,dataTxFailed=0,dataTxExpired=0,dataTxDeferred=0;IOReturn dataTxStatus=0;
+ uint64_t dataTxNotReady=0,dataTxNoGrantTicks=0;
+ uint64_t amsduFrames=0,amsduSubframes=0,amsduBytes=0,amsduAllocFailed=0;
+ mbuf_t buildAmsdu(mbuf_t,uint8_t,uint64_t,unsigned&){return nullptr;}
+ static bool awdlAmsduEnabled(){return true;}
+ template<typename T> void inputNativeView(const T&v){
+  std::vector<uint8_t> out(v.length-2);
+  if(mtkawdl::decodeDataView(out.data(),out.size(),v)==out.size()) received.emplace_back(std::move(out));
+ }
  uint64_t dataRxFrames=0,dataRxInvalid=0,dataRxUnknownPeer=0,dataRxWrongDestination=0,dataRxReplay=0,dataRxDecoded=0;
  std::vector<std::vector<uint8_t>> received;
  uint64_t queueTime[kDataQueueSize]{},queueDeadline[kDataQueueSize]{};unsigned queueCount=0,queueHead=0,nativeCalls=0;

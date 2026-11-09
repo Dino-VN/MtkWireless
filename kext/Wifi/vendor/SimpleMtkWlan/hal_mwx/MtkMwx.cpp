@@ -1635,6 +1635,13 @@ mwx_scan(struct mwx_softc *sc)
 	struct ifnet *ifp = &ic->ic_if;
 	int rv;
 
+	/* 1.0.19 diagnostic: every scan entry, including the ones that bail out
+	 * early. A foreground scan while in RUN tears the link down below, so
+	 * this line identifies the initiator's context (state/bgscan/timer). */
+	MWX_DEV_LOG(sc, "scan enter state=%s bgscan=%d flags=0x%x mgt_timer=%d\n",
+	    ieee80211_state_name[ic->ic_state],
+	    (sc->sc_flags & MWX_FLAG_BGSCAN) != 0, sc->sc_flags, ic->ic_mgt_timer);
+
 	if (sc->sc_flags & MWX_FLAG_BGSCAN) {
 		rv = mt7921_mcu_hw_scan_cancel(sc);
 		if (rv) {
@@ -1785,6 +1792,10 @@ mwx_newstate_task(void *ptr)
         // while MCU waits temporarily release the gate and ic_state is SCAN.
         if (sc->sc_awdl_lock) {
             rv = mwx_awdl_abort(sc);
+            /* 1.0.25: restore the 1.0.22 behaviour. 1.0.24 removed this break
+             * and the link stopped associating (0xe00002bc at ASSOC, plus a
+             * new 0xe00002d7). A granted ROC must be cancelled before the AP
+             * channel is programmed - proceeding anyway makes AUTH fail. */
             if (ic->ic_join_diag.Active) {
                 ic->ic_join_diag.ROCAbortAtUS = mtk_join_now();
                 ic->ic_join_diag.ROCAbortError = rv;
@@ -2888,7 +2899,19 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
 	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
-	sc->sc_knobs = MWX_KNOB_DATA_RA;
+	/*
+	 * MtkWireless 1.0.17: 11n / 20 MHz only (0x1022 = DATA_RA|NO_40|NO_HE).
+	 * 1.0.16 (11ac/80) kept the machine up but AirDrop died: 29 frames/s
+	 * submitted, 9/s acked, peer re-added 5 times, RX BA restarted with a new
+	 * SSN each time, received file stayed at 0 bytes. 1.0.10 -- 11n/20 MHz --
+	 * did complete transfers (4 MB photo). Every AW reservation at 80 MHz pays
+	 * a wider channel switch, so keep 20 MHz; NO_HE also stays on because every
+	 * build that froze had HE negotiated.
+	 */
+	/* 1.0.48: 1.0.46 (80 MHz + 8000/8) and 1.0.47 (20 MHz + 8000/8) both froze,
+	 * so the common variable is the 8000/8 aggregate, not the bandwidth. Put
+	 * 80 MHz back with 2560/4 to test the bandwidth knob alone. NO_HE stays. */
+	sc->sc_knobs = MWX_KNOB_DATA_RA | MWX_KNOB_NO_HE;
 	sc->sc_bgscan_dwell = MWX_BGSCAN_DWELL_AUTO;
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
 	task_set(&sc->sc_ba_task, mwx_ba_task, sc, "mwx_ba");
@@ -5527,8 +5550,9 @@ mt7921_mcu_beacon_loss_event(struct mwx_softc *sc, struct mbuf *m)
 	if (mbuf_len(m) < sizeof(*event))
 		return;
 	event = mtod(m, struct mt7921_mcu_beacon_loss_event *);
-	MWX_DEV_LOG(sc, "beacon loss bss_idx=%u reason=%u state=%d mgt_timer=%d\n",
-	    event->bss_idx, event->reason, ic->ic_state, ic->ic_mgt_timer);
+	MWX_DEV_LOG(sc, "beacon loss bss_idx=%u reason=%u state=%d mgt_timer=%d bgscan=%d reset=%d\n",
+	    event->bss_idx, event->reason, ic->ic_state, ic->ic_mgt_timer,
+	    (ic->ic_flags & IEEE80211_F_BGSCAN) != 0, sc->sc_resetting);
 
 	if (sc->sc_resetting || ic->ic_opmode != IEEE80211_M_STA ||
 	    ic->ic_state != IEEE80211_S_RUN ||
@@ -7018,6 +7042,43 @@ mt7921_mac_tx_rate_val(struct mwx_softc *sc)
 	return (rate & MT_TX_RATE_IDX_MASK) | (mode & MT_TX_RATE_MODE_MASK);
 }
 
+// 1.0.49: AWDL rate experiments. Defaults preserve the ACK-driven ladder.
+// amtk_awdl_rate_start: initial ladder rung 0..6 (6,12,24,36,48,54,65 Mbps).
+// amtk_awdl_fixed_rate: pin the TXD6 rate. 0..6 reuse the ladder values, 7 is
+// HT MCS7 2SS (130 Mbps) and 8 is HT MCS4 2SS (86.7 Mbps). -1 = ladder.
+static int mwx_awdl_rate_start()
+{
+    static int initialized=0, value=0;
+    if(!initialized) {
+        int parsed=0;
+        PE_parse_boot_argn("amtk_awdl_rate_start",&parsed,sizeof(parsed));
+        if(parsed<0 || parsed>6) parsed=0;
+        value=parsed;
+        initialized=1;
+    }
+    return value;
+}
+
+static int mwx_awdl_fixed_rate()
+{
+    static int initialized=0, value=-1;
+    if(!initialized) {
+        int parsed=-1;
+        PE_parse_boot_argn("amtk_awdl_fixed_rate",&parsed,sizeof(parsed));
+        if(parsed<-1 || parsed>8) parsed=-1;
+        value=parsed;
+        initialized=1;
+    }
+    return value;
+}
+
+static uint16_t mwx_awdl_fixed_rate_value(int index)
+{
+    // TXD6 rate layout matches TXS: mode bits 6..9, index 0..5, NSS 10..12.
+    static const uint16_t rates[9]={0x4b,0x4a,0x49,0x4d,0x48,0x4c,0x87,0x487,0x484};
+    return rates[index];
+}
+
 void
 mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
     struct ieee80211_node *ni, struct mt76_txwi *txp)
@@ -7120,8 +7181,11 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
             // ladder (OFDM 6..54 Mbps, then HT MCS 7; mtkawdl TX_RATES).
             // Discovery, BA actions and multicast keep 6 Mbps.
             rate=0x4b;
-            if(!multicast && type==(IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT))
-                rate=sc->sc_awdl_tx_status.rate(((mwx_node *)ni)->wcid);
+            if(!multicast && type==(IEEE80211_FC0_TYPE_DATA >> IEEE80211_FC0_TYPE_SHIFT)) {
+                int fixed=mwx_awdl_fixed_rate();
+                rate=fixed>=0 ? mwx_awdl_fixed_rate_value(fixed)
+                    : sc->sc_awdl_tx_status.rate(((mwx_node *)ni)->wcid);
+            }
         } else rate = mt7921_mac_tx_rate_val(sc);
 
 		val6 = MT_TXD6_FIXED_BW;
@@ -9876,6 +9940,17 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     bool sameAddress=!memcmp(address,sc->sc_awdl_address,6);
     IOLockUnlock(sc->sc_awdl_lock);
     if(alreadyEnabled) return sameAddress ? kIOReturnSuccess : kIOReturnBusy;
+    /* 1.0.25: hold AWDL off until the infra link is actually joined. At boot
+     * airportd enables AWDL at the same moment as the first join, and the MCU
+     * waits are serialised (sc_ns_state blocks reservations while a wait is
+     * outstanding), so the first AUTH/ASSOC loses the race: state=3,
+     * driver=0xe00002bc, followed by a full rescan and ~1 minute without
+     * network. airportd retries this call by itself. */
+    if (sc->sc_ic.ic_state != IEEE80211_S_RUN) {
+        MWX_DEV_LOG(sc,"AWDL enable deferred until infra RUN (state=%d)\n",
+                    sc->sc_ic.ic_state);
+        return kIOReturnNotReady;
+    }
     MwxAwdlOperation operation(sc);
     if (!operation.valid()) {
         MWX_DEV_LOG(sc,"AWDL enable blocked busy=%d stopping=%d reset=%d running=%d\n",
@@ -9965,6 +10040,11 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
         IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
     }
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
+    int rateStart=mwx_awdl_rate_start();
+    for(unsigned i=0;i<3;++i) {
+        sc->sc_awdl_tx_status.rates[i]={};
+        sc->sc_awdl_tx_status.rates[i].index=static_cast<uint8_t>(rateStart);
+    }
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
     sc->sc_awdl_native_session=mwx_awdl_native_new_session();
     sc->sc_awdl_enabled=true;
@@ -10279,6 +10359,12 @@ void MtkMwx::awdlPublishDiagnostics()
         char property[40]; snprintf(property,sizeof(property),"MTKAWDLTXPeer%uRateMbps",i);
         mwxController()->setProperty(property,static_cast<uint64_t>(tx.rateMbps(i)),32);
     }
+    // 1.0.49: report the opt-in rate experiment knobs. 0xff = ladder.
+    mwxController()->setProperty("MTKAWDLTXRateStart",
+        static_cast<uint64_t>(mwx_awdl_rate_start()),32);
+    int fixedRate=mwx_awdl_fixed_rate();
+    mwxController()->setProperty("MTKAWDLTXFixedRate",
+        static_cast<uint64_t>(fixedRate<0 ? 0xff : fixedRate),32);
     // Firmware owns RFCR; a nonzero AWDL-mask value means it reapplied drops.
     if(com->sc_awdl_enabled && !com->sc_resetting && !com->sc_detaching &&
        (com->sc_ic.ic_if.if_flags & IFF_RUNNING))
@@ -10520,6 +10606,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
     com->sc_awdl_native_tx.cancel(wcid);
     memset(&node,0,sizeof(node)); node.wcid=wcid;
     com->sc_awdl_tx_status.rates[index]={};
+    com->sc_awdl_tx_status.rates[index].index=static_cast<uint8_t>(mwx_awdl_rate_start());
     if(add) memcpy(node.ni.ni_macaddr,address,6);
     com->sc_awdl_peer_used[index]=add;
     com->sc_awdl_station_pending[index]=add;

@@ -215,10 +215,22 @@ static inline void mtk_join_record_failure(const struct mtk_join_diag *d,
 }
 /* MtkWireless: associated (and in RUN) but not one EAPOL-Key frame from the
  * AP arrived: the iPhone Instant Hotspot failure with HE + PMF negotiated
- * (2026-11-01, 1.0.16: 8.5 s, no M1; WPA2 home AP without them fine). */
+ * (2026-11-01, 1.0.16: 8.5 s, no M1; WPA2 home AP without them fine).
+ * An open (or WEP) join carries no EAPOL at all and never sets ni_port_valid,
+ * so "no EAPOL" there is normal, not a stall. Only upper-layer auth
+ * (WPA/WPA2/802.1X/SAE) can stall in the 4-way handshake; treating an open
+ * join as a stall made every later join take the compat level 2 path
+ * (NO_HE|NO_VHT|NO_40 -> 11n/20 MHz, seen 2026-11-06). */
+/* WARNING 2026-11-06: this predicate fix alone was built as 1.0.13 and froze
+ * the machine on the first post-install boot:
+ *   CoreCapture/WiFi/[13,26,22]=watchdog@0xe0823c02~missed beacons timeout
+ * With the downgrade gone the link really ran HE/80 MHz and the firmware lost
+ * beacons. Do NOT ship this without fixing the 80 MHz/HE instability first;
+ * 1.0.10 (downgrade in place) is the known-good build. */
 static inline bool mtk_join_eapol_stall(const struct mtk_join_diag *d) {
     return d->AssocRxCount && !d->AssocStatus && d->RunCommittedAtUS &&
-        !d->PortValidAtUS && !d->EapolRxAtUS && !d->EapolRawAtUS;
+        !d->PortValidAtUS && !d->EapolRxAtUS && !d->EapolRawAtUS &&
+        d->UpperAuth != 0;
 }
 static inline uint64_t mtk_join_now(void) {
     struct timeval tv;

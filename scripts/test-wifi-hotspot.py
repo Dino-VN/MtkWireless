@@ -171,12 +171,15 @@ int main(){
         assert(failed.Attempt==2 && assocFailed.Attempt==1);
     }
     {   // Associated + RUN with no EAPOL at all is the hotspot stall.
-        mtk_join_diag s{};s.AssocRxCount=1;s.RunCommittedAtUS=7;
+        mtk_join_diag s{};s.AssocRxCount=1;s.RunCommittedAtUS=7;s.UpperAuth=8;
         assert(mtk_join_eapol_stall(&s));
         s.EapolRawAtUS=9;assert(!mtk_join_eapol_stall(&s));
         s.EapolRawAtUS=0;s.AssocStatus=17;assert(!mtk_join_eapol_stall(&s));
         s.AssocStatus=0;s.PortValidAtUS=8;assert(!mtk_join_eapol_stall(&s));
         mtk_join_diag scanOnly{};assert(!mtk_join_eapol_stall(&scanOnly));
+        // An open join has no EAPOL by design and must not be a stall.
+        mtk_join_diag open{};open.AssocRxCount=1;open.RunCommittedAtUS=7;
+        assert(!mtk_join_eapol_stall(&open));
     }
     ic.ic_join_diag.Active=1;
     {   // Association subtype zero must not count ordinary data or Start.

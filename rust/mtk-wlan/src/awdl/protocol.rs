@@ -114,8 +114,15 @@ pub fn parse_sequence(p: &[u8]) -> Option<Sequence> {
     }
     let used = 6 + count * width;
     // Bound padding separately from TLV framing; never accept nonzero
-    // extension bytes.
-    if n - used > 3 || p[used..].iter().any(|&b| b != 0) {
+    // extension bytes. iOS 26/27 append a 2-byte trailer after the last
+    // channel entry (observed 0x20 0xe4 on iPhone18,2 / iOS 27); only the
+    // remaining legacy padding has to be zero.
+    let tail = n - used;
+    if tail > 3 {
+        return None;
+    }
+    let legacy = tail.saturating_sub(2);
+    if p[used..used + legacy].iter().any(|&b| b != 0) {
         return None;
     }
     let mut s = Sequence {
@@ -1889,9 +1896,16 @@ pub const TX_PID_ACTION: u8 = 127;
 pub const TX_RATES: [u16; 7] = [0x4b, 0x4a, 0x49, 0x4d, 0x48, 0x4c, 0x87];
 pub const TX_RATE_MBPS: [u16; 7] = [6, 12, 24, 36, 48, 54, 65];
 const TX_RATE_OFDM_TOP: usize = 5;
-const TX_PROBE_ACKS: u8 = 32;
-const TX_CLEAN_ACKS: u8 = 128;
-const TX_HOLD: u16 = 256;
+// 1.0.51: with the 1.0.49 counters the ladder sat at 6 Mbps while
+// MTKAWDLTXDataFailed/DataAcked was 277/105621 (0.26%). One loss sets
+// failed=true and needs 128 clean ACKs to clear, then probe_after starts at
+// 256, so a full promotion needs 384 consecutive successes; at a 1-in-385
+// loss rate that almost never happens. Lower the three thresholds so a
+// normal transfer can actually reach HT MCS7 (65 Mbps). A/B: failure rate
+// above 2% or a speed regression means restore 32/128/256.
+const TX_PROBE_ACKS: u8 = 16;
+const TX_CLEAN_ACKS: u8 = 32;
+const TX_HOLD: u16 = 64;
 const TX_STALE_LIMIT: u8 = 128;
 
 #[repr(C)]
@@ -2213,6 +2227,36 @@ pub fn receive_roc_grant(
 mod tests {
     use super::*;
     use std::vec::Vec;
+
+    /// Captured from an iPhone18,2 on iOS 27 (sync TLV kind 4, p[33..], 40
+    /// bytes). iOS 26/27 append a 2-byte trailer (0x20 0xe4) after the 16
+    /// channel entries; rejecting it kept the peer out of `state.peers`, so
+    /// AirDrop stayed on "Waiting…" forever. 1.0.9 returned None here.
+    #[test]
+    fn accepts_ios27_embedded_sequence_trailer() {
+        let s: [u8; 40] = [
+            0x0f, 0x01, 0x00, 0x03, 0xff, 0xff, 0x2b, 0x06, //
+            0x00, 0x00, 0x1d, 0x97, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x06, //
+            0x00, 0x00, 0x1d, 0x97, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xe4, //
+        ];
+        let parsed = parse_sequence(&s).expect("iOS 27 trailer must be tolerated");
+        assert_eq!(parsed.count, 16);
+        assert_eq!(parsed.step, 3);
+        assert_eq!(parsed.channels[0], 6);
+    }
+
+    /// The legacy rule still applies to real garbage past the trailer.
+    #[test]
+    fn rejects_oversized_sequence_padding() {
+        let mut s: [u8; 44] = [0; 44];
+        s[0] = 0x0f;
+        s[3] = 0x03;
+        s[4] = 0xff;
+        s[5] = 0xff;
+        assert!(parse_sequence(&s).is_none());
+    }
 
     fn native_ipv6_frame(size: usize, aggregate: bool) -> (Vec<u8>, Vec<u8>) {
         let (envelope, eth) = qos_llc_frame(size);
@@ -2787,7 +2831,7 @@ mod tests {
     fn unicast_rates_climb_to_ht_and_ignore_isolated_losses() {
         let mut c = TxStatusCounters::default();
         assert_eq!(c.rate(15), 0x4b); // 6 Mbps
-        acks(&mut c, 15, 32 * 6);
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 6);
         assert_eq!(c.rate(15), 0x87); // HT MCS 7
         assert_eq!(c.rate_mbps(0), 65);
         assert_eq!(c.rate(16), 0x4b); // independent peer
@@ -2800,30 +2844,30 @@ mod tests {
             acks(&mut c, 15, 2000);
             assert_eq!(c.rate(15), 0x87);
         }
-        // Two losses within 128 ACKs do.
+        // Two losses inside TX_CLEAN_ACKS do.
         c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
-        acks(&mut c, 15, 100);
+        acks(&mut c, 15, 20); // below TX_CLEAN_ACKS, so the first loss still holds
         c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
         assert_eq!(c.rate(15), 0x4c); // 54 Mbps
-        assert_eq!(c.rates[0].probe_after, 256);
+        assert_eq!(c.rates[0].probe_after, TX_HOLD);
     }
 
     #[test]
     fn unicast_rate_probe_failures_back_off_exponentially() {
         let mut c = TxStatusCounters { ofdm_only: true, ..Default::default() };
-        acks(&mut c, 15, 32 * 4);
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 4);
         assert_eq!(c.rate(15), 0x48); // 48 Mbps
-        acks(&mut c, 15, 32);
+        acks(&mut c, 15, TX_PROBE_ACKS as usize);
         assert_eq!(c.rate(15), 0x4c); // 54: probing
         c.observe(&txs(0x4c, true, 15, TX_PID_UNICAST));
         assert_eq!(c.rate(15), 0x48);
-        assert_eq!(c.rates[0].probe_after, 512);
-        acks(&mut c, 15, 512 + 32);
+        assert_eq!(c.rates[0].probe_after, TX_HOLD << 1);
+        acks(&mut c, 15, (TX_HOLD << 1) as usize + TX_PROBE_ACKS as usize);
         assert_eq!(c.rate(15), 0x4c);
         c.observe(&txs(0x4c, true, 15, TX_PID_UNICAST));
-        assert_eq!(c.rates[0].probe_after, 1024);
+        assert_eq!(c.rates[0].probe_after, TX_HOLD << 2);
         // A confirmed probe resets the backoff.
-        acks(&mut c, 15, 1024 + 32 + 32);
+        acks(&mut c, 15, (TX_HOLD << 2) as usize + TX_PROBE_ACKS as usize * 2);
         assert_eq!(c.rate(15), 0x4c);
         assert_eq!(c.rates[0].backoff, 0);
         // ofdm_only never offers HT.
@@ -2835,7 +2879,7 @@ mod tests {
     #[test]
     fn unicast_rate_ignores_stale_and_foreign_reports() {
         let mut c = TxStatusCounters::default();
-        acks(&mut c, 15, 64);
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 2);
         assert_eq!(c.rate(15), 0x49); // 24 Mbps
         let before = c.rates[0];
         // Late completions at older rates, other frame classes and PPDU
@@ -2857,7 +2901,7 @@ mod tests {
         }
         assert_eq!(c.rate(15), 0x4a);
         // NSS/STBC bits above the mode field still match.
-        acks(&mut c, 15, 256 + 1);
+        acks(&mut c, 15, TX_HOLD as usize + 1);
         assert_eq!(c.rate(15), 0x49); // hold over: probing 24 again
         c.observe(&txs(0x49 | 0x2000, true, 15, TX_PID_UNICAST));
         assert_eq!(c.rate(15), 0x4a);
