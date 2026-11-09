@@ -1034,17 +1034,20 @@ static void awdlScheduleService(IOTimerEventSource *timer)
 // 1.0.50: peer-window gate for AWDL data TX. The peer advertises its own
 // channel sequence; when it is not on our data channel the frame is
 // requeued and MTKAWDLDataTxNotReady grows (68399 vs 105399 submitted on
-// 1.0.49). Mode 1 (default) keeps 1.0.49 behaviour. Mode 2 also accepts a
+// 1.0.49). Mode 1 keeps 1.0.49 behaviour. Mode 2 (default) also accepts a
 // peer whose window starts or ends within +/-amtk_awdl_peer_gate_slack_us
 // (default 8 ms, matching the 10 TU grant tolerance). Mode 0 drops the peer
 // test and sends whenever the local ROC grant is valid (the P3 experiment:
 // it can use gaps the advertisement does not describe, at the cost of ACK
 // failures and rate-ladder steps when the peer really is off channel).
+// 1.0.14: default 2. Mode 0 on hardware (2026-11-10, iPhone16,2): 136 of
+// 420 unicast frames with TX status failed during one AirDrop ask, the
+// QUIC connection reset (NWError 54) and the 296 MB transfer never started.
 static int awdlPeerGateMode()
 {
     static int value=-1;
     if(value<0) {
-        value=1;
+        value=2;
         PE_parse_boot_argn("amtk_awdl_peer_gate",&value,sizeof(value));
         if(value<0) value=0;
         if(value>2) value=2;
@@ -1984,11 +1987,12 @@ void AirportMtkAwdlInterface::serviceInGate()
                           (now>slack && p.channel(now-slack)==channel);
                 }
             }
-        } else if(!(f[4]&1) && awdlPeerGateMode()==0) {
+        } else if(!(f[4]&1) && awdlPeerGateMode()!=1) {
             // 1.0.53: a unicast frame whose destination is not in state.peers
             // (peer<0) never reaches the gate above, so it kept the original
-            // ready=false and was requeued forever (51% of NotReady on
-            // 1.0.52). In gate=0 mode the local grant is the only bound.
+            // ready=false and was requeued until expiry (51% of NotReady on
+            // 1.0.52). Without an advertisement only the local grant bounds
+            // it; strict mode 1 keeps the old behaviour.
             ready=true;
         }
         // Block Ack responses are sent as built; only native MIs are rebuilt.
