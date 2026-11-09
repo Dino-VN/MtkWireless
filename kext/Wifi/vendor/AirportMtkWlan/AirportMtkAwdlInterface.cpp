@@ -21,6 +21,47 @@ static uint64_t awdlNow()
     uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(),&ns); return ns/1000;
 }
 
+void AirportMtkAwdlInterface::invalidateDataRxAdmission()
+{
+    // Live mutations are controller-gate ordered, not callback-excluded: the
+    // gate is recursive and commandSleep releases it. Invalidate BEFORE table,
+    // readiness or identity changes and their native/firmware side effects.
+    // Even authoritative replay REJECTION refreshes lastRx: a nested later RX
+    // must cancel an older allocation, not let it reset the window backwards.
+    if(dataRxAdmissionGeneration)
+        dataRxAdmissionGeneration=dataRxAdmissionGeneration==UINT64_MAX ? 0 : dataRxAdmissionGeneration+1;
+}
+void AirportMtkAwdlInterface::resetDataPeers()
+{
+    invalidateDataRxAdmission(); dataPeers.reset();
+}
+int AirportMtkAwdlInterface::observeDataPeer(const uint8_t *address,uint64_t now)
+{
+    // Refreshes mutate seen too; dead-slot reuse also clears replay (same-MAC
+    // ABA included). Neither kind may survive an outer allocation preflight.
+    invalidateDataRxAdmission(); return dataPeers.observe(address,now);
+}
+bool AirportMtkAwdlInterface::cacheDataPeer(const uint8_t *address,bool value,uint64_t now)
+{
+    invalidateDataRxAdmission(); return dataPeers.setCached(address,value,now);
+}
+bool AirportMtkAwdlInterface::trafficDataPeer(const uint8_t *address,bool value,uint64_t now)
+{
+    invalidateDataRxAdmission(); return dataPeers.setTraffic(address,value,now);
+}
+IOReturn AirportMtkAwdlInterface::programDataPeer(const uint8_t *address,bool value)
+{
+    invalidateDataRxAdmission();
+    if(dataRxPeerProgramming==~0u) { dataRxAdmissionGeneration=0; return kIOReturnNotReady; }
+    // commandSleep can admit another RX on this gate while firmware changes
+    // the station. Do not allocate/commit canonical candidates in that gap.
+    uint8_t peer[6]; memcpy(peer,address,6);
+    ++dataRxPeerProgramming;
+    IOReturn status=hal ? hal->awdlPeer(peer,value) : kIOReturnNotReady;
+    invalidateDataRxAdmission(); --dataRxPeerProgramming;
+    return status;
+}
+
 IOReturn AirportMtkAwdlInterface::reportDataPathEvents(unsigned int message,void *data,unsigned long length,bool sync)
 {
     // MtkWireless: observe cache indications before the superclass handles
@@ -56,6 +97,17 @@ IOReturn AirportMtkAwdlInterface::recordCacheControlResult(IOReturn status,uint6
 
 bool AirportMtkAwdlInterface::start(IOService *provider)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(startGated,this,provider) : kIOReturnNotReady;
+    release(); return status==kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::startGated(OSObject*,void *arg,void *provider,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->startInGate(static_cast<IOService *>(provider)) ?
+        kIOReturnSuccess : kIOReturnError;
+}
+bool AirportMtkAwdlInterface::startInGate(IOService *provider)
+{
     if(!owner || provider!=owner || !hal || stopping || nativeStarted) return false;
     // The superclass publishes during start. BSD must not match until native
     // registration creates its logical-link set and packet queues.
@@ -67,7 +119,7 @@ bool AirportMtkAwdlInterface::start(IOService *provider)
     if(!createDataPath()) { releaseDataPath(); return false; }
     owner->recordAwdlCreation("native-super-start",kIOReturnNotReady);
     if(!super::start(provider)) { releaseDataPath(); return false; }
-    nativeStarted=true;
+    invalidateDataRxAdmission(); nativeStarted=true;
     // The native MAC agent now exists. Its setter calls our setMacAddress
     // callback, then commits the address to the agent and IOMACAddress.
     ether_addr mac;
@@ -109,7 +161,7 @@ bool AirportMtkAwdlInterface::start(IOService *provider)
         owner->recordAwdlCreation("native-register-failed",status);
         stop(provider); return false;
     }
-    nativeRegistered=true;
+    invalidateDataRxAdmission(); nativeRegistered=true;
     setProperty("MTKAWDLConfigured",true);
     setProperty("MTKAWDLConfigStatus",static_cast<uint64_t>(kIOReturnSuccess),32);
     // Controller start marks the object ready before releasing BSD deferral.
@@ -128,6 +180,7 @@ bool AirportMtkAwdlInterface::start(IOService *provider)
 
 bool AirportMtkAwdlInterface::createDataPath()
 {
+    invalidateDataRxAdmission();
     // The native factory has an unbounded IOBSD dependency wait. A nonblocking
     // lookup prevents entering that wait when boot resources are unavailable.
     OSDictionary *matching=IOService::resourceMatching("IOBSD");
@@ -166,16 +219,39 @@ bool AirportMtkAwdlInterface::createDataPath()
 
 void AirportMtkAwdlInterface::releaseDataPath()
 {
+    if(_fCommandGate && _fCommandGate->getWorkLoop())
+        _fCommandGate->runAction(releaseDataPathGated,this);
+    else releaseDataPathInGate(); // unshared partial init/final free only
+}
+IOReturn AirportMtkAwdlInterface::releaseDataPathGated(OSObject*,void *arg,void*,void*,void*)
+{
+    static_cast<AirportMtkAwdlInterface *>(arg)->releaseDataPathInGate();
+    return kIOReturnSuccess;
+}
+void AirportMtkAwdlInterface::releaseDataPathInGate()
+{
+    invalidateDataRxAdmission(); dataPathEnabled=false;
     IOSkywalkPacketQueue *queues[]={txSubmit,txComplete,rxComplete};
-    for(unsigned i=0;i<queuesAdded;++i) queues[i]->disable();
-    // A rejected completion still owns its packet. Pool deallocation completes
-    // the preparation and notifies the submission queue exactly once.
-    for(unsigned i=0;i<completionCount;++i) txPool->deallocatePacket(completions[i]);
-    completionCount=0;
-    while(queuesAdded) owner->getWorkLoop()->removeEventSource(queues[--queuesAdded]);
-    OSSafeReleaseNULL(txSubmit); OSSafeReleaseNULL(txComplete); OSSafeReleaseNULL(rxComplete);
-    OSSafeReleaseNULL(txPool); OSSafeReleaseNULL(rxPool);
-    dataPathEnabled=false;
+    auto txOrigin=txPool, rxOrigin=rxPool;
+    auto workloop=owner ? owner->getWorkLoop() : NULL;
+    if(workloop) workloop->retain();
+    unsigned added=queuesAdded, pending=completionCount;
+    IOSkywalkPacket *batch[128]; memcpy(batch,completions,pending*sizeof(batch[0]));
+    // Detach metadata before disable/completion callbacks. Recursive teardown
+    // must neither release a replacement pool nor consume this batch twice.
+    txSubmit=NULL; txComplete=NULL; rxComplete=NULL; txPool=rxPool=NULL;
+    queuesAdded=completionCount=0;
+    for(unsigned i=0;i<added;++i) queues[i]->disable();
+    // A rejected completion still owns its packet. Use its originating pool.
+    for(unsigned i=0;i<pending;++i) txOrigin->deallocatePacket(batch[i]);
+    while(added && workloop) workloop->removeEventSource(queues[--added]);
+    if(workloop) workloop->release();
+    for(auto q:queues) if(q) q->release();
+    if(txOrigin) txOrigin->release();
+    if(rxOrigin) rxOrigin->release();
+    // RX's pool/queue retains preserve object lifetime only, not private
+    // finalize/stop exclusion. Canonical admission therefore moves only past
+    // allocation, never past prepareWithQueue or enqueuePackets.
 }
 void *AirportMtkAwdlInterface::getTxSubQueue(apple80211_wme_ac) { return txSubmit; }
 void *AirportMtkAwdlInterface::getTxCompQueue() { return txComplete; }
@@ -232,9 +308,20 @@ IOReturn AirportMtkAwdlInterface::prepareBSDInterface(ifnet_t interface,unsigned
 }
 IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(enableGated,this,
+        reinterpret_cast<void *>(uintptr_t(options))) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::enableGated(OSObject*,void *arg,void *options,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->enableInGate(unsigned(uintptr_t(options)));
+}
+IOReturn AirportMtkAwdlInterface::enableInGate(unsigned int options)
+{
     if(stopping || !nativeRegistered || queuesAdded!=3 || !_fCommandGate)
         return kIOReturnNotReady;
-    retain();
+    invalidateDataRxAdmission();
     // Tahoe's Wi-Fi base enable only calls setInterfaceEnable. The native
     // BCM proximity subclass explicitly starts its queues after that call.
     IOReturn status=super::enable(options);
@@ -244,16 +331,27 @@ IOReturn AirportMtkAwdlInterface::enable(unsigned int options)
         if(!dataPathEnabled) status=kIOReturnNotReady;
     } else if(status==kIOReturnSuccess) status=kIOReturnNotReady;
     setProperty("MTKAWDLBSDEnableStatus",static_cast<uint64_t>(status),32);
-    release(); return status;
+    return status;
 }
 IOReturn AirportMtkAwdlInterface::disable(unsigned int options)
 {
     retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(disableGated,this,
+        reinterpret_cast<void *>(uintptr_t(options))) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::disableGated(OSObject*,void *arg,void *options,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->disableInGate(unsigned(uintptr_t(options)));
+}
+IOReturn AirportMtkAwdlInterface::disableInGate(unsigned int options)
+{
+    invalidateDataRxAdmission();
     // Stop submission before the native disable can tear down sync/peers.
     disableDatapath();
     IOReturn status=super::disable(options);
     setProperty("MTKAWDLBSDDisableStatus",static_cast<uint64_t>(status),32);
-    release(); return status;
+    return status;
 }
 IOReturn AirportMtkAwdlInterface::dataPathGated(OSObject*,void *arg,void *enable,void*,void*)
 {
@@ -271,6 +369,7 @@ void AirportMtkAwdlInterface::disableDatapath()
 void AirportMtkAwdlInterface::setDataPathEnabled(bool value)
 {
     if(!nativeRegistered || !queuesAdded || (value && stopping)) return;
+    invalidateDataRxAdmission();
     if(value) {
         dataPathEnabled=true;
         txComplete->enable(); rxComplete->enable(); txSubmit->enable();
@@ -358,42 +457,149 @@ void AirportMtkAwdlInterface::inputNative(const uint8_t *bytes,size_t length)
     // Successful RX enqueue disposes the wrapper and transfers the packet
     // handle to networking. No release/deallocation after that transfer.
 }
-// MtkWireless: decode an accepted AWDL MSDU straight into the Skywalk
-// buffer; no 1514-byte stack frame and no second copy per packet.
-void AirportMtkAwdlInterface::inputNativeView(const mtkawdl::DataView &view)
+AirportMtkAwdlInterface::NativeRxAllocation::NativeRxAllocation(
+    AirportMtkAwdlInterface *object,uint64_t value,const uint8_t *address)
+    : self(object),pool(object->rxPool),queue(object->rxComplete),generation(value)
 {
-    if(!dataPathEnabled || stopping || !rxPool || !rxComplete) return;
+    memcpy(mac,address,6);
+    self->retain();
+    if(pool) pool->retain();
+    if(queue) queue->retain();
+}
+AirportMtkAwdlInterface::NativeRxAllocation::~NativeRxAllocation()
+{
+    // A callback may have detached/replaced rxPool. Cleanup uses the origin,
+    // never the current interface resources. Retains protect object lifetime,
+    // not private native finalize/stop exclusion.
+    if(packet) pool->deallocatePacket(packet);
+    if(queue) queue->release();
+    if(pool) pool->release();
+    self->release();
+}
+int AirportMtkAwdlInterface::NativeRxAllocation::currentPeer(
+    const uint8_t *transmitter,const mtkawdl::DataView &view) const
+{
+    if(!generation || generation!=self->dataRxAdmissionGeneration ||
+       self->dataRxPeerProgramming || self->syncOwner || !self->enabled || self->stopping ||
+       !self->nativeStarted || !self->nativeRegistered || !self->dataPathEnabled ||
+       !pool || !queue || self->rxPool!=pool || self->rxComplete!=queue ||
+       memcmp(mac,self->state.mac,6) || memcmp(transmitter,view.source,6) ||
+       (memcmp(view.destination,mac,6) && !(view.destination[0]&1))) return -1;
+    // Re-find by transmitter at the current clock, not an index/borrow retained
+    // across allocatePacket. Authoritative replay still uses the RX timestamp.
+    return self->dataPeers.find(transmitter,awdlNow());
+}
+
+bool AirportMtkAwdlInterface::admitDataRx(int peer,unsigned stream,const uint8_t *f,
+    const mtkawdl::DataView &view,uint64_t now,uint8_t channel,int8_t rssi)
+{
+    invalidateDataRxAdmission();
+    if(!dataRxAdmissionGeneration) { ++nativeDrops; return false; }
+#ifdef KERNEL
+    uint16_t previous=dataPeers.entries[peer].windows[stream].sequence;
+    uint64_t bitmap=dataPeers.entries[peer].windows[stream].bitmap;
+#else
+    (void)f; (void)channel; (void)rssi;
+#endif
+    // Rejections mutate lastRx too, so EVERY authoritative decision above
+    // invalidates an older nested allocation before touching the Rust table.
+    bool accepted=dataPeers.acceptData(peer,stream,view.sequence,now);
+#ifdef KERNEL
+    uint16_t mask=dataPeers.entries[peer].windows[stream].sequenceBits==12 ? 0xfff : 0xffff;
+    recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted,mask);
+#endif
+    if(accepted) ++dataRxDecoded; else ++dataRxReplay;
+    return accepted;
+}
+
+uint64_t AirportMtkAwdlInterface::inputCanonicalView(const uint8_t *f,
+    const mtkawdl::DataView &view,unsigned stream,uint64_t now,uint8_t channel,int8_t rssi,
+    uint64_t generation,const uint8_t *mac)
+{
+    if(!generation || generation!=dataRxAdmissionGeneration || !enabled || stopping ||
+       memcmp(mac,state.mac,6)) return generation;
+    if(generation==UINT64_MAX) { invalidateDataRxAdmission(); ++nativeDrops; return 0; }
+    int peer=dataPeers.find(f+10,now);
+    if(peer<0 || memcmp(f+10,view.source,6) ||
+       (memcmp(view.destination,mac,6) && !(view.destination[0]&1))) return generation;
+    if(!dataPeers.probeData(peer,stream,view.sequence,now)) {
+        // Genuine replay rejection takes the ordinary path immediately: retain
+        // its lastRx refresh and trace without allocating a native packet.
+        admitDataRx(peer,stream,f,view,now,channel,rssi);
+        return dataRxAdmissionGeneration;
+    }
+    if(dataRxPeerProgramming || syncOwner || !nativeStarted || !nativeRegistered ||
+       !dataPathEnabled || !rxPool || !rxComplete) return generation;
     const size_t length=mtkawdl::dataEthernetLength(view);
-    if(length<54 || length>1514) { ++nativeDrops; return; }
+    if(length<54 || length>1514) { ++nativeDrops; return generation; }
+    NativeRxAllocation allocation(this,generation,mac);
     IOSkywalkPacket *packet=NULL;
-    if(rxPool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) { ++nativeDrops; return; }
+    if(allocation.pool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) {
+        ++nativeDrops; return generation;
+    }
+    // Keep the existing allocation-error policy: ownership of a non-NULL
+    // error return is not established here. Adopt only successful allocations.
+    allocation.packet=packet;
+    peer=allocation.currentPeer(f+10,view);
+    if(peer<0) { ++nativeDrops; return generation; }
+    bool accepted=admitDataRx(peer,stream,f,view,now,channel,rssi);
+    const uint64_t admittedGeneration=dataRxAdmissionGeneration;
+    // Allocation ONLY moved before authoritative accept. Prepare, decode or
+    // enqueue failure intentionally still consumes canonical replay. Never
+    // roll back a snapshot or adopt a callback's newer admission generation.
+    if(accepted) deliverNativeView(allocation,view,length);
+    return admittedGeneration;
+}
+
+// MtkWireless: decode straight into Skywalk; no MTU-sized stack copy. Retain
+// the existing prepare/decode/enqueue order and cleanup policy. Boundary mocks
+// exercise this flow, not the private Skywalk ownership implementation.
+bool AirportMtkAwdlInterface::deliverNativeView(NativeRxAllocation &allocation,
+    const mtkawdl::DataView &view,size_t length)
+{
+    IOSkywalkPacket *packet=allocation.packet;
     if(packet->prepareWithQueue(NULL,2,0)!=kIOReturnSuccess ||
        packet->getPacketBufferCount()!=1 || packet->setDataOffset(0)!=kIOReturnSuccess ||
        packet->setDataLength(static_cast<unsigned>(length))!=kIOReturnSuccess) {
-        rxPool->deallocatePacket(packet); ++nativeDrops; return;
+        ++nativeDrops; return false;
     }
     auto destination=static_cast<uint8_t *>(packet->getDataVirtualAddress());
     if(!destination || mtkawdl::decodeDataView(destination,length,view)!=length) {
-        rxPool->deallocatePacket(packet); ++nativeDrops; return;
+        ++nativeDrops; return false;
     }
-    IOReturn status=rxComplete->enqueuePackets(&packet,1,0);
-    if(status!=kIOReturnSuccess) { rxPool->deallocatePacket(packet); ++nativeDrops; }
-    else ++nativeRx;
+    IOReturn status=allocation.queue->enqueuePackets(&packet,1,0);
+    if(status!=kIOReturnSuccess) { ++nativeDrops; return false; }
+    allocation.packet=NULL; ++nativeRx;
+    return true;
+}
+
+bool AirportMtkAwdlInterface::inputNativeView(const mtkawdl::DataView &view)
+{
+    if(!dataPathEnabled || stopping || !rxPool || !rxComplete || !dataRxAdmissionGeneration) return false;
+    const size_t length=mtkawdl::dataEthernetLength(view);
+    if(length<54 || length>1514) { ++nativeDrops; return false; }
+    NativeRxAllocation allocation(this,dataRxAdmissionGeneration,state.mac);
+    IOSkywalkPacket *packet=NULL;
+    if(allocation.pool->allocatePacket(&packet,1)!=kIOReturnSuccess || !packet) {
+        ++nativeDrops; return false;
+    }
+    allocation.packet=packet; // only successful non-NULL allocations are owned
+    if(allocation.currentPeer(view.source,view)<0) { ++nativeDrops; return false; }
+    return deliverNativeView(allocation,view,length);
 }
 
 bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ether_addr *mac,MtkMwx *transport)
 {
     owner=controller; hal=transport; timer=NULL; bsd=NULL; timerAdded=false;
     stopping=enabled=false; queueHead=queueCount=0; templateLength=0;
-    txStatusLock=IOLockAlloc(); txStatusCount=txStatusDropped=0;
-    if(!txStatusLock) return false;
+    txSession=0;
     // Configuration is tracked by the native peer manager; this backend keeps
     // the firmware context ready once registration succeeds.
     requestedChannel=grantedChannel=0; nextAction=requestDeadline=0;
     bzero(queue,sizeof(queue));
     bzero(trafficPeer,sizeof(trafficPeer)); trafficActive=false;
     bzero(installedTrafficPeer,sizeof(installedTrafficPeer)); trafficPeerInstalled=false;
-    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending));
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending));
     state.init((const uint8_t *)mac,awdlNow());
     state.nativeElectionManaged=true;
     XYLog("AWDL native interface init\n");
@@ -422,8 +628,11 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     for(unsigned i=count;i<16;++i) state.ownSequence.channels[i]=state.ownSequence.channels[i%count];
     state.sequence=state.ownSequence;
     for(unsigned i=0;i<16;++i) {
-        auto &c=channelSequence.seqs[i]; c.channel=state.sequence.channels[i];
-        c.flags=APPLE80211_C_FLAG_20MHZ | (c.channel<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
+        // The packed sequence may place these naturally aligned descriptors at
+        // an unaligned address. Keep access through the packed containing type.
+        channelSequence.seqs[i].channel=state.sequence.channels[i];
+        channelSequence.seqs[i].flags=APPLE80211_C_FLAG_20MHZ |
+            (state.sequence.channels[i]<=14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
     }
     // Native initialization may call configuration getters through our vtable.
     // Skywalk::free dereferences its ivars before testing for NULL. Establish
@@ -454,7 +663,6 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     }
     timerAdded=true;
     hal->awdlSetReceiver(this,receive);
-    hal->awdlSetTxCompletion(this,txStatus);
     receiverRegistered=true;
     return true;
 }
@@ -479,10 +687,10 @@ bool AirportMtkAwdlInterface::isChipInterfaceReady() { return !stopping && hal; 
 
 void AirportMtkAwdlInterface::shutdown()
 {
-    if(_fCommandGate && timerAdded) {
+    if(_fCommandGate && _fCommandGate->getWorkLoop()) {
         _fCommandGate->runAction(shutdownGated,this); return;
     }
-    shutdownGated(this,this,NULL,NULL,NULL);
+    shutdownGated(this,this,NULL,NULL,NULL); // unshared partial init/final free
 }
 IOReturn AirportMtkAwdlInterface::shutdownGated(OSObject*,void *arg,void*,void*,void*)
 {
@@ -492,18 +700,18 @@ IOReturn AirportMtkAwdlInterface::shutdownGated(OSObject*,void *arg,void*,void*,
 void AirportMtkAwdlInterface::shutdownInGate()
 {
     if(stopping) return;
-    stopping=true;
+    invalidateDataRxAdmission(); stopping=true;
     if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
     awTimeline.reset();
     setDataPathEnabled(false);
     if(timer) { timer->cancelTimeout(); timer->disable(); }
     if(hal && receiverRegistered) {
-        hal->awdlSetTxCompletion(NULL,NULL);
+        txSession=0;
         hal->awdlSetReceiver(NULL,NULL); receiverRegistered=false;
         hal->awdlEnable(NULL,false);
     }
     enabled=false;
-    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
     trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
     while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
     if(timerAdded) { owner->getWorkLoop()->removeEventSource(timer); timerAdded=false; }
@@ -511,15 +719,29 @@ void AirportMtkAwdlInterface::shutdownInGate()
 }
 void AirportMtkAwdlInterface::stop(IOService *provider)
 {
-    shutdown();
-    if(nativeStarted) { super::stop(provider); nativeStarted=false; }
-    nativeRegistered=false;
-    releaseDataPath();
+    retain();
+    if(_fCommandGate && _fCommandGate->getWorkLoop())
+        _fCommandGate->runAction(stopGated,this,provider);
+    else stopInGate(provider); // unshared partial init/final teardown
+    release();
+}
+IOReturn AirportMtkAwdlInterface::stopGated(OSObject*,void *arg,void *provider,void*,void*)
+{
+    static_cast<AirportMtkAwdlInterface *>(arg)->stopInGate(static_cast<IOService *>(provider));
+    return kIOReturnSuccess;
+}
+void AirportMtkAwdlInterface::stopInGate(IOService *provider)
+{
+    invalidateDataRxAdmission();
+    shutdownInGate();
+    bool started=nativeStarted;
+    nativeStarted=nativeRegistered=false;
+    if(started) super::stop(provider);
+    releaseDataPathInGate();
 }
 void AirportMtkAwdlInterface::free()
 {
     shutdown(); releaseDataPath(); OSSafeReleaseNULL(timer);
-    if(txStatusLock) { IOLockFree(txStatusLock); txStatusLock=NULL; }
     if(nativeBaseInitialized) super::free();
     else {
         // Never enter IO80211SkywalkInterface::free on an object whose base
@@ -529,15 +751,26 @@ void AirportMtkAwdlInterface::free()
 }
 IOReturn AirportMtkAwdlInterface::setMacAddress(ether_addr &mac)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(macAddressGated,this,&mac) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::macAddressGated(OSObject*,void *arg,void *mac,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->setMacAddressInGate(*static_cast<ether_addr *>(mac));
+}
+IOReturn AirportMtkAwdlInterface::setMacAddressInGate(ether_addr &mac)
+{
     if(stopping) return kIOReturnNotReady;
     if(enabled || syncOwner) return kIOReturnBusy;
     if(!mtkawdl::unicast((uint8_t *)&mac)) return kIOReturnBadArgument;
     auto sequence=state.ownSequence;
+    invalidateDataRxAdmission();
     state.init((uint8_t *)&mac,awdlNow());
     state.nativeElectionManaged=true;
     awTimeline.reset();
     bzero(nativePeerSamples,sizeof(nativePeerSamples));
-    dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
     state.sequence=state.ownSequence=sequence;
     memcpy(syncState.master,&mac,6);
     if(bsd) ifnet_set_lladdr(bsd,state.mac,6);
@@ -548,21 +781,45 @@ IOReturn AirportMtkAwdlInterface::setMacAddress(ether_addr &mac)
 }
 IOReturn AirportMtkAwdlInterface::setInterfaceEnable(bool value)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(interfaceEnableGated,this,
+        reinterpret_cast<void *>(uintptr_t(value))) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::interfaceEnableGated(OSObject*,void *arg,void *value,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->setInterfaceEnableInGate(value!=NULL);
+}
+IOReturn AirportMtkAwdlInterface::setInterfaceEnableInGate(bool value)
+{
     if(stopping) return kIOReturnNotReady;
+    invalidateDataRxAdmission();
     // Native link transitions enable the Apple peer manager; sync is enabled
     // by the peer manager after the AWDL configuration transaction succeeds.
-    retain();
     IOReturn status=super::setInterfaceEnable(value);
     if(status==kIOReturnSuccess && !stopping)
         status=reportLinkStatus(value ? 3 : 1,value ? 0x80 : 0x82);
     if(!value && !stopping) setSync(false);
     setProperty("MTKAWDLInterfaceEnableRequested",value);
     setProperty("MTKAWDLInterfaceEnableStatus",static_cast<uint64_t>(status),32);
-    release(); return status;
+    return status;
 }
 bool AirportMtkAwdlInterface::setLinkState(IO80211LinkState value,unsigned int reason)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(linkStateGated,this,
+        reinterpret_cast<void *>(uintptr_t(value)),reinterpret_cast<void *>(uintptr_t(reason))) : kIOReturnNotReady;
+    release(); return status==kIOReturnSuccess;
+}
+IOReturn AirportMtkAwdlInterface::linkStateGated(OSObject*,void *arg,void *value,void *reason,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->setLinkStateInGate(
+        static_cast<IO80211LinkState>(uintptr_t(value)),unsigned(uintptr_t(reason))) ? kIOReturnSuccess : kIOReturnError;
+}
+bool AirportMtkAwdlInterface::setLinkStateInGate(IO80211LinkState value,unsigned int reason)
+{
     if(stopping) return false;
+    invalidateDataRxAdmission();
     if(value==kIO80211NetworkLinkDown) setSync(false);
     setProperty("MTKAWDLNativeLinkState",static_cast<uint64_t>(value),32);
     return super::setLinkState(value,reason);
@@ -625,7 +882,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
         _fCommandGate->commandSleep(&syncOwner,wake,THREAD_UNINT);
         if(stopping) return kIOReturnNotReady;
     }
-    syncOwner=caller;
+    invalidateDataRxAdmission(); syncOwner=caller;
     setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
     if(!value) {
         enabled=false;
@@ -635,11 +892,14 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     }
     IOReturn status=stopping ? kIOReturnNotReady : hal->awdlEnable(state.mac,value);
     if(stopping) status=kIOReturnNotReady;
+    invalidateDataRxAdmission();
     if(status==kIOReturnSuccess) enabled=value;
+    txSession=enabled ? hal->awdlTxSession() : 0;
     if(!enabled) {
+        drainTxStatus();
         // MtkWireless: the tick that would send PM=0 is canceled below.
         hal->awdlInfraWakeIfIdle();
-        dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false; trafficPeerInstalled=false;
+        resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false; trafficPeerInstalled=false;
         bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         // Firmware commandSleep releases the gate. Submission can queue drop
         // completions during that wait, so drain again before canceling tick.
@@ -657,7 +917,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
     setProperty("MTKAWDLSyncWaits",syncWaits,64);
     setProperty("MTKAWDLSyncFailures",syncFailures,64);
     XYLog("AWDL sync request=%d enabled=%d status=0x%x waits=%llu\n",value,enabled,status,syncWaits);
-    syncOwner=NULL;
+    invalidateDataRxAdmission(); syncOwner=NULL;
     _fCommandGate->commandWakeup(&syncOwner,false);
     return status;
 }
@@ -699,35 +959,23 @@ void AirportMtkAwdlInterface::service()
     retain(); drainTxStatus(); drainCompletions(); serviceInGate(); release();
 }
 
-void AirportMtkAwdlInterface::txStatus(void *context, const uint8_t *address,
-    uint8_t failed, uint16_t wcid, uint16_t sequence, uint8_t pid, uint32_t epoch)
-{
-    auto self=static_cast<AirportMtkAwdlInterface *>(context);
-    if(!self || !address || !self->txStatusLock) return;
-    IOLockLock(self->txStatusLock);
-    if(self->txStatusCount<32) {
-        auto &entry=self->txStatuses[self->txStatusCount++];
-        memcpy(entry.address,address,6); entry.failed=failed; entry.wcid=wcid;
-        entry.sequence=sequence; entry.pid=pid; entry.epoch=epoch;
-    } else ++self->txStatusDropped;
-    IOLockUnlock(self->txStatusLock);
-    if(self->timer) self->timer->setTimeoutMS(1);
-}
-
 void AirportMtkAwdlInterface::drainTxStatus()
 {
-    if(!txStatusLock || !txStatusCount) return;
-    TxStatus batch[32]; unsigned count;
-    IOLockLock(txStatusLock); count=txStatusCount;
-    memcpy(batch,txStatuses,count*sizeof(batch[0])); txStatusCount=0;
-    IOLockUnlock(txStatusLock);
-    for(unsigned i=0;i<count;++i) {
-        uint8_t message[7]; memcpy(message,batch[i].address,6);
-        message[6]=batch[i].failed ? 1 : 0;
+    if(!hal) return;
+    // One at a time, bounded even if a controller message recursively submits.
+    // No HAL lock is held across the native message or its lifecycle callbacks.
+    for(unsigned i=0;i<32;++i) {
+        MtkMwx::AwdlTxResult result={};
+        if(!hal->awdlTakeTxResult(result)) break;
+        if(!enabled || stopping || !txSession || result.session!=txSession ||
+           result.session!=hal->awdlTxSession()) { ++txStatusDiscarded; continue; }
+        uint8_t message[7]; memcpy(message,result.address,6);
+        message[6]=result.failed ? 1 : 0;
         IOReturn status=awdlControllerMessage(owner,this,0x45,message,sizeof(message),true);
         ++txStatusCompletions;
         setProperty("MTKAWDLLastUMICompletionStatus",static_cast<uint64_t>(status),32);
-        setProperty("MTKAWDLLastUMICompletionFailure",static_cast<uint64_t>(batch[i].failed),32);
+        setProperty("MTKAWDLLastUMICompletionFailure",static_cast<uint64_t>(result.failed),32);
+        setProperty("MTKAWDLLastUMICompletionReason",static_cast<uint64_t>(result.reason),32);
         setProperty("MTKAWDLUMICompletions",txStatusCompletions,64);
     }
 }
@@ -849,7 +1097,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLUMIQueued",umiQueued,64);
     setProperty("MTKAWDLUMIStatus",static_cast<uint64_t>(umiStatus),32);
     setProperty("MTKAWDLUMICompletions",txStatusCompletions,64);
-    setProperty("MTKAWDLUMICompletionDropped",static_cast<uint64_t>(txStatusDropped),64);
+    setProperty("MTKAWDLUMICompletionDropped",static_cast<uint64_t>(txStatusDiscarded),64);
     setProperty("MTKAWDLADDBARequests",addbaRequests,64);
     setProperty("MTKAWDLADDBAQueued",addbaQueued,64);
     setProperty("MTKAWDLADDBAAccepted",addbaAccepted,64);
@@ -859,6 +1107,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLADDBADeferred",addbaDeferred,64);
     setProperty("MTKAWDLADDBADropped",addbaDropped,64);
     setProperty("MTKAWDLDELBAReceived",delbaReceived,64);
+    setProperty("MTKAWDLDELBADropped",delbaDropped,64);
     setProperty("MTKAWDLDataTxStatus",static_cast<uint64_t>(dataTxStatus),32);
     unsigned dataPending=0, umiPending=0;
     uint64_t oldestAge=0, nextExpiry=0;
@@ -979,13 +1228,13 @@ void AirportMtkAwdlInterface::serviceInGate()
     // control transaction before opening another AW with the old snapshot.
     if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     ++serviceTicks;
-    // MtkWireless: back on the AP's channel (or AWDL off), say we are awake.
-    hal->awdlInfraWakeIfIdle();
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
+        invalidateDataRxAdmission();
         state.holdClock(0);
         state.discardControls();
-        enabled=false; dataPeers.reset(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+        enabled=false; resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+        hal->awdlInfraWakeIfIdle();
         trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         setProperty("MTKAWDLSyncEnabled",false);
         setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(kIOReturnNotReady),32);
@@ -996,6 +1245,8 @@ void AirportMtkAwdlInterface::serviceInGate()
         while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
         return;
     }
+    // MtkWireless: back on the AP's channel (or AWDL off), say we are awake.
+    hal->awdlInfraWakeIfIdle();
     uint64_t now=awdlNow();
     // Change our sequence only between AWs: the open AW keeps its snapshot.
     if(!awTimeline.open) updatePresence(now);
@@ -1092,14 +1343,14 @@ void AirportMtkAwdlInterface::serviceInGate()
     for(unsigned i=0;i<3;++i) {
         if(mtkawdl::unicast(discoveryTxPeers[i]) && dataPeers.find(discoveryTxPeers[i],now)<0) {
             uint8_t address[6]; memcpy(address,discoveryTxPeers[i],6);
-            IOReturn status=hal->awdlPeer(address,false);
+            IOReturn status=programDataPeer(address,false);
             if(stopping || !enabled) return;
             // Membership can revive while the delete waits for firmware.
             // Keep tracking a restored station so its eventual expiry still
             // releases the WCID; a failed restore can be retried from the queue.
             bool clear=status==kIOReturnSuccess;
             if(clear && dataPeers.find(address,awdlNow())>=0)
-                clear=hal->awdlPeer(address,true)!=kIOReturnSuccess;
+                clear=programDataPeer(address,true)!=kIOReturnSuccess;
             if(stopping || !enabled) return;
             if(clear && !memcmp(discoveryTxPeers[i],address,6))
                 bzero(discoveryTxPeers[i],6);
@@ -1118,15 +1369,15 @@ void AirportMtkAwdlInterface::serviceInGate()
             if(!mtkawdl::unicast(discoveryTxPeers[j])) empty=j;
         }
         if(installed || empty<0) continue;
-        IOReturn status=hal->awdlPeer(address,true);
+        IOReturn status=programDataPeer(address,true);
         if(stopping || !enabled) return;
         if(status==kIOReturnSuccess) {
             memcpy(discoveryTxPeers[empty],address,6);
             if(dataPeers.find(address,awdlNow())<0) {
-                bool clear=hal->awdlPeer(address,false)==kIOReturnSuccess;
+                bool clear=programDataPeer(address,false)==kIOReturnSuccess;
                 if(stopping || !enabled) return;
                 if(clear && dataPeers.find(address,awdlNow())>=0)
-                    clear=hal->awdlPeer(address,true)!=kIOReturnSuccess;
+                    clear=programDataPeer(address,true)!=kIOReturnSuccess;
                 if(stopping || !enabled) return;
                 if(clear && !memcmp(discoveryTxPeers[empty],address,6))
                     bzero(discoveryTxPeers[empty],6);
@@ -1146,7 +1397,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             bool discovery=false;
             for(unsigned i=0;i<3;++i)
                 if(!memcmp(discoveryTxPeers[i],installedTrafficPeer,6)) discovery=true;
-            if(cached || discovery || hal->awdlPeer(installedTrafficPeer,false)==kIOReturnSuccess) {
+            if(cached || discovery || programDataPeer(installedTrafficPeer,false)==kIOReturnSuccess) {
                 trafficPeerInstalled=false;
                 bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
             }
@@ -1154,7 +1405,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     if(trafficActive && !trafficPeerInstalled) {
         int peer=dataPeers.find(trafficPeer,now);
-        if(peer>=0 && hal->awdlPeer(trafficPeer,true)==kIOReturnSuccess) {
+        if(peer>=0 && programDataPeer(trafficPeer,true)==kIOReturnSuccess) {
             memcpy(installedTrafficPeer,trafficPeer,6); trafficPeerInstalled=true;
         }
     }
@@ -1522,7 +1773,19 @@ bool AirportMtkAwdlInterface::bpfScratchReady()
 bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,uint8_t channel,int8_t rssi)
 {
     auto self=static_cast<AirportMtkAwdlInterface *>(context);
-    if(!self || !self->enabled || self->stopping || n<24) return false;
+    if(!self || !f || n<24) return false;
+#ifdef KERNEL
+    // The HAL invokes RX on the controller workloop. Fail closed on any
+    // off-gate entry instead of racing native cache/lifecycle mutations.
+    if(!_fCommandGate || !_fCommandGate->getWorkLoop() ||
+       !_fCommandGate->getWorkLoop()->inGate()) return false;
+    struct ReceiveLifetime {
+        AirportMtkAwdlInterface *object;
+        explicit ReceiveLifetime(AirportMtkAwdlInterface *p):object(p) { object->retain(); }
+        ~ReceiveLifetime() { object->release(); }
+    } lifetime(self);
+#endif
+    if(!self->enabled || self->stopping) return false;
     uint64_t now=awdlNow();
     if(f[0]==0xd0) {
         ++self->actionReceived;
@@ -1544,14 +1807,17 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
                     memcpy(self->addbaPending[slot].request,f,24+9);
                     self->addbaPending[slot].valid=true;
                 }
-            } else if(f[25]==mtkawdl::delba) {
+            } else if(f[25]==mtkawdl::delba && n>=24+6) {
                 ++self->delbaReceived;
+                // Do not pad a truncated DELBA into a valid-looking request.
                 // Firmware teardown waits; the service loop owns it.
+                bool queued=false;
                 for(auto &p:self->addbaPending) if(!p.valid) {
                     bzero(p.request,sizeof(p.request));
                     memcpy(p.request,f,n<sizeof(p.request) ? n : sizeof(p.request));
-                    p.valid=true; break;
+                    p.valid=true; queued=true; break;
                 }
+                if(!queued) ++self->delbaDropped;
             }
             return true;
         }
@@ -1564,7 +1830,7 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
         }
         if(rssi<self->rssiThresholds.peer_rssi_threshold) { ++self->actionRSSIRejected; return true; }
         if(self->state.receiveAction(f,n,now)>=0) {
-            self->dataPeers.observe(f+10,now);
+            self->observeDataPeer(f+10,now);
             ++self->actionHostAccepted;
             self->setProperty("MTKAWDLLastPeer",const_cast<uint8_t *>(f+10),6);
         } else {
@@ -1626,8 +1892,14 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
     // after hardware deaggregation. Non-QoS and each QoS TID have independent
     // sequence domains; a different stream must never advance this window.
     unsigned stream=f[0]==0x88 ? f[24]&15 : 16;
+    uint64_t generation=self->dataRxAdmissionGeneration;
+    uint8_t mac[6]; memcpy(mac,self->state.mac,6);
     size_t at=mtkawdl::dataHeaderLength(f,n);
     while(at<n) {
+        // A previous subframe's native calls can admit newer RX too. Do not
+        // start another old-timestamp probe after that callback invalidation.
+        if(!generation || generation!=self->dataRxAdmissionGeneration ||
+           !self->enabled || self->stopping || memcmp(mac,self->state.mac,6)) break;
         mtkawdl::DataView view={};
         size_t used=mtkawdl::dataView(f,n,at,view);
         if(!used) { ++self->dataRxInvalid; break; }
@@ -1642,30 +1914,16 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
                 if(self->nativeIPv6Tags[i]==nativeTag && now>=self->nativeIPv6TagTimes[i] &&
                    now-self->nativeIPv6TagTimes[i]<3000000) { duplicate=true; break; }
             if(duplicate) { ++self->nativeIPv6Duplicate; continue; }
-            unsigned slot=self->nativeIPv6TagNext++%128;
-            self->nativeIPv6Tags[slot]=nativeTag; self->nativeIPv6TagTimes[slot]=now;
             ++self->nativeIPv6Decoded;
             ++self->dataRxDecoded;
-            self->inputNativeView(view);
+            if(self->inputNativeView(view)) {
+                // A failed allocation/enqueue must leave its radio retry eligible.
+                unsigned slot=self->nativeIPv6TagNext++%128;
+                self->nativeIPv6Tags[slot]=nativeTag; self->nativeIPv6TagTimes[slot]=now;
+            }
             continue;
         }
-#ifdef KERNEL
-        // Metadata is retained in the heap-owned trace and published by the
-        // scheduler once per second, never allocated/published in RX itself.
-        const auto &window=self->dataPeers.entries[peer].windows[stream];
-        uint16_t previous=window.sequence;
-        uint64_t bitmap=window.bitmap;
-#endif
-        bool accepted=self->dataPeers.acceptData(peer,stream,view.sequence,now);
-#ifdef KERNEL
-        self->recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted,
-            window.sequenceBits==12 ? 0xfff : 0xffff);
-#endif
-        if(!accepted) {
-            ++self->dataRxReplay; continue;
-        }
-        ++self->dataRxDecoded;
-        self->inputNativeView(view);
+        generation=self->inputCanonicalView(f,view,stream,now,channel,rssi,generation,mac);
     }
     return true;
 }
@@ -2024,6 +2282,18 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
     __atomic_store_n(&cacheDiagnostic.requestTimeUS,start,__ATOMIC_RELAXED);
     __atomic_store_n(&cacheDiagnostic.requestVersionOp,0,__ATOMIC_RELAXED);
     __atomic_store_n(&cacheDiagnostic.requestAddressTag,0,__ATOMIC_RELAXED);
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(peerCacheGated,this,d,&start) :
+        recordCacheControlResult(kIOReturnNotReady,start);
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::peerCacheGated(OSObject*,void *arg,void *request,void *start,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->setPeerCacheInGate(
+        static_cast<apple80211_peer_cache_control *>(request),*static_cast<uint64_t *>(start));
+}
+IOReturn AirportMtkAwdlInterface::setPeerCacheInGate(apple80211_peer_cache_control *d,uint64_t start)
+{
     if(!d || stopping || !enabled) return recordCacheControlResult(kIOReturnNotReady,start);
     // Tahoe supplies a 0x1d0-byte request. Only the independently verified
     // version/op/address prefix is needed for our raw, unencrypted peer path.
@@ -2037,29 +2307,28 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
     if(operation!=0 && operation!=2 && operation!=6) return recordCacheControlResult(kIOReturnUnsupported,start);
     uint8_t address[6]; memcpy(address,p+8,6);
     if(operation!=2 && !dataPeers.canObserve(address,awdlNow())) return recordCacheControlResult(kIOReturnNoResources,start);
-    retain();
     int member=dataPeers.find(address,awdlNow());
     bool trafficOwns=member>=0 && dataPeers.entries[member].traffic;
     IOReturn status=kIOReturnSuccess;
     if(operation!=2 || !trafficOwns) {
         __atomic_fetch_add(&cacheDiagnostic.firmwareCalls,1,__ATOMIC_RELAXED);
         uint64_t firmwareStart=awdlNow();
-        status=hal->awdlPeer(address,operation!=2);
+        status=programDataPeer(address,operation!=2);
         __atomic_store_n(&cacheDiagnostic.firmwareDurationUS,awdlNow()-firmwareStart,__ATOMIC_RELAXED);
         __atomic_store_n(&cacheDiagnostic.firmwareStatus,status,__ATOMIC_RELAXED);
         if(status!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.firmwareFailures,1,__ATOMIC_RELAXED);
     }
     if(status!=kIOReturnSuccess || stopping || !enabled) {
         if(status==kIOReturnSuccess) status=kIOReturnNotReady;
-        recordCacheControlResult(status,start); release(); return status;
+        return recordCacheControlResult(status,start);
     }
     uint8_t completion[0x1d0]={}; mtkawdl::put32(completion,APPLE80211_VERSION);
-    if(!dataPeers.setCached(address,operation!=2,awdlNow())) {
+    if(!cacheDataPeer(address,operation!=2,awdlNow())) {
         // Firmware waits release the gate; another request may have filled
         // the bounded cache before this one returned. Never acknowledge a
         // native cache add that the receive path cannot authorize.
-        hal->awdlPeer(address,false); recordCacheControlResult(kIOReturnNoResources,start);
-        release(); return kIOReturnNoResources;
+        programDataPeer(address,false);
+        return recordCacheControlResult(kIOReturnNoResources,start);
     }
     if(operation==2 && !trafficOwns) {
         // Firmware station removal invalidates discovery's local tracking too.
@@ -2072,8 +2341,7 @@ IOReturn AirportMtkAwdlInterface::setPEER_CACHE_CONTROL(apple80211_peer_cache_co
     IOReturn postStatus=awdlControllerMessage(owner,this,0x33,completion,sizeof(completion),true);
     __atomic_store_n(&cacheDiagnostic.postStatus,postStatus,__ATOMIC_RELAXED);
     if(postStatus!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.postFailures,1,__ATOMIC_RELAXED);
-    recordCacheControlResult(kIOReturnSuccess,start);
-    release(); return kIOReturnSuccess;
+    return recordCacheControlResult(kIOReturnSuccess,start);
 }
 void AirportMtkAwdlInterface::applySequence(uint64_t now)
 {
@@ -2101,6 +2369,17 @@ void AirportMtkAwdlInterface::updatePresence(uint64_t now)
 }
 IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration *d)
 {
+    retain();
+    IOReturn status=_fCommandGate ? _fCommandGate->runAction(peerTrafficGated,this,d) : kIOReturnNotReady;
+    release(); return status;
+}
+IOReturn AirportMtkAwdlInterface::peerTrafficGated(OSObject*,void *arg,void *request,void*,void*)
+{
+    return static_cast<AirportMtkAwdlInterface *>(arg)->setPeerTrafficInGate(
+        static_cast<apple80211_awdl_peer_traffic_registration *>(request));
+}
+IOReturn AirportMtkAwdlInterface::setPeerTrafficInGate(apple80211_awdl_peer_traffic_registration *d)
+{
     if(!d || d->version>APPLE80211_VERSION || d->active>1 || d->name_len>sizeof(d->name) ||
        (d->active && !mtkawdl::unicast(d->addr))) return kIOReturnBadArgument;
     uint64_t now=awdlNow();
@@ -2112,9 +2391,9 @@ IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_a
     bool hadPrevious=trafficActive;
     if(hadPrevious) memcpy(previousPeer,trafficPeer,6);
     bool changed=hadPrevious && (!d->active || memcmp(previousPeer,d->addr,6));
-    if(changed) dataPeers.setTraffic(previousPeer,false,now);
-    if(d->active && !dataPeers.setTraffic(d->addr,true,now)) {
-        if(changed) dataPeers.setTraffic(previousPeer,true,now);
+    if(changed) trafficDataPeer(previousPeer,false,now);
+    if(d->active && !trafficDataPeer(d->addr,true,now)) {
+        if(changed) trafficDataPeer(previousPeer,true,now);
         return kIOReturnNoResources;
     }
     memcpy(trafficPeer,d->addr,6); trafficActive=d->active;

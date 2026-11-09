@@ -26,6 +26,7 @@ bool mtk_awdl_valid_action_envelope(const uint8_t *f, size_t n);
 bool mtk_awdl_parse_action(const uint8_t *f, size_t n, mtkawdl::Advertisement *out);
 uint8_t mtk_awdl_peer_channel(const mtkawdl::Peer *p, uint64_t now);
 void mtk_awdl_data_peers_reset(mtkawdl::DataPeers *d);
+bool mtk_awdl_data_peers_probe(const mtkawdl::DataPeers *d, size_t index, size_t stream, uint16_t seq, uint64_t now);
 bool mtk_awdl_data_peers_accept(mtkawdl::DataPeers *d, size_t index, size_t stream, uint16_t seq, uint64_t now);
 bool mtk_awdl_data_peers_live(const void *entry, uint64_t now);
 int32_t mtk_awdl_data_peers_find(const mtkawdl::DataPeers *d, const uint8_t *mac, uint64_t now);
@@ -149,6 +150,9 @@ struct DataPeers {
         bool cached, traffic;
     } entries[maxPeers]={};
     void reset() { mtk_awdl_data_peers_reset(this); }
+    // Pure allocation preflight, not a reservation. Authoritative accept is
+    // still required; the Rust implementation copies only one replay window.
+    bool probeData(size_t index,size_t stream,uint16_t seq,uint64_t now) const { return mtk_awdl_data_peers_probe(this,index,stream,seq,now); }
     bool acceptData(size_t index,size_t stream,uint16_t seq,uint64_t now) { return mtk_awdl_data_peers_accept(this,index,stream,seq,now); }
     bool live(const Entry &e,uint64_t now) const { return mtk_awdl_data_peers_live(&e,now); }
     int find(const uint8_t *mac,uint64_t now) const { return mtk_awdl_data_peers_find(this,mac,now); }

@@ -67,6 +67,9 @@ export! {
     fn mtk_awdl_peer_channel(peer: *const Peer, now: u64) -> u8 { peer.as_ref().map_or(0, |x| x.channel(now)) }
 
     fn mtk_awdl_data_peers_reset(d: *mut DataPeers) { if let Some(d) = d.as_mut() { d.reset() } }
+    fn mtk_awdl_data_peers_probe(d: *const DataPeers, index: usize, stream: usize, seq: u16, now: u64) -> bool {
+        d.as_ref().is_some_and(|d| d.probe_data(index, stream, seq, now))
+    }
     fn mtk_awdl_data_peers_accept(d: *mut DataPeers, index: usize, stream: usize, seq: u16, now: u64) -> bool {
         d.as_mut().is_some_and(|d| d.accept_data(index, stream, seq, now))
     }
@@ -360,4 +363,59 @@ pub extern "C" fn mtk_awdl_layout(index: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn mtk_awdl_layout_len() -> usize {
     LAYOUT.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_probe_ffi_null_and_bad_indices_fail_without_mutation() {
+        let mut peers = DataPeers::default();
+        let mac = [2, 1, 2, 3, 4, 5];
+        let index = peers.observe(&mac, 100) as usize;
+        assert!(peers.accept_data(index, 5, 42, 100));
+        let before = peers;
+        unsafe {
+            assert!(!mtk_awdl_data_peers_probe(core::ptr::null(), index, 5, 42, 101));
+            assert!(!mtk_awdl_data_peers_accept(core::ptr::null_mut(), index, 5, 42, 101));
+            for (index, stream) in [(p::MAX_PEERS, 5), (usize::MAX, 5), (0, 17), (0, usize::MAX)] {
+                assert!(!mtk_awdl_data_peers_probe(&peers, index, stream, 43, 101));
+                assert!(!mtk_awdl_data_peers_accept(&mut peers, index, stream, 43, 101));
+            }
+        }
+        assert_eq!(peers, before);
+        assert_eq!(core::mem::size_of::<DataReplayWindow>(), 24);
+    }
+
+    #[test]
+    fn replay_probe_ffi_is_const_and_equivalent_for_all_streams() {
+        let mut peers = DataPeers::default();
+        let mac = [2, 1, 2, 3, 4, 5];
+        assert!(peers.set_cached(&mac, true, 100));
+        let index = peers.find(&mac, 100) as usize;
+        for stream in 0..17 {
+            for (seq, now) in [(0x2ffe, 100), (0x2fff, 101), (0x219e, 102), (0x219e, 103),
+                               (0x219d, 104), (0x2000, 105), (0x3000, 106),
+                               (0x3000, 106 + p::PEER_LIFETIME_US),
+                               (1, 107 + 2 * p::PEER_LIFETIME_US), (0, 1)] {
+                let before = peers;
+                let mut ordinary = peers;
+                let expected = ordinary.accept_data(index, stream, seq, now);
+                unsafe {
+                    assert_eq!(mtk_awdl_data_peers_probe(&peers, index, stream, seq, now), expected);
+                    assert_eq!(mtk_awdl_data_peers_probe(&peers, index, stream, seq, now), expected);
+                }
+                assert_eq!(peers, before);
+                unsafe {
+                    assert_eq!(mtk_awdl_data_peers_accept(&mut peers, index, stream, seq, now), expected);
+                }
+                assert_eq!(peers, ordinary);
+            }
+        }
+        assert!(peers.set_cached(&mac, false, 200));
+        let revoked = peers;
+        unsafe { assert!(!mtk_awdl_data_peers_probe(&peers, index, 5, 1, 200)); }
+        assert_eq!(peers, revoked);
+    }
 }

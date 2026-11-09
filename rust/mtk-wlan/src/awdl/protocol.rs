@@ -383,6 +383,14 @@ pub struct DataReplayWindow {
 }
 
 impl DataReplayWindow {
+    /// Allocation preflight only: copy one small window and reuse the ordinary
+    /// admission math. This neither refreshes last_rx nor reserves a sequence;
+    /// callers must still invoke authoritative accept after revalidation.
+    pub fn probe(&self, seq: u16, now: u64) -> bool {
+        let mut window = *self;
+        window.accept(seq, now)
+    }
+
     pub fn accept(&mut self, seq: u16, now: u64) -> bool {
         if !self.active || now < self.last_rx || now - self.last_rx > PEER_LIFETIME_US {
             self.active = true;
@@ -426,7 +434,6 @@ impl DataReplayWindow {
         self.bitmap |= 1u64 << back;
         true
     }
-
 }
 
 #[repr(C)]
@@ -452,6 +459,14 @@ unsafe impl Zeroable for DataPeers {}
 unsafe impl Zeroable for State {}
 
 impl DataPeers {
+    /// A pure, bounds-checked preflight. Never copy this ~8 KB table onto the
+    /// kernel stack, and never hold an entry/window borrow across native calls.
+    pub fn probe_data(&self, index: usize, stream: usize, seq: u16, now: u64) -> bool {
+        let Some(entry) = self.entries.get(index) else { return false };
+        if !Self::live(entry, now) { return false; }
+        entry.windows.get(stream).is_some_and(|w| w.probe(seq, now))
+    }
+
     pub fn accept_data(&mut self, index: usize, stream: usize, seq: u16, now: u64) -> bool {
         let Some(entry) = self.entries.get_mut(index) else { return false };
         if !Self::live(entry, now) { return false; }
@@ -1458,7 +1473,9 @@ pub fn delba_rx_tid(own: &[u8; 6], f: &[u8]) -> Option<u8> {
         return None;
     }
     let params = le16(f, 26);
-    (params & 0x0800 != 0).then_some((params >> 12) as u8 & 7)
+    // Unsupported wire TIDs must not alias one of our recipient sessions.
+    let tid = (params >> 12) as u8;
+    (params & 0x0800 != 0 && tid <= 7).then_some(tid)
 }
 
 fn build_addba_response(s: &mut State, request: &[u8], f: &mut [u8], status: u16, params: u16) -> usize {
@@ -2459,6 +2476,100 @@ mod tests {
     }
 
     #[test]
+    fn data_replay_probe_is_pure_and_equivalent_at_all_boundaries() {
+        assert_eq!(core::mem::size_of::<DataReplayWindow>(), 24);
+        for domain in 0u16..16 {
+            for low in [0, 1, 63, 64, 0x7ff, 0x800, 0xfc0, 0xffe, 0xfff] {
+                let sequence = domain << 12 | low;
+                for sequence_bits in [0, 12, 16] {
+                    for bitmap in [1, 0x8000_0000_0000_0011, u64::MAX] {
+                        let window = DataReplayWindow {
+                            bitmap, last_rx: 1000, sequence, active: true, sequence_bits,
+                        };
+                        for now in [0, 999, 1000, 1001, 1000 + PEER_LIFETIME_US, 1001 + PEER_LIFETIME_US, u64::MAX] {
+                            for seq in [sequence, sequence.wrapping_add(1), sequence.wrapping_sub(1),
+                                        sequence.wrapping_sub(63), sequence.wrapping_sub(64),
+                                        sequence.wrapping_add(64), sequence.wrapping_add(0x8000),
+                                        domain << 12, domain << 12 | 0xfff, 0xffff] {
+                                let before = window;
+                                let mut ordinary = window;
+                                let expected = ordinary.accept(seq, now);
+                                assert_eq!(window.probe(seq, now), expected);
+                                assert_eq!(window.probe(seq, now), expected); // no reservation
+                                assert_eq!(window, before); // including last_rx/modulus on rejection
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let inactive = DataReplayWindow::default();
+        assert!(inactive.probe(42, 0));
+        assert_eq!(inactive, DataReplayWindow::default());
+    }
+
+    #[test]
+    fn data_peers_probe_checks_bounds_and_liveness_without_table_mutation() {
+        let mac = [2, 1, 2, 3, 4, 5];
+        let mut peers = DataPeers::default();
+        assert!(!peers.probe_data(0, 0, 42, 100)); // unused
+        let index = peers.observe(&mac, 100) as usize;
+        for stream in 0..17 {
+            assert!(peers.accept_data(index, stream, 0x2fff, 100));
+        }
+        for now in [99, 100, 101, 100 + PEER_LIFETIME_US, 101 + PEER_LIFETIME_US] {
+            for stream in 0..18 {
+                for seq in [0x2fff, 0x219e, 0x3000, 0x2000] {
+                    // Table copies are host-test fixtures only. Production probe
+                    // copies just the selected 24-byte window, never DataPeers.
+                    let before = peers;
+                    let mut ordinary = peers;
+                    assert_eq!(peers.probe_data(index, stream, seq, now), ordinary.accept_data(index, stream, seq, now));
+                    assert_eq!(peers, before);
+                }
+            }
+        }
+        let before = peers;
+        for (index, stream) in [(MAX_PEERS, 0), (usize::MAX, 0), (0, 17), (0, usize::MAX)] {
+            assert!(!peers.probe_data(index, stream, 1, 100));
+        }
+        assert_eq!(peers, before);
+        // Cached/traffic membership survives expiry/backward clocks; probe
+        // preserves the ordinary replay epoch-reset policy, without doing it.
+        assert!(peers.set_cached(&mac, true, 100));
+        assert!(peers.probe_data(index, 5, 1, 99));
+        assert!(peers.probe_data(index, 5, 1, 101 + PEER_LIFETIME_US));
+        assert!(peers.set_traffic(&mac, true, 100));
+        assert!(peers.set_cached(&mac, false, 100));
+        assert!(peers.probe_data(index, 5, 1, u64::MAX));
+        assert!(peers.set_traffic(&mac, false, 100));
+        let revoked = peers;
+        assert!(!peers.probe_data(index, 5, 1, 100));
+        assert_eq!(peers, revoked);
+    }
+
+    #[test]
+    fn data_probe_neither_reserves_nor_refreshes_rejected_last_rx() {
+        let mut window = DataReplayWindow::default();
+        assert!(window.probe(42, 100));
+        assert!(window.probe(42, 101));
+        assert!(!window.active);
+        assert!(window.accept(42, 102));
+        let before = window;
+        assert!(!window.probe(42, 103));
+        assert_eq!(window, before);
+        // The caller's ordinary rejection, not probe, refreshes liveness.
+        assert!(!window.accept(42, 104));
+        assert_eq!(window.last_rx, 104);
+        let before = window;
+        assert!(!window.probe(42, 104 + PEER_LIFETIME_US));
+        assert_eq!(window, before);
+        assert!(window.probe(42, 105 + PEER_LIFETIME_US));
+        assert_eq!(window, before);
+        assert!(window.accept(42, 105 + PEER_LIFETIME_US));
+    }
+
+    #[test]
     fn independent_data_streams_and_idle_restart() {
         let mut peers = DataPeers::default();
         let mac = [2, 1, 2, 3, 4, 5];
@@ -2811,16 +2922,36 @@ mod tests {
     }
 
     #[test]
-    fn delba_from_the_originator_names_the_rx_tid() {
+    fn delba_from_the_originator_names_only_supported_rx_tids() {
         let mut s = State::default();
         s.mac = [0x02, 9, 9, 9, 9, 9];
         let mut f = addba(&s, 0, 0);
         f[25] = DELBA;
-        f[26..28].copy_from_slice(&(0x0800u16 | 6 << 12).to_le_bytes());
-        assert_eq!(delba_rx_tid(&s.mac, &f[..30]), Some(6));
-        f[26..28].copy_from_slice(&(6u16 << 12).to_le_bytes()); // recipient
+        for tid in 0u16..16 {
+            for initiator in [0, 0x0800] {
+                f[26..28].copy_from_slice(&(initiator | tid << 12).to_le_bytes());
+                let expected = (initiator != 0 && tid <= 7).then_some(tid as u8);
+                assert_eq!(delba_rx_tid(&s.mac, &f[..30]), expected);
+                for n in 0..30 {
+                    assert_eq!(delba_rx_tid(&s.mac, &f[..n]), None);
+                }
+            }
+            // ADDBA and DELBA must agree on the supported TID range.
+            assert_eq!(addba_request(&s.mac, &addba(&s, 2 | tid << 2, 0)).is_some(), tid <= 7);
+        }
+        // An originator's TID 13 must not tear down its TID 5 session.
+        f[26..28].copy_from_slice(&0xd800u16.to_le_bytes());
         assert_eq!(delba_rx_tid(&s.mac, &f[..30]), None);
-        assert_eq!(delba_rx_tid(&s.mac, &f[..29]), None);
+        f[26..28].copy_from_slice(&0x5800u16.to_le_bytes());
+        assert_eq!(delba_rx_tid(&s.mac, &f[..30]), Some(5));
+        // Retain envelope and direction validation for otherwise valid TIDs.
+        for offset in [0, 4, 10, 16, 24, 25] {
+            let mut invalid = f;
+            invalid[offset] ^= 1;
+            assert_eq!(delba_rx_tid(&s.mac, &invalid[..30]), None);
+        }
+        f[1] = 0x40; // Protected action is not an AWDL Block Ack envelope.
+        assert_eq!(delba_rx_tid(&s.mac, &f[..30]), None);
     }
 
     fn fixture(name: &str) -> Vec<u8> {

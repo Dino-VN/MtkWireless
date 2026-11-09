@@ -521,7 +521,10 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     // a transition network then still joins with the PSK side.
     const uint32_t pskAuth = APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK |
         APPLE80211_AUTHTYPE_SHA256_PSK;
-    bool sae = auth == AirportWCL::LegacyAuth::Sae && (ic->ic_caps & IEEE80211_C_MFP);
+    // Read baseline PMF without restoring a still-pending join's profile.
+    const bool pmfAvailable = (ic->ic_caps & IEEE80211_C_MFP) ||
+        (joinCompatActive && joinCompatClearedMFP);
+    bool sae = auth == AirportWCL::LegacyAuth::Sae && pmfAvailable;
     bool pskSide = personal || (auth == AirportWCL::LegacyAuth::Sae &&
         (join.upperAuth & pskAuth) && AirportWCL::passphraseKey(join));
     if (auth == AirportWCL::LegacyAuth::Sae && !sae && !pskSide)
@@ -580,6 +583,8 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
                 joinPending ? "join pending" : "scan pending");
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
+    // Only an admitted request may restore the prior temporary PHY/PMF state.
+    restoreJoinCompat();
     clearWCLRoam();
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
@@ -710,11 +715,12 @@ IOReturn AirportMtkSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
-    applyJoinCompat();
+    applyJoinCompat(pskSide);
     if (ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         WCL_LOG("join rejected: newstate SCAN failed\n");
         joinPending = false;
         joinTimer->cancelTimeout();
+        restoreJoinCompat();
         ic->ic_wcl_join_requested = false;
         clearWCLPMKSA();
         ic->ic_wcl_enterprise = false;
@@ -749,11 +755,12 @@ void AirportMtkSkywalkInterface::noteJoinFailure(const mtk_join_diag &d)
         joinCompatLevel);
 }
 
-void AirportMtkSkywalkInterface::applyJoinCompat()
+void AirportMtkSkywalkInterface::applyJoinCompat(bool pskJoin)
 {
     ieee80211com *ic = fHalService->get80211Controller();
     restoreJoinCompat();
-    if (!joinCompatEnabled)
+    // A local BSSID or a remembered SSID can also name an open/802.1X AP.
+    if (!joinCompatEnabled || !pskJoin)
         return;
     uint8_t level = 0;
     if (joinCompatSsidLength && joinCompatLevel &&

@@ -386,13 +386,120 @@ struct mwx_vif {
 	uint8_t			scan_seq_num;
 };
 
+// Native UMI containment, not a device-status fence. This BSS history and
+// its lazily installed lock live until module unload, across all instances
+// and reattachments. Never clear it on reset, peer removal, or disable.
+// Reloading the module is NOT established to fence old hardware statuses.
+static uint32_t mwx_awdl_native_issued[3][4096]; // exactly 48 KiB
+static IOLock *mwx_awdl_native_history_lock;
+static uint64_t mwx_awdl_native_session_serial;
+
+static bool mwx_awdl_native_history_init()
+{
+    if (__atomic_load_n(&mwx_awdl_native_history_lock,__ATOMIC_ACQUIRE)) return true;
+    IOLock *lock=IOLockAlloc();
+    if (!lock) return false;
+    IOLock *expected=NULL;
+    if (!__atomic_compare_exchange_n(&mwx_awdl_native_history_lock,&expected,lock,
+                                    false,__ATOMIC_RELEASE,__ATOMIC_ACQUIRE))
+        IOLockFree(lock);
+    // The installed lock is intentionally never freed while this module lives.
+    return true;
+}
+
+static uint64_t mwx_awdl_native_new_session()
+{
+    IOLock *lock=__atomic_load_n(&mwx_awdl_native_history_lock,__ATOMIC_ACQUIRE);
+    if (!lock) return 0;
+    IOLockLock(lock);
+    uint64_t session=0;
+    if (mwx_awdl_native_session_serial!=UINT64_MAX)
+        session=++mwx_awdl_native_session_serial;
+    IOLockUnlock(lock);
+    return session;
+}
+
 struct mwx_awdl_native_tx_pending {
-    bool used;
-    uint8_t address[6];
-    uint16_t wcid;
-    uint16_t sequence;
-    uint8_t pid;
-    uint32_t epoch;
+    enum State : uint8_t { Free, Submitting, Active, Terminal } state;
+    bool submitting;
+    MtkMwx::AwdlTxResult result;
+    uint64_t identity, issuedAt;
+};
+
+// Every table operation requires sc_awdl_lock. The only nested lock is
+// table -> module history; never reverse it. No waits, DMA reclamation,
+// controller messages or callbacks occur here.
+struct mwx_awdl_native_tx_table {
+    mwx_awdl_native_tx_pending entries[32];
+    uint64_t serial, timeouts, canceled, stale, exhausted, backpressure;
+    uint8_t lastReason; // 1 ACK, 2 negative TXS, 3 timeout, 4 cancel,
+                        // 5 tuple exhaustion, 6 full, 7 unavailable, 8 rollback
+    void expire(uint64_t now) {
+        for (auto &p:entries) if (p.state==mwx_awdl_native_tx_pending::Active &&
+            now>=p.issuedAt && now-p.issuedAt>=1000000) {
+            p.state=mwx_awdl_native_tx_pending::Terminal;
+            p.result.failed=1; p.result.reason=lastReason=3; ++timeouts;
+        }
+    }
+    int reserve(const uint8_t *address,uint16_t wcid,uint16_t sequence,
+                uint64_t session,uint64_t now,uint64_t &identity,uint8_t &pid) {
+        expire(now);
+        IOLock *lock=__atomic_load_n(&mwx_awdl_native_history_lock,__ATOMIC_ACQUIRE);
+        if (!lock || !session || wcid<15 || wcid>17 || sequence>=4096 || serial==UINT64_MAX) {
+            lastReason=7; ++exhausted; return -1;
+        }
+        int slot=-1;
+        for (unsigned i=0;i<32;++i) if (entries[i].state==mwx_awdl_native_tx_pending::Free) {
+            slot=static_cast<int>(i); break;
+        }
+        if (slot<0) { lastReason=6; ++backpressure; return -1; }
+        IOLockLock(lock);
+        uint32_t &issued=mwx_awdl_native_issued[wcid-15][sequence];
+        unsigned bit=0;
+        while (bit<32 && (issued&(uint32_t(1)<<bit))) ++bit;
+        if (bit<32) issued|=uint32_t(1)<<bit; // burn even on submission failure
+        IOLockUnlock(lock);
+        if (bit==32) { lastReason=5; ++exhausted; return -1; }
+        auto &p=entries[slot]; p={};
+        p.state=mwx_awdl_native_tx_pending::Submitting; p.submitting=true;
+        p.identity=identity=++serial; p.issuedAt=now;
+        memcpy(p.result.address,address,6);
+        p.result.wcid=wcid; p.result.sequence=sequence;
+        p.result.pid=pid=static_cast<uint8_t>(80+bit); p.result.session=session;
+        return slot;
+    }
+    void finish(unsigned slot,uint64_t identity,bool submitted) {
+        if (slot>=32) return;
+        auto &p=entries[slot];
+        if (p.state==mwx_awdl_native_tx_pending::Free || p.identity!=identity || !p.submitting) return;
+        p.submitting=false;
+        if (!submitted) { p.state=mwx_awdl_native_tx_pending::Free; lastReason=8; }
+        else if (p.state==mwx_awdl_native_tx_pending::Submitting) p.state=mwx_awdl_native_tx_pending::Active;
+    }
+    void match(uint16_t wcid,uint16_t sequence,uint8_t pid,bool failed) {
+        for (auto &p:entries) if ((p.state==mwx_awdl_native_tx_pending::Active ||
+            p.state==mwx_awdl_native_tx_pending::Submitting) &&
+            p.result.wcid==wcid && p.result.sequence==sequence && p.result.pid==pid) {
+            p.state=mwx_awdl_native_tx_pending::Terminal;
+            p.result.failed=failed; p.result.reason=lastReason=failed ? 2 : 1;
+            return;
+        }
+        ++stale;
+    }
+    void cancel(uint16_t wcid=0) {
+        for (auto &p:entries) if (p.state!=mwx_awdl_native_tx_pending::Free &&
+            (!wcid || p.result.wcid==wcid)) {
+            // Caller closes/drains submission first. Cancellation is silent
+            // to obsolete sessions; it is not an ACK or a DMA ownership event.
+            p.state=mwx_awdl_native_tx_pending::Free; ++canceled; lastReason=4;
+        }
+    }
+    bool take(MtkMwx::AwdlTxResult &result) {
+        for (auto &p:entries) if (p.state==mwx_awdl_native_tx_pending::Terminal && !p.submitting) {
+            result=p.result; p.state=mwx_awdl_native_tx_pending::Free; return true;
+        }
+        return false;
+    }
 };
 
 enum mwx_hw_type {
@@ -447,9 +554,8 @@ struct mwx_softc {
     int sc_awdl_tx_errno;
     void *sc_awdl_context;
     MtkMwx::AwdlReceive sc_awdl_receive;
-    void *sc_awdl_tx_context;
-    MtkMwx::AwdlTxCompletion sc_awdl_tx_completion;
-    mwx_awdl_native_tx_pending sc_awdl_native_tx[32];
+    mwx_awdl_native_tx_table sc_awdl_native_tx;
+    uint64_t sc_awdl_native_session;
     struct mbuf *sc_awdl_native_tx_frame;
     uint8_t sc_awdl_native_tx_pid;
     bool sc_awdl_native_tx_override;
@@ -2574,6 +2680,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	}
     sc->sc_awdl_lock = IOLockAlloc();
     if (!sc->sc_awdl_lock) return false;
+    // Failure only disables native UMI identity allocation, never unsafe reuse.
+    (void)mwx_awdl_native_history_init();
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
@@ -2842,6 +2950,8 @@ mwx_reset_task(void *arg)
 
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
+	else
+		mwx_awdl_quiesce(sc);
 
 	if (!fatal && (ifp->if_flags & (IFF_UP | IFF_RUNNING)) == IFF_UP)
 		mwx_init(ifp);
@@ -5478,23 +5588,9 @@ mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 		// Native UMI PIDs are deliberately outside the three long-lived AWDL
 		// PIDs. Only a real MPDU TXS can complete one.
 		if (pid>=80 && pid<112 && ((status>>23)&3)<=1 && sc->sc_awdl_lock) {
-			uint8_t address[6]={}; uint32_t epoch=0; void *context=NULL;
-			MtkMwx::AwdlTxCompletion callback=NULL; bool matched=false;
 			IOLockLock(sc->sc_awdl_lock);
-			for (unsigned i=0;i<32;++i) {
-				auto &pending=sc->sc_awdl_native_tx[i];
-				if (!pending.used || pending.pid!=pid || pending.wcid!=wcid ||
-				    pending.sequence!=sequence) continue;
-				memcpy(address,pending.address,6); epoch=pending.epoch;
-				pending.used=false; matched=true; break;
-			}
-			bool current=matched && epoch==sc->sc_awdl_epoch &&
-				sc->sc_awdl_enabled && !sc->sc_awdl_stopping &&
-				!sc->sc_detaching && !sc->sc_resetting;
-			if (current) { callback=sc->sc_awdl_tx_completion; context=sc->sc_awdl_tx_context; }
+			sc->sc_awdl_native_tx.match(wcid,sequence,pid,(status&0x00070000)!=0);
 			IOLockUnlock(sc->sc_awdl_lock);
-			if (callback && current)
-				callback(context,address,(status&0x00070000)!=0,wcid,sequence,pid,epoch);
 		}
 		return;
 	}
@@ -5899,6 +5995,8 @@ mwx_fullreset_task(void *arg)
 	sc->sc_resetting = 1;
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
+	else
+		mwx_awdl_quiesce(sc);
 	rv = mwx_wfsys_reset(sc);
 	MWX_DEV_LOG(sc, "full reset wfsys rv=%d\n", rv);
 	sc->sc_fw_restart = 1;
@@ -8980,6 +9078,23 @@ mwx_apply_phy_knobs(struct mwx_softc *sc)
 	    ic->ic_modecaps);
 }
 
+/* MtkWireless: transport completion alone does not establish a BA session. */
+static int
+mwx_ba_command(struct mwx_softc *sc, struct mbuf *m)
+{
+	uint32_t status = UINT32_MAX;
+	int rv, seq;
+
+	rv = mwx_mcu_send_mbuf(sc, MCU_UNI_CMD_STA_REC_UPDATE, m, &seq);
+	if (rv != 0)
+		return rv;
+	rv = mwx_mcu_wait_resp_int(sc, MCU_UNI_CMD_STA_REC_UPDATE, seq,
+	    &status);
+	if (rv != 0)
+		return rv;
+	return status == 0 ? 0 : EIO;
+}
+
 /*
  * Tell the firmware about an RX Block Ack agreement, as in
  * mt76_connac_mcu_sta_ba(): a WTBL_BA update followed by STA_REC_BA.
@@ -9022,7 +9137,7 @@ mt7921_mcu_sta_rx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
 	    mn->wcid, tlvnum);
 	if (m == NULL)
 		return ENOBUFS;
-	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	rv = mwx_ba_command(sc, m);
 	if (rv != 0)
 		goto out;
 
@@ -9042,7 +9157,7 @@ mt7921_mcu_sta_rx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
 	    mn->wcid, tlvnum);
 	if (m == NULL)
 		return ENOBUFS;
-	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	rv = mwx_ba_command(sc, m);
 out:
 	MWX_DEV_LOG(sc, "rx ba %s tid=%u ssn=%u winsize=%u rv=%d\n",
 	    enable ? "start" : "stop", tid, enable ? ba->ba_winstart : 0,
@@ -9086,7 +9201,7 @@ mt7921_mcu_sta_tx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
 	    mn->wcid, tlvnum);
 	if (m == NULL)
 		return ENOBUFS;
-	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	rv = mwx_ba_command(sc, m);
 	if (rv != 0)
 		goto out;
 
@@ -9117,7 +9232,7 @@ mt7921_mcu_sta_tx_ba(struct mwx_softc *sc, struct ieee80211_node *ni,
 	    mn->wcid, tlvnum);
 	if (m == NULL)
 		return ENOBUFS;
-	rv = mwx_mcu_send_mbuf_wait(sc, MCU_UNI_CMD_STA_REC_UPDATE, m);
+	rv = mwx_ba_command(sc, m);
 out:
 	MWX_DEV_LOG(sc, "tx ba %s tid=%u ssn=%u winsize=%u rv=%d\n",
 	    enable ? "start" : "stop", tid, ssn, winsize, rv);
@@ -9332,6 +9447,7 @@ static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
     ++sc->sc_awdl_epoch;
     sc->sc_awdl_stopping=true;
     sc->sc_awdl_enabled=false;
+    sc->sc_awdl_native_session=0;
     bool reserved=sc->sc_awdl_roc.pending || sc->sc_awdl_roc.granted;
     if(reserved) {
         sc->sc_awdl_roc_abort_pending=true;
@@ -9349,6 +9465,9 @@ static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
         busy=sc->sc_awdl_busy || (drainCalls && sc->sc_awdl_calls);
         IOLockUnlock(sc->sc_awdl_lock);
     }
+    IOLockLock(sc->sc_awdl_lock);
+    sc->sc_awdl_native_tx.cancel();
+    IOLockUnlock(sc->sc_awdl_lock);
     if (!sc->sc_resetting && !sc->sc_detaching &&
         (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
         mwx_awdl_abort(sc);
@@ -9402,11 +9521,24 @@ void MtkMwx::awdlSetReceiver(void *context, AwdlReceive receiver)
     com->sc_awdl_receive=receiver;
 }
 
-void MtkMwx::awdlSetTxCompletion(void *context, AwdlTxCompletion completion)
+uint64_t MtkMwx::awdlTxSession()
 {
-    if (!com) return;
-    com->sc_awdl_tx_context=context;
-    com->sc_awdl_tx_completion=completion;
+    if (!com || !com->sc_awdl_lock) return 0;
+    IOLockLock(com->sc_awdl_lock);
+    uint64_t session=com->sc_awdl_enabled && !com->sc_awdl_stopping &&
+        !com->sc_resetting && !com->sc_detaching ? com->sc_awdl_native_session : 0;
+    IOLockUnlock(com->sc_awdl_lock);
+    return session;
+}
+
+bool MtkMwx::awdlTakeTxResult(AwdlTxResult &result)
+{
+    if (!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    com->sc_awdl_native_tx.expire(mwx_awdl_now());
+    bool found=com->sc_awdl_native_tx.take(result);
+    IOLockUnlock(com->sc_awdl_lock);
+    return found;
 }
 
 bool MtkMwx::awdlInterfaceReady()
@@ -9834,6 +9966,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     }
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
+    sc->sc_awdl_native_session=mwx_awdl_native_new_session();
     sc->sc_awdl_enabled=true;
     IOLockUnlock(sc->sc_awdl_lock);
     mwxController()->setProperty("MTKAWDLFirmwareStage","enabled");
@@ -10016,7 +10149,24 @@ void MtkMwx::awdlPublishDiagnostics()
     uint64_t abortSubmitted=com->sc_awdl_roc_abort_submitted, abortFailed=com->sc_awdl_roc_abort_failed,
              abortRetryAt=com->sc_awdl_roc_abort_retry_at;
     uint64_t queueDelay=com->sc_awdl_roc_queue_delay_us, maxQueueDelay=com->sc_awdl_roc_max_queue_delay_us;
+    const auto &native=com->sc_awdl_native_tx;
+    uint64_t nativeTimeouts=native.timeouts, nativeCanceled=native.canceled,
+        nativeStale=native.stale, nativeExhausted=native.exhausted,
+        nativeBackpressure=native.backpressure;
+    uint64_t nativeReason=native.lastReason, nativeActive=0, nativeTerminal=0;
+    for(const auto &p:native.entries) {
+        if(p.state==mwx_awdl_native_tx_pending::Terminal) ++nativeTerminal;
+        else if(p.state!=mwx_awdl_native_tx_pending::Free) ++nativeActive;
+    }
     IOLockUnlock(com->sc_awdl_lock);
+    mwxController()->setProperty("MTKAWDLUMIActive",nativeActive,64);
+    mwxController()->setProperty("MTKAWDLUMITerminal",nativeTerminal,64);
+    mwxController()->setProperty("MTKAWDLUMITimeouts",nativeTimeouts,64);
+    mwxController()->setProperty("MTKAWDLUMICanceled",nativeCanceled,64);
+    mwxController()->setProperty("MTKAWDLUMIStaleTXS",nativeStale,64);
+    mwxController()->setProperty("MTKAWDLUMIExhausted",nativeExhausted,64);
+    mwxController()->setProperty("MTKAWDLUMIBackpressure",nativeBackpressure,64);
+    mwxController()->setProperty("MTKAWDLUMILastReason",nativeReason,64);
     // Publish outside the receive lock; called at most once per second.
     uint64_t observed=mwx_awdl_now();
     const char *state=abortPending ? "abort-pending" :
@@ -10181,22 +10331,17 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
         ++com->sc_awdl_tx_copy_failed; return kIOReturnNoMemory;
     }
     const uint8_t *attemptBytes=static_cast<const uint8_t *>(mbuf_data(attempt));
-    bool nativeMI=attemptBytes[0]==0xd0 && !(attemptBytes[4]&1) && attemptBytes[24]==127;
-    int nativeSlot=-1; uint8_t nativePid=0;
+    bool nativeMI=mbuf_len(attempt)>24 && attemptBytes[0]==0xd0 &&
+        !(attemptBytes[4]&1) && attemptBytes[24]==127;
+    int nativeSlot=-1; uint8_t nativePid=0; uint64_t nativeIdentity=0;
     if (nativeMI) {
         if (!com->sc_awdl_lock) { mbuf_freem(attempt); return kIOReturnNotReady; }
+        uint16_t frameSequence=0; memcpy(&frameSequence,attemptBytes+22,2);
         IOLockLock(com->sc_awdl_lock);
-        for (unsigned i=0;i<32;++i) if (!com->sc_awdl_native_tx[i].used) {
-            nativeSlot=static_cast<int>(i); nativePid=static_cast<uint8_t>(80+i);
-            auto &pending=com->sc_awdl_native_tx[i];
-            pending.used=true; memcpy(pending.address,destination,6);
-            pending.wcid=static_cast<uint16_t>(((mwx_node *)node)->wcid);
-            uint16_t frameSequence=0;
-            memcpy(&frameSequence,static_cast<const uint8_t *>(mbuf_data(attempt))+22,2);
-            pending.sequence=static_cast<uint16_t>(le16toh(frameSequence)>>4);
-            pending.pid=nativePid; pending.epoch=operation.epoch;
-            break;
-        }
+        if (com->sc_awdl_epoch==operation.epoch && !com->sc_awdl_stopping)
+            nativeSlot=com->sc_awdl_native_tx.reserve(destination,
+                static_cast<uint16_t>(((mwx_node *)node)->wcid),le16toh(frameSequence)>>4,
+                com->sc_awdl_native_session,mwx_awdl_now(),nativeIdentity,nativePid);
         IOLockUnlock(com->sc_awdl_lock);
         if (nativeSlot<0) { mbuf_freem(attempt); return kIOReturnNoResources; }
     }
@@ -10210,11 +10355,12 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
     com->sc_awdl_native_tx_override=false;
     com->sc_awdl_native_tx_frame=NULL;
     com->sc_awdl_tx_errno=rv;
+    if (nativeSlot>=0) {
+        IOLockLock(com->sc_awdl_lock);
+        com->sc_awdl_native_tx.finish(static_cast<unsigned>(nativeSlot),nativeIdentity,rv==0);
+        IOLockUnlock(com->sc_awdl_lock);
+    }
     if(rv) {
-        if (nativeSlot>=0 && com->sc_awdl_lock) {
-            IOLockLock(com->sc_awdl_lock); com->sc_awdl_native_tx[nativeSlot].used=false;
-            IOLockUnlock(com->sc_awdl_lock);
-        }
         ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources;
     }
     ++com->sc_awdl_tx_submitted;
@@ -10324,6 +10470,8 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
     // infrastructure broadcast retains 19.
     mwx_node &node=com->sc_awdl_peers[index];
     uint16_t wcid=MWX_WTBL_STA+index;
+    // Preserve current-session completions if allocation or firmware removal
+    // fails. Cancellation belongs to the successful peer update below.
     if(add && com->sc_awdl_station_pending[index]) {
         int rv=mwx_awdl_remove_station(com,operation.epoch,index);
         if(!operation.valid()) return kIOReturnAborted;
@@ -10369,6 +10517,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
     if(com->sc_awdl_epoch!=operation.epoch || com->sc_awdl_stopping) {
         IOLockUnlock(com->sc_awdl_lock); return kIOReturnAborted;
     }
+    com->sc_awdl_native_tx.cancel(wcid);
     memset(&node,0,sizeof(node)); node.wcid=wcid;
     com->sc_awdl_tx_status.rates[index]={};
     if(add) memcpy(node.ni.ni_macaddr,address,6);

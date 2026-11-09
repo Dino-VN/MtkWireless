@@ -115,14 +115,50 @@ public:
     IOReturn setAWDL_RTG_PEER_STATS_CONFIG(apple80211_rtg_peer_stats_cfg*) override { return kIOReturnUnsupported; }
     IOReturn getTX_RATE(apple80211_tx_rate*) override { return kIOReturnUnsupported; }
 private:
+    static IOReturn startGated(OSObject*,void*,void*,void*,void*);
+    bool startInGate(IOService*);
+    static IOReturn stopGated(OSObject*,void*,void*,void*,void*);
+    void stopInGate(IOService*);
+    static IOReturn enableGated(OSObject*,void*,void*,void*,void*);
+    IOReturn enableInGate(unsigned int);
+    static IOReturn disableGated(OSObject*,void*,void*,void*,void*);
+    IOReturn disableInGate(unsigned int);
+    static IOReturn interfaceEnableGated(OSObject*,void*,void*,void*,void*);
+    IOReturn setInterfaceEnableInGate(bool);
+    static IOReturn linkStateGated(OSObject*,void*,void*,void*,void*);
+    bool setLinkStateInGate(IO80211LinkState,unsigned int);
     void publishBSDOffloadState(ifnet_t);
     bool createDataPath();
     void releaseDataPath();
+    static IOReturn releaseDataPathGated(OSObject*,void*,void*,void*,void*);
+    void releaseDataPathInGate();
     void drainCompletions();
     void drainTxStatus();
-    static void txStatus(void *, const uint8_t *, uint8_t, uint16_t, uint16_t, uint8_t, uint32_t);
     void inputNative(const uint8_t*,size_t);
-    void inputNativeView(const mtkawdl::DataView&);
+    // True only when Skywalk accepted the packet, not end-to-end delivery.
+    bool inputNativeView(const mtkawdl::DataView&);
+    // Canonical replay gets an allocation-only preflight. Preparation, decode
+    // and enqueue failures still consume replay; this is not a delivery commit.
+    struct NativeRxAllocation {
+        AirportMtkAwdlInterface *self;
+        IOSkywalkPacketBufferPool *pool;
+        IOSkywalkRxCompletionQueue *queue;
+        IOSkywalkPacket *packet=NULL;
+        uint64_t generation;
+        uint8_t mac[6];
+        NativeRxAllocation(AirportMtkAwdlInterface*,uint64_t,const uint8_t*);
+        ~NativeRxAllocation();
+        NativeRxAllocation(const NativeRxAllocation&)=delete;
+        NativeRxAllocation& operator=(const NativeRxAllocation&)=delete;
+        int currentPeer(const uint8_t*,const mtkawdl::DataView&) const;
+    };
+    bool admitDataRx(int,unsigned,const uint8_t*,const mtkawdl::DataView&,
+        uint64_t,uint8_t,int8_t);
+    // Returns only this frame's own admission generation, never one changed
+    // by a native callback. The aggregate cancels if that token is now stale.
+    uint64_t inputCanonicalView(const uint8_t*,const mtkawdl::DataView&,unsigned,
+        uint64_t,uint8_t,int8_t,uint64_t,const uint8_t*);
+    bool deliverNativeView(NativeRxAllocation&,const mtkawdl::DataView&,size_t);
     static unsigned submitNative(OSObject*,IOSkywalkTxSubmissionQueue*,IOSkywalkPacket *const*,unsigned,void*);
     static IOReturn dataPathGated(OSObject*,void*,void*,void*,void*);
     void setDataPathEnabled(bool);
@@ -147,14 +183,8 @@ private:
         uint64_t eventVersionOp=0, eventAddressTag=0, eventStatus=kIOReturnNotReady;
     };
     CacheDiagnostic cacheDiagnostic;
-    struct TxStatus {
-        uint8_t address[6]; uint8_t failed; uint16_t wcid; uint16_t sequence;
-        uint8_t pid; uint32_t epoch;
-    };
-    IOLock *txStatusLock = NULL;
-    TxStatus txStatuses[32] = {};
-    unsigned txStatusCount = 0, txStatusDropped = 0;
-    uint64_t txStatusCompletions = 0;
+    uint64_t txSession = 0;
+    uint64_t txStatusCompletions = 0, txStatusDiscarded = 0;
     void notifyAvailabilityWindowStart(uint8_t,uint64_t);
     void notifyAvailabilityWindowEnd(uint64_t);
     IOReturn setSync(bool);
@@ -242,6 +272,7 @@ private:
     struct AddbaDecline { uint8_t request[24+9]; bool valid; } addbaPending[4] = {};
     uint64_t addbaRequests = 0, addbaQueued = 0, addbaSubmitted = 0, addbaFailed = 0, addbaAccepted = 0;
     uint64_t addbaExpired = 0, addbaDeferred = 0, addbaDropped = 0, delbaReceived = 0;
+    uint64_t delbaDropped = 0;  // Shared pending queue overflow, not firmware failure.
     uint16_t miCounter = 0; bool miCounterValid = false;
     mtkawdl::Timeline awTimeline;
     void finishAvailabilityWindowForDisable();
@@ -263,6 +294,22 @@ private:
     ifnet_t bsd = NULL;
     mtkawdl::State state;
     mtkawdl::DataPeers dataPeers;
+    // Controller-gate metadata (initialization/final free are unshared). Zero
+    // is a permanent fail-closed exhaustion state, never a wrapping ABA token.
+    uint64_t dataRxAdmissionGeneration=1;
+    unsigned dataRxPeerProgramming=0;
+    void invalidateDataRxAdmission();
+    void resetDataPeers();
+    int observeDataPeer(const uint8_t*,uint64_t);
+    bool cacheDataPeer(const uint8_t*,bool,uint64_t);
+    bool trafficDataPeer(const uint8_t*,bool,uint64_t);
+    IOReturn programDataPeer(const uint8_t*,bool);
+    static IOReturn macAddressGated(OSObject*,void*,void*,void*,void*);
+    IOReturn setMacAddressInGate(ether_addr&);
+    static IOReturn peerCacheGated(OSObject*,void*,void*,void*,void*);
+    IOReturn setPeerCacheInGate(apple80211_peer_cache_control*,uint64_t);
+    static IOReturn peerTrafficGated(OSObject*,void*,void*,void*,void*);
+    IOReturn setPeerTrafficInGate(apple80211_awdl_peer_traffic_registration*);
     uint8_t requestedChannel = 0, grantedChannel = 0; uint64_t nextAction = 0, requestDeadline = 0;
     uint8_t syncTemplate[2048]; size_t templateLength = 0;
     // 64 frames is ~15 ms at 54 Mbps; an off-channel AWDL slot lasts

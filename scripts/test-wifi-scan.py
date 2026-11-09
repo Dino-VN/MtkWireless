@@ -24,11 +24,16 @@ completion = wcl[start:wcl.index('        case IEEE80211_EVT_STA_ASSOC_DONE:', s
 start = hal.index('int\nmt7921_mcu_hw_scan(')
 admission = hal[start:hal.index('\n\tm = mwx_mcu_alloc_msg', start)]
 admission += '\n    return 99; /* admitted to firmware submission */\n}\n'
+# Use the production diagnostics layout; scan admission now records AWDL
+# suspension. The unrelated EAPOL helpers need kernel-only clock stubs.
+diagnostics = (vendor / 'mtk80211/openbsd/net80211/mtk_join_diag.h').read_text()
+diagnostics = diagnostics[:diagnostics.index('/* MtkWireless: a failed attempt.')] + '#endif\n'
 code = r'''
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+''' + diagnostics + r'''
 struct mtk_wlan_scan_ssids {uint8_t count=0;uint8_t lengths[10]{};uint8_t ssids[10][32]{};bool wildcard=false;};
 #define AIRPORT_WCL 1
 #define IEEE80211_STA_ONLY 1
@@ -66,6 +71,7 @@ struct ieee80211com : _ifnet {
     unsigned ic_wcl_scan_ssid_length=0, ic_des_esslen=0;
     uint8_t ic_wcl_scan_ssid[32]{}, ic_wcl_scan_channels[32]{};
     mtk_wlan_scan_ssids ic_wcl_scan_targets;
+    mtk_join_diag ic_join_diag{};
     ieee80211_channel ic_channels[197];
     int(*ic_newstate)(ieee80211com*,int,int)=nullptr;
     void(*ic_event_handler)(ieee80211com*,int,void*)=nullptr;
@@ -145,9 +151,12 @@ int main(){
     ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
     assert(d.scanCompleted && !ic.ic_wcl_scan_requested);
     bssSelections=1;
-    // Passive scans clear directed targets inherited from an earlier request.
+    // A leave during a background scan must not leave the next WCL scan
+    // busy. Passive scans also clear inherited directed targets.
     d.scanPending=false;ic.ic_wcl_scan_inflight=false;request.type=2;
+    ic.ic_flags |= IEEE80211_F_BGSCAN;
     assert(d.beginWCLScan(&request)==0 && !ic.ic_wcl_scan_targets.count);
+    assert(!(ic.ic_flags & IEEE80211_F_BGSCAN));
     ieee80211_end_scan(reinterpret_cast<_ifnet*>(&ic));
     request.type=1;
     // Joining keeps candidate selection/retries, even after scan completion.
@@ -163,11 +172,15 @@ int main(){
     // and joins must take the radio and finish instead of timing out.
     mwx_softc sc;sc.sc_ic.ic_state=IEEE80211_S_RUN;sc.sc_ic.ic_softc=&sc;
     assert(mt7921_mcu_hw_scan(&sc,1)==0 && sc.sc_awdl_scan_suspended && !aborts);
+    assert(sc.sc_ic.ic_join_diag.ScanSuspendedAWDL==0); // No active join.
     // A rejected autonomous scan must not tell net80211 it submitted work:
     // otherwise F_BGSCAN blocks every subsequent network-list request.
+    sc.sc_ic.ic_join_diag.Active=1;
     assert(mwx_bgscan(&sc.sc_ic)==EBUSY && !sc.sc_flags && !sc.sc_scan_requests);
+    assert(sc.sc_ic.ic_join_diag.ScanSuspendedAWDL==1);
     sc.sc_ic.ic_wcl_scan_requested=true;
     assert(mt7921_mcu_hw_scan(&sc,1)==99 && !sc.sc_awdl_scan_suspended && aborts==1);
+    assert(sc.sc_ic.ic_join_diag.ScanSuspendedAWDL==1); // Explicit scan wins.
     sc.sc_ic.ic_wcl_scan_requested=false;sc.sc_ic.ic_wcl_join_requested=true;
     // WCL retains join_requested on a successful link; it must not turn
     // every autonomous roam scan into an explicit join request.

@@ -363,10 +363,10 @@ private:
     void resumeWCLJoin();
     IOReturn abortWCLJoin();
     IOReturn leaveWCLNetwork();
-    // MtkWireless: after an EAPOL stall, the next joins to that SSID go
+    // MtkWireless: after an EAPOL stall, the next PSK joins to that SSID go
     // without HE and PMF (amtk_hotspot_compat=0 off).
     void noteJoinFailure(const struct mtk_join_diag &);
-    void applyJoinCompat();
+    void applyJoinCompat(bool pskJoin);
     void restoreJoinCompat();
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);

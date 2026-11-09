@@ -872,9 +872,8 @@ IOReturn AirportMtkWlan::setMulticastList(IOEthernetAddress* addr, UInt32 len)
 IOReturn AirportMtkWlan::getPacketFilters(const OSSymbol *group, UInt32 *filters) const
 {
     IOReturn    rtn = kIOReturnSuccess;
-    if (group == gIOEthernetWakeOnLANFilterGroup && magicPacketSupported)
-        *filters = kIOEthernetWakeOnMagicPacket;
-    else if (group == gIONetworkFilterGroup)
+    // MtkWireless: the base reports zero wake filters; PCI PME is not WoWLAN.
+    if (group == gIONetworkFilterGroup)
         *filters = kIOPacketFilterMulticast | kIOPacketFilterPromiscuous;
     else
         rtn = IOEthernetController::getPacketFilters(group, filters);
@@ -1235,7 +1234,10 @@ IOReturn AirportMtkWlan::setPowerState(unsigned long powerStateOrdinal, IOServic
 
 IOReturn AirportMtkWlan::setWakeOnMagicPacket(bool active)
 {
-    magicPacketEnabled = active;
+    // MtkWireless: no firmware magic-packet wake path is implemented.
+    if (active)
+        return kIOReturnUnsupported;
+    magicPacketEnabled = false;
     return kIOReturnSuccess;
 }
 
