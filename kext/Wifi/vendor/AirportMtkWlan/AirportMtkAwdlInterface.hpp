@@ -226,6 +226,7 @@ private:
     // 1.0.49 diagnostics: distinguish "no ROC grant" from "peer not on this
     // channel". Both currently look like an empty service tick.
     uint64_t dataTxNotReady = 0, dataTxNoGrantTicks = 0;
+    uint64_t dataTxGateUnknown = 0;
     uint64_t amsduFrames = 0, amsduSubframes = 0, amsduBytes = 0, amsduAllocFailed = 0;
     // Stations prepared for discovery unicast before native cache registration.
     uint8_t discoveryTxPeers[3][6] = {};

@@ -876,6 +876,15 @@ void AirportMtkAwdlInterface::finishAvailabilityWindowForDisable()
 // never register (AirDrop stays at "waiting"). Wait for the accelerator to
 // publish its profile instead of racing it, so a fast boot enables early and
 // a slow one still ends up in a working state.
+// True if the peer's advertised schedule names any channel during the next
+// two 16-slot cycles; false when it is stale or invalid (all slots 0).
+static bool peerScheduleKnown(const mtkawdl::Peer &p,uint64_t now)
+{
+    for(unsigned i=0;i<32;++i)
+        if(p.channel(now+uint64_t(i)*16384)) return true;
+    return false;
+}
+
 bool AirportMtkAwdlInterface::awdlSystemReady()
 {
     // The HAL rejects awdlEnable unless the infra link is in RUN, and airportd
@@ -1427,6 +1436,7 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLDataTxDeferred",dataTxDeferred,64);
     setProperty("MTKAWDLDataTxExpired",dataTxExpired,64);
     setProperty("MTKAWDLDataTxNotReady",dataTxNotReady,64);
+    setProperty("MTKAWDLDataTxGateUnknown",dataTxGateUnknown,64);
     setProperty("MTKAWDLDataTxNoGrantTicks",dataTxNoGrantTicks,64);
     // 1.0.49: sample the registered traffic peer's advertised channel. A value
     // other than the data channel at service time explains "peer not ready".
@@ -1981,7 +1991,13 @@ void AirportMtkAwdlInterface::serviceInGate()
                 ready=true;
             } else {
                 ready=p.channel(now)==channel;
-                if(!ready && gate==2) {
+                if(!ready && gate==2 && !peerScheduleKnown(p,now)) {
+                    // 1.0.16: a stale/invalid advertisement makes every slot
+                    // read channel 0; gate 2 then held all unicast until
+                    // expiry (1.0.15 hardware: 0 submitted, NotReady 4736).
+                    // Without a schedule only the local grant bounds it.
+                    ready=true; ++dataTxGateUnknown;
+                } else if(!ready && gate==2) {
                     unsigned slack=awdlPeerGateSlackUS();
                     ready=p.channel(now+slack)==channel ||
                           (now>slack && p.channel(now-slack)==channel);
