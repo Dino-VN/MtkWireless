@@ -6,6 +6,7 @@
 //  Copyright © 2023 钟先耀. All rights reserved.
 //
 #include "AirportMtkWlan.hpp"
+#include "CountryLocale.hpp"
 #include "AirportMtkSkywalkInterface.hpp"
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
@@ -807,7 +808,13 @@ getLOCALE(struct apple80211_locale_data *ld)
     if (!ld)
         return kIOReturnError;
     ld->version = APPLE80211_VERSION;
-    ld->locale  = APPLE80211_LOCALE_FCC;
+    // MtkWireless: follow the effective country code (ETSI in the EU)
+    // instead of always FCC; unknown and unlisted countries stay FCC.
+    apple80211_country_code_data country = {};
+    int locale = APPLE80211_LOCALE_FCC;
+    if (instance && instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)
+        locale = mtkcc::locale(reinterpret_cast<const char *>(country.cc));
+    ld->locale  = static_cast<decltype(ld->locale)>(locale);
     
     return kIOReturnSuccess;
 }

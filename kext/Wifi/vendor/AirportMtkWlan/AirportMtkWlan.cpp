@@ -7,6 +7,7 @@
 //
 
 #include "AirportMtkWlan.hpp"
+#include "CountryLocale.hpp"
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
@@ -1028,8 +1029,20 @@ getCOUNTRY_CODE(OSObject *object,
     cd->version = APPLE80211_VERSION;
     memset(user_override_cc, 0, sizeof(user_override_cc));
     PE_parse_boot_argn("amtk_cc", user_override_cc, 3);
-    /* user_override_cc > firmware_cc > geo_location_cc */
-    strncpy((char*)cd->cc, user_override_cc[0] ? user_override_cc : ((cc_fw[0] == 'Z' && cc_fw[1] == 'Z' && geo_location_cc[0]) ? geo_location_cc : cc_fw), sizeof(cd->cc));
+    /* MtkWireless: user_override_cc > named firmware_cc > geo_location_cc
+     * > firmware_cc. The firmware reports "00" (world), which used to hide
+     * the geolocated country; see CountryLocale.hpp. */
+    mtkcc::Source source = mtkcc::kFirmware;
+    const char *effective = mtkcc::select(user_override_cc, cc_fw, geo_location_cc, &source);
+    strncpy((char*)cd->cc, effective, sizeof(cd->cc));
+    if (memcmp(reported_cc, cd->cc, 2) != 0 || reported_cc_source != source) {
+        memcpy(reported_cc, cd->cc, 2); reported_cc[2] = 0;
+        reported_cc_source = source;
+        setProperty("MTKWiFiCountryCode", reported_cc);
+        setProperty("MTKWiFiCountrySource", source == mtkcc::kOverride ? "boot-arg" :
+                    source == mtkcc::kGeo ? "geolocation" : "firmware");
+        setProperty("MTKWiFiLocale", static_cast<uint64_t>(mtkcc::locale(reported_cc)), 32);
+    }
     return kIOReturnSuccess;
 }
 
@@ -1041,6 +1054,8 @@ setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
     if (data->cc[0] != 'x' && data->cc[0] != 'X' &&
         memcmp(geo_location_cc, data->cc, sizeof(geo_location_cc)) != 0) {
         memcpy(geo_location_cc, data->cc, sizeof(geo_location_cc));
+        char geo[3] = {geo_location_cc[0], geo_location_cc[1], 0};
+        setProperty("MTKWiFiCountryGeo", geo);
         if (fNetIf)
             static_cast<AirportMtkSkywalkInterface *>(fNetIf)->handleWCLEvent(
                 IEEE80211_EVT_COUNTRY_CODE_UPDATE, nullptr);
