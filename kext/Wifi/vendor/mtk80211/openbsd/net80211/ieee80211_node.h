@@ -350,6 +350,8 @@ struct ieee80211_node {
 	u_int8_t		ni_essid[IEEE80211_NWID_LEN];
 	struct ieee80211_rateset ni_rates;	/* negotiated rate set */
 	u_int8_t		*ni_country;	/* country information XXX */
+	/* MtkWireless: 802.11d Country element (two uppercase letters, or 0). */
+	u_int8_t		ni_11d_cc[2];
 	struct ieee80211_channel *ni_chan;
 	u_int8_t		ni_erp;		/* 11g only */
     u_int64_t       ni_age_ts;

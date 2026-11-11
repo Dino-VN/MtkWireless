@@ -1809,6 +1809,8 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
     const u_int8_t *tstamp, *ssid, *rates, *xrates, *edcaie, *wmmie;
     const u_int8_t *rsnie, *wpaie, *htcaps, *htop;
     const uint8_t *csa;
+    const uint8_t *countryie = NULL;
+    u_int8_t country[2];
     const uint8_t *vhtcap;
     const uint8_t *vhtopmode;
     const uint8_t *hecap;
@@ -1918,6 +1920,9 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
                 break;
             case IEEE80211_ELEMID_HTOP:
                 htop = frm;
+                break;
+            case IEEE80211_ELEMID_COUNTRY:
+                countryie = frm;
                 break;
             case IEEE80211_ELEMID_TIM:
                 if (frm[1] > 3) {
@@ -2052,6 +2057,16 @@ ieee80211_recv_probe_resp(struct ieee80211com *ic, mbuf_t m,
         is_new = 0;
     
     ni->ni_chan = &ic->ic_channels[chan];
+    
+    if (ieee80211_11d_country(countryie, country)) {
+        ic->ic_11d_elements++;
+        ieee80211_11d_note(ic->ic_11d_seen, ni->ni_11d_cc, country);
+        if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_state == IEEE80211_S_RUN &&
+            ni->ni_state == IEEE80211_STA_BSS) {
+            ic->ic_11d_bss_cc[0] = country[0];
+            ic->ic_11d_bss_cc[1] = country[1];
+        }
+    }
     
     if (htcaps)
         ieee80211_setup_htcaps(ni, htcaps + 2, htcaps[1]);

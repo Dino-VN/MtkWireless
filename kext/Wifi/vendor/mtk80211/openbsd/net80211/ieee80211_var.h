@@ -78,6 +78,7 @@
 
 #include <sys/kpi_mbuf.h>
 #include <net80211/ieee80211.h>
+#include <net80211/ieee80211_11d.h> /* MtkWireless: 802.11d */
 #include <net80211/ieee80211_crypto.h>
 #include <net80211/ieee80211_ioctl.h>		/* for ieee80211_stats */
 #include <net80211/ieee80211_node.h>
@@ -488,6 +489,12 @@ struct ieee80211com {
      * native Mac sends them: bit 0 device IE (subtype 0x0a, airportd),
      * bit 1 Instant Hotspot IE (subtype 0x0b) with ic_wcl_hotspot_flag. */
     uint8_t ic_wcl_apple_ie;
+    /* MtkWireless: 802.11d. The country the associated AP announces
+     * (0 when not associated) and a count of BSSes per announced country,
+     * filled from beacons/probe responses (ieee80211_recv_probe_resp). */
+    u_int8_t ic_11d_bss_cc[2];
+    struct ieee80211_11d_seen ic_11d_seen[IEEE80211_11D_SLOTS];
+    u_int32_t ic_11d_elements;
     uint8_t ic_wcl_hotspot_flag;
     bool ic_wcl_scan_requested;
     bool ic_wcl_scan_inflight; /* A firmware scan, not just logical SCAN. */

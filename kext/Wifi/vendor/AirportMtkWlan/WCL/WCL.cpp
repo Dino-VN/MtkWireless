@@ -992,6 +992,16 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
         case IEEE80211_EVT_STATE_CHANGED:
             instance->setEAPOLTransport(!wclStopping && ic->ic_wcl_enterprise &&
                                       ic->ic_state == IEEE80211_S_RUN);
+            // MtkWireless: 802.11d of the joined AP (from its scan entry, then
+            // refreshed by its beacons); cleared when not associated.
+            if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss) {
+                ic->ic_11d_bss_cc[0] = ic->ic_bss->ni_11d_cc[0];
+                ic->ic_11d_bss_cc[1] = ic->ic_bss->ni_11d_cc[1];
+            } else if (ic->ic_state != IEEE80211_S_RUN) {
+                ic->ic_11d_bss_cc[0] = ic->ic_11d_bss_cc[1] = 0;
+            }
+            if (instance->countryCodeAnnounceNeeded())
+                deferWCLCountryUpdate();
             break;
         case IEEE80211_EVT_STA_ROAM_START:
             beginWCLRoam(static_cast<const ieee80211_roam_event *>(data));
@@ -1118,6 +1128,8 @@ void AirportMtkSkywalkInterface::handleWCLEvent(int code, void *data)
             break;
         }
         case IEEE80211_EVT_SCAN_DONE:
+            if (instance->countryCodeAnnounceNeeded())
+                deferWCLCountryUpdate();
             if (scanPending) {
                 if (scanSkipCompletion)
                     scanSkipCompletion = false;
