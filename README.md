@@ -103,6 +103,11 @@ experimental rather than a general compatibility guarantee. See the
 [driver registration and RX notes](docs/IPHONE-MIRRORING.md) and
 [Mirra's media documentation](https://github.com/eiyuumiru/Mirra/blob/main/docs/Media.md).
 
+**AWDL coexistence warning:** In current experimental testing, running Mirra
+may disrupt AirDrop and other AWDL-dependent Continuity features. Reliable
+concurrent operation has not yet been verified, and the cause has not been
+isolated to Mirra, MtkWireless or Apple's native services.
+
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 
 ```sh
