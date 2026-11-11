@@ -65,9 +65,43 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 |---|---|---|
 | AirDrop iPhone <-> Mac, iOS 16 -> 27 | ✅ | 1.0.3: faster transfers and large files no longer stall (~4 MB/s average iPhone -> Mac, peaks ~7 MB/s). [Details](docs/AIRDROP-PERFORMANCE.md) |
 | Handoff, Universal Clipboard, AirPlay to Mac | ✅ | |
-| iPhone Mirroring | ❌ | not possible: needs Apple silicon or a T2 chip (Secure Enclave), which this machine does not have |
+| iPhone Mirroring with [Mirra](https://github.com/eiyuumiru/Mirra) | ⚠️ | Experimental on Intel: authentication, decoder creation and first video frame observed on 26.7.2 (25G332). Requires a separate jailbroken bridge iPhone; see below. MtkWireless alone does not supply T2/Secure Enclave support. |
 | Instant Hotspot (same iCloud / Family) | ✅ | 1.0.7+, **macOS 26.7.2 (25G332) only**: the BLE RPA patch exists only for that build. The Mac sends Apple's hotspot IEs in the Association Request, so the iPhone starts the WPA2 handshake. See [diagnosis](docs/INSTANT-HOTSPOT.md). |
 | Auto Unlock, Sidecar, Continuity Camera, Continuity Microphone  | — | |
+
+### iPhone Mirroring with Mirra
+
+MtkWireless can provide the Wi-Fi/Bluetooth and AWDL connectivity used by
+[Mirra](https://github.com/eiyuumiru/Mirra), an experimental companion for
+Apple's iPhone Mirroring on Intel Hackintosh. Mirra supplies separate native
+compatibility and cryptographic-operation adapters; it is not bundled with
+these kexts and does not emulate a complete T2 chip.
+
+Requirements:
+
+- A supported **macOS 26 Tahoe** Wi-Fi build; the tested configuration is
+  **26.7.2 (25G332), x86_64**. Mirra's broader macOS support does not make this
+  Wi-Fi kext compatible with Sequoia.
+- A Wi-Fi build containing the native media IPv6 RX, replay-window rollover
+  and UMI TX-completion fixes in the current source. Older release binaries
+  may lack these changes.
+- Mirra and Apple's compatible iPhone Mirroring app. Follow
+  [Mirra's setup guide](https://github.com/eiyuumiru/Mirra#requirements).
+- A **separate jailbroken bridge iPhone**, iOS 15 or later, with compatible
+  jailbreak, OpenSSH and `ldid`. Mirra connects to the bridge through SSH over
+  Wi-Fi or USB. **The iPhone being mirrored does not need a jailbreak.**
+- Working Wi-Fi, Bluetooth, AWDL and H.264 VideoToolbox decoding. Keep the
+  target iPhone locked and nearby; Apple's account, pairing and authentication
+  requirements still apply. Do not restrict AWDL to the AP channel with
+  `amtk_awdl_offchan=0` when the peer uses another channel.
+
+On the test host, a development Wi-Fi build with Mirra reached successful
+native authentication, H.264 decoder creation (`status=0`), the first received
+video frame, and activated video/audio streams. **Stable video, audible audio,
+input and reconnection are not yet verified end to end**, so this remains
+experimental rather than a general compatibility guarantee. See the
+[driver registration and RX notes](docs/IPHONE-MIRRORING.md) and
+[Mirra's media documentation](https://github.com/eiyuumiru/Mirra/blob/main/docs/Media.md).
 
 After boot, `RustSelfTestFailed = 0` means the Rust kernel runtime works:
 
