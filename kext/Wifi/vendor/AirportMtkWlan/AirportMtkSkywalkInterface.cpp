@@ -807,8 +807,12 @@ getLOCALE(struct apple80211_locale_data *ld)
     if (!ld)
         return kIOReturnError;
     ld->version = APPLE80211_VERSION;
-    ld->locale  = APPLE80211_LOCALE_FCC;
-    
+    // MtkWireless: there is no independently established hardware locale.
+    // Tahoe's native IOC 28 handler calls IO80211InfraInterface::getLOCALE
+    // directly and derives the locale from COUNTRY_CODE (00 -> UNKNOWN).
+    // This legacy method must not invent FCC, nor does changing it bypass that
+    // native mapping. System Information's Location is not a PCI-slot location.
+    ld->locale = APPLE80211_LOCALE_UNKNOWN;
     return kIOReturnSuccess;
 }
 

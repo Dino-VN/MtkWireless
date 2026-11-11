@@ -9,6 +9,7 @@
 //! and an out-of-range read yields 0 instead of panicking.
 
 pub mod advertisers;
+pub mod forward;
 pub mod protocol;
 pub mod timeline;
 

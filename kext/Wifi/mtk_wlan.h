@@ -9,6 +9,7 @@
 #ifndef mtk_wlan_h
 #define mtk_wlan_h
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -50,6 +51,58 @@ int32_t mtk_wlan_patch_parse(const uint8_t *image, size_t len, mtk_wlan_patch_in
 int32_t mtk_wlan_patch_region(const uint8_t *image, size_t len, uint32_t index, mtk_wlan_fw_region *out);
 int32_t mtk_wlan_ram_parse(const uint8_t *image, size_t len, mtk_wlan_ram_info *info);
 int32_t mtk_wlan_ram_region(const uint8_t *image, size_t len, uint32_t index, mtk_wlan_fw_region *out);
+
+/* Optional diagnostic release features; independent of RAM download parsing.
+ * CNM is a firmware offload flag, not proof of simultaneous physical radios.
+ * Return 0 with present=false for absent metadata/feature; EINVAL for malformed
+ * metadata or NULL out. Output is cleared on error. Duplicate feature records
+ * and feature payloads other than the documented 16 bytes are malformed. */
+#define MTK_WLAN_FW_CAP_CNM 0x80
+typedef struct mtk_wlan_fw_features {
+    bool present;
+    uint8_t segment;
+    uint8_t flags;
+} mtk_wlan_fw_features;
+int32_t mtk_wlan_ram_features(const uint8_t *image, size_t len, mtk_wlan_fw_features *out);
+
+/* Raw MT_NIC_CAP_PHY payload, without the TLV header. At least 12 bytes are
+ * required; trailing extension bytes are ignored. Values are neither clamped
+ * nor normalized, and dbdc/hw_path do not prove simultaneous RF capability.
+ * Return EINVAL for malformed input or NULL out; clear output on error. */
+typedef struct mtk_wlan_phy_caps {
+    uint8_t ht;
+    uint8_t vht;
+    uint8_t band_5ghz;
+    uint8_t max_bw;
+    uint8_t nss;
+    uint8_t dbdc;
+    uint8_t tx_ldpc;
+    uint8_t rx_ldpc;
+    uint8_t tx_stbc;
+    uint8_t rx_stbc;
+    uint8_t hw_path;
+    uint8_t he;
+} mtk_wlan_phy_caps;
+int32_t mtk_wlan_phy_caps_parse(const uint8_t *payload, size_t len, mtk_wlan_phy_caps *out);
+#ifdef __cplusplus
+static_assert(sizeof(mtk_wlan_fw_features) == 3, "firmware feature Rust ABI");
+static_assert(offsetof(mtk_wlan_fw_features, present) == 0, "firmware present offset");
+static_assert(offsetof(mtk_wlan_fw_features, segment) == 1, "firmware segment offset");
+static_assert(offsetof(mtk_wlan_fw_features, flags) == 2, "firmware flags offset");
+static_assert(sizeof(mtk_wlan_phy_caps) == 12, "PHY capability Rust ABI");
+static_assert(offsetof(mtk_wlan_phy_caps, ht) == 0, "PHY HT offset");
+static_assert(offsetof(mtk_wlan_phy_caps, vht) == 1, "PHY VHT offset");
+static_assert(offsetof(mtk_wlan_phy_caps, band_5ghz) == 2, "PHY 5 GHz offset");
+static_assert(offsetof(mtk_wlan_phy_caps, max_bw) == 3, "PHY bandwidth offset");
+static_assert(offsetof(mtk_wlan_phy_caps, nss) == 4, "PHY NSS offset");
+static_assert(offsetof(mtk_wlan_phy_caps, dbdc) == 5, "PHY DBDC offset");
+static_assert(offsetof(mtk_wlan_phy_caps, tx_ldpc) == 6, "PHY TX LDPC offset");
+static_assert(offsetof(mtk_wlan_phy_caps, rx_ldpc) == 7, "PHY RX LDPC offset");
+static_assert(offsetof(mtk_wlan_phy_caps, tx_stbc) == 8, "PHY TX STBC offset");
+static_assert(offsetof(mtk_wlan_phy_caps, rx_stbc) == 9, "PHY RX STBC offset");
+static_assert(offsetof(mtk_wlan_phy_caps, hw_path) == 10, "PHY hardware path offset");
+static_assert(offsetof(mtk_wlan_phy_caps, he) == 11, "PHY HE offset");
+#endif
 
 /* Tahoe WCL scan targets, parsed with mtk_common::Reader. */
 #define MTK_WLAN_SCAN_MAX_SSIDS 10
@@ -118,6 +171,20 @@ bool mtk_wlan_rx_classify(const uint8_t *packet, size_t len, uint32_t *kind, uin
                           uint32_t *rxd0);
 /* 8-dword TX status records in a TXS packet of len bytes (from dword 2). */
 size_t mtk_wlan_txs_records(size_t len);
+/* Bounded raw TXS observation. NO token/session/peer-incarnation identity.
+ * rate/errors/sequence are raw decoded fields; format 0/1 is MPDU, 2/3 PPDU.
+ * Keep in sync with connac2::event::TxStatus (44 bytes, 4-byte alignment). */
+typedef struct mtk_wlan_tx_status {
+    uint32_t raw[8];
+    uint32_t errors; /* raw[0] & 0x00070000 */
+    uint16_t rate;   /* raw[0] & 0x3fff, NOT the requested TXD6 rate */
+    uint16_t wcid;
+    uint16_t sequence;
+    uint8_t pid;
+    uint8_t format;
+} mtk_wlan_tx_status;
+/* False clears out. At least 32 bytes are required, trailing bytes ignored. */
+bool mtk_wlan_txs_parse(const uint8_t *record, size_t len, mtk_wlan_tx_status *out);
 
 /* MSDUs released by a TXRX_NOTIFY packet. */
 typedef struct mtk_wlan_tx_free_iter {

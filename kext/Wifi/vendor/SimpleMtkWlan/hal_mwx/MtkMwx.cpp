@@ -31,6 +31,7 @@
 #include "MtkMwx.hpp"
 #include "mtk_wlan.h"
 #include <AWDL/AwdlProtocol.hpp>
+#include <AWDL/AwdlTxTrace.hpp>
 
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -326,7 +327,10 @@ struct mwx_txwi {
 	int				mt_eapol;	/* log TX status */
 	unsigned			mt_join_kind;
 	uint64_t			mt_join_attempt;
+    // MtkWireless: submitting-object-owned diagnostic identity, not TX policy.
+    mtkawdl::HalTxTrace::Token mt_awdl_tx;
 };
+static_assert(MWX_TXWI_MAX<=mtkawdl::HalTxTrace::tokenCapacity,"AWDL TX trace token bound");
 
 struct mwx_txwi_desc {
 	struct mt76_txwi		*mt_desc;
@@ -366,6 +370,12 @@ struct mwx_hw_capa {
 	int8_t		has_6ghz;
 	uint8_t		antenna_mask;
 	uint8_t		num_streams;
+	// MtkWireless: raw observations, never an instruction to enable DBDC/MCC.
+	mtk_wlan_phy_caps phy;
+	bool phy_valid;
+	mtk_wlan_fw_features fw_features;
+	int fw_features_error;
+	bool fw_features_loaded;
 };
 
 struct mwx_node {
@@ -529,6 +539,8 @@ struct mwx_softc {
     // after a failed reply. Keep ownership until a disconnect is acknowledged.
     bool sc_awdl_station_pending[4];
     mtkawdl::Reservation sc_awdl_roc;
+    MtkMwx::AwdlRocTiming sc_awdl_roc_timing;
+    uint64_t sc_awdl_roc_pm_blocked;
     uint64_t sc_awdl_roc_events, sc_awdl_roc_grants, sc_awdl_roc_rejected;
     uint64_t sc_awdl_roc_command_results, sc_awdl_roc_command_failed, sc_awdl_roc_command_malformed;
     uint64_t sc_awdl_roc_command_result_us;
@@ -551,6 +563,9 @@ struct mwx_softc {
     uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
     uint64_t sc_awdl_rx_ba_started, sc_awdl_rx_ba_stopped, sc_awdl_rx_ba_failed;
     mtkawdl::TxStatusCounters sc_awdl_tx_status;
+    // Bounded diagnostic rings and watchdog snapshot, allocated once on attach.
+    // Retained through sync-off/reset; no per-packet allocation.
+    mtkawdl::HalTxTrace *sc_awdl_tx_trace;
     int sc_awdl_tx_errno;
     void *sc_awdl_context;
     MtkMwx::AwdlReceive sc_awdl_receive;
@@ -893,6 +908,14 @@ void	mwx_stop(struct ifnet *);
 static void mwx_awdl_quiesce(struct mwx_softc *, bool drainCalls=true);
 static int mwx_awdl_abort(struct mwx_softc *);
 static bool mwx_awdl_current(struct mwx_softc *, uint32_t);
+static void mwx_awdl_tx_trace_prepare(struct mwx_softc *,struct mwx_txwi *,
+    struct ieee80211_node *,const struct mt76_txwi &,size_t);
+static void mwx_awdl_tx_trace_submit(struct mwx_softc *,struct mwx_txwi *);
+static void mwx_awdl_tx_trace_failed(struct mwx_softc *,struct mwx_txwi *,int);
+static void mwx_awdl_tx_trace_reclaim(struct mwx_softc *,struct mwx_txwi *);
+static void mwx_awdl_tx_trace_complete(struct mwx_softc *,struct mwx_txwi *,const mtk_wlan_tx_freed &);
+static void mwx_awdl_tx_trace_orphan(struct mwx_softc *,const mtk_wlan_tx_freed &);
+static void mwx_awdl_tx_trace_txs(struct mwx_softc *,const uint8_t *,size_t);
 static int mwx_awdl_remove_context(struct mwx_softc *, uint32_t);
 void	mwx_watchdog(struct ifnet *);
 void	mwx_start(struct ifnet *);
@@ -2220,6 +2243,7 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 
 		memset(&tmp, 0, sizeof(tmp));
 		mt7921_mac_write_txwi(sc, m, ni, &tmp);
+        mwx_awdl_tx_trace_prepare(sc,mt,ni,tmp,mbuf_pkthdr_len(m));
 		memcpy(txp, &tmp, sizeof(tmp));
 	}
 
@@ -2240,6 +2264,7 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 	}
 	if (rv != 0) {
 		/* Mapping failed before ownership reached the TXWI. */
+        mwx_awdl_tx_trace_failed(sc,mt,rv);
 		m_freem(m);
 		mwx_txwi_put(sc, mt);
 		return rv;
@@ -2281,6 +2306,7 @@ mwx_tx(struct mwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni,
 	    sc->sc_ic.ic_join_diag.Attempt : 0;
 	rv = mwx_dma_txwi_enqueue(sc, &sc->sc_txq, mt);
 	if (rv != 0) {
+        mwx_awdl_tx_trace_failed(sc,mt,rv);
 		sc->sc_tx_ring_full++;
 		mwx_txwi_put(sc, mt);
 	}
@@ -2691,6 +2717,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	}
     sc->sc_awdl_lock = IOLockAlloc();
     if (!sc->sc_awdl_lock) return false;
+    // A diagnostic allocation failure must never prevent ordinary TX.
+    sc->sc_awdl_tx_trace=static_cast<mtkawdl::HalTxTrace *>(malloc(
+        sizeof(mtkawdl::HalTxTrace),M_DEVBUF,M_NOWAIT|M_ZERO));
     // Failure only disables native UMI identity allocation, never unsafe reuse.
     (void)mwx_awdl_native_history_init();
 	sc->sc_pc = pa->pa_pc;
@@ -3128,6 +3157,7 @@ mwx_txwi_free(struct mwx_softc *sc)
 		int i;
 		for (i = 0; i < q->mt_count; i++) {
 			struct mwx_txwi *mt = &q->mt_data[i];
+            mwx_awdl_tx_trace_reclaim(sc,mt);
 			bus_dmamap_destroy(sc->sc_dmat, mt->mt_map);
 			m_freem(mt->mt_mbuf);
 			if (i >= MT_PACKET_ID_FIRST)
@@ -3164,6 +3194,8 @@ mwx_txwi_get(struct mwx_softc *sc)
 	if (mt == NULL)
 		return NULL;
 	LIST_REMOVE(mt, mt_entry);
+    // Normally already empty; contain a lost diagnostic lifetime on reuse.
+    mwx_awdl_tx_trace_reclaim(sc,mt);
 	mt->mt_busy = 1;
 	if (++sc->sc_txwi.mt_inuse > sc->sc_txwi.mt_peak)
 		sc->sc_txwi.mt_peak = sc->sc_txwi.mt_inuse;
@@ -3173,6 +3205,8 @@ mwx_txwi_get(struct mwx_softc *sc)
 void
 mwx_txwi_put(struct mwx_softc *sc, struct mwx_txwi *mt)
 {
+    // A plain put/reset is unobserved reclaim, never a synthesized TX ACK.
+    mwx_awdl_tx_trace_reclaim(sc,mt);
 	if (mt->mt_busy == 0)
 		return;
 
@@ -3775,6 +3809,9 @@ mwx_dma_txwi_enqueue_locked(struct mwx_softc *sc, struct mwx_queue *q,
 
 	q->mq_prod = idx;
 
+    // Diagnostic timestamp at successful admission, before hardware can free
+    // the token. No fallible step remains; no later return edits this ticket.
+    mwx_awdl_tx_trace_submit(sc,mt);
 	mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
 
 	return 0;
@@ -4344,6 +4381,11 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
     ++sc->sc_awdl_roc_reasons[static_cast<unsigned>(result)];
     if(result==mtkawdl::RocResult::Accepted) {
         ++sc->sc_awdl_roc_grants;
+        auto &timing=sc->sc_awdl_roc_timing;
+        if(timing.session==sc->sc_awdl_native_session && timing.epoch==sc->sc_awdl_epoch &&
+           timing.token==sc->sc_awdl_roc.token && timing.channel==sc->sc_awdl_roc.channel &&
+           timing.issuedAtUS && now>=timing.issuedAtUS)
+            timing.grantAtUS=now;
         if(sc->sc_ic.ic_join_diag.Active) {
             ++sc->sc_ic.ic_join_diag.ROCGrants;
             if(sc->sc_ns_state >= IEEE80211_S_AUTH && !sc->sc_ic.ic_join_diag.PortValidAtUS)
@@ -5001,6 +5043,10 @@ mwx_load_firmware(struct mwx_softc *sc)
 		return 0;
 	}
 	sc->sc_fw_restart = 0;
+	// Do not identify an already-running, unexamined image as the bundled one.
+	memset(&sc->sc_capa.fw_features, 0, sizeof(sc->sc_capa.fw_features));
+	sc->sc_capa.fw_features_error = ENOENT;
+	sc->sc_capa.fw_features_loaded = false;
 
 	switch (sc->sc_hwtype) {
 	case MWX_HW_MT7921:
@@ -5094,6 +5140,10 @@ out:
 	MWX_DEV_LOG(sc, "WM header version=%.10s build=%.15s chip=0x%02x eco=0x%02x regions=%u\n",
 	    rinfo.fw_ver, rinfo.build_date, rinfo.chip_id,
 	    rinfo.eco_code, rinfo.regions);
+	// Optional release metadata is diagnostic only. A malformed/missing feature
+	// record must not change which firmware regions are downloaded or started.
+	sc->sc_capa.fw_features_error = mtk_wlan_ram_features(fwbuf, fwlen,
+	    &sc->sc_capa.fw_features);
 
 	for (i = 0; i < rinfo.regions; i++) {
 		mtk_wlan_fw_region region;
@@ -5144,6 +5194,7 @@ out:
 	}
 
 	MWX_DEV_LOG(sc, "firmware loaded and ready\n");
+	sc->sc_capa.fw_features_loaded = true;
 	rv = 0;
 
 fail:
@@ -5363,23 +5414,11 @@ mt7921_mcu_get_nic_capability(struct mwx_softc *sc)
 		uint32_t	type;
 		uint32_t	len;
 	} __packed *tlv;
-	struct mt76_connac_phy_cap {
-		uint8_t		ht;
-		uint8_t		vht;
-		uint8_t		_5g;
-		uint8_t		max_bw;
-		uint8_t		nss;
-		uint8_t		dbdc;
-		uint8_t		tx_ldpc;
-		uint8_t		rx_ldpc;
-		uint8_t		tx_stbc;
-		uint8_t		rx_stbc;
-		uint8_t		hw_path;
-		uint8_t		he;
-	} __packed *cap;
 	struct mbuf *m;
 	int rv, seq, count, i;
 
+	sc->sc_capa.phy_valid = false;
+	memset(&sc->sc_capa.phy, 0, sizeof(sc->sc_capa.phy));
 	rv = mwx_mcu_send_msg(sc, MCU_CE_CMD_GET_NIC_CAPAB, NULL, 0, &seq);
 	if (rv != 0)
 		return rv;
@@ -5429,17 +5468,19 @@ mt7921_mcu_get_nic_capability(struct mwx_softc *sc)
 			memcpy(sc->sc_lladdr, mtod(m, caddr_t), ETHER_ADDR_LEN);
 			break;
 		case MT_NIC_CAP_PHY:
-			if (len < sizeof(*cap))
+			sc->sc_capa.phy_valid = mtk_wlan_phy_caps_parse(
+			    mtod(m, const uint8_t *), len, &sc->sc_capa.phy) == 0;
+			if (!sc->sc_capa.phy_valid)
 				break;
-			cap = mtod(m, struct mt76_connac_phy_cap *);
 
 			/* MtkWireless: the chip has at most 4 chains; a larger
-			 * value from firmware would overflow the shift. */
-			sc->sc_capa.num_streams = MIN(cap->nss, 4);
+			 * value from firmware would overflow the shift. Keep raw
+			 * NSS/DBDC separately for diagnostics, not radio enablement. */
+			sc->sc_capa.num_streams = MIN(sc->sc_capa.phy.nss, 4);
 			sc->sc_capa.antenna_mask =
 			    (1U << sc->sc_capa.num_streams) - 1;
-			sc->sc_capa.has_2ghz = cap->hw_path & 0x01;
-			sc->sc_capa.has_5ghz = cap->hw_path & 0x02;
+			sc->sc_capa.has_2ghz = sc->sc_capa.phy.hw_path & 0x01;
+			sc->sc_capa.has_5ghz = sc->sc_capa.phy.hw_path & 0x02;
 			break;
 		case MT_NIC_CAP_TX_RESOURCE:
 			/* unused on PCIe devices */
@@ -5603,6 +5644,7 @@ void
 mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 {
 	const uint8_t *raw=reinterpret_cast<const uint8_t *>(txs_data);
+    mwx_awdl_tx_trace_txs(sc,raw,32);
 	const uint64_t awdlDataBefore=sc->sc_awdl_tx_status.dataAcked+
 	    sc->sc_awdl_tx_status.dataFailed;
 	bool awdlStatus=sc->sc_awdl_tx_status.observe(raw,32);
@@ -7421,11 +7463,16 @@ mwx_mac_tx_free(struct mwx_softc *sc, struct mbuf *m)
 
 	mtk_wlan_tx_free_begin(mtod(m, const uint8_t *), mbuf_len(m), &it);
 	while (mtk_wlan_tx_free_next(&it, &freed)) {
-		if (freed.msdu >= sc->sc_txwi.mt_count)
+		if (freed.msdu >= sc->sc_txwi.mt_count) {
+            mwx_awdl_tx_trace_orphan(sc,freed);
 			continue;
+        }
 		mt = &sc->sc_txwi.mt_data[freed.msdu];
-		if (mt->mt_busy == 0)
+		if (mt->mt_busy == 0) {
+            mwx_awdl_tx_trace_orphan(sc,freed);
 			continue;
+        }
+        mwx_awdl_tx_trace_complete(sc,mt,freed);
 		mtk_join_tx_complete(&sc->sc_ic.ic_join_diag, mt->mt_join_attempt,
 		    mt->mt_join_kind, freed.status, freed.count, freed.raw);
 		if (mt->mt_eapol) {
@@ -8780,6 +8827,8 @@ MtkMwx::releaseAll()
 	if (com) {
         mwx_awdl_quiesce(com);
         if (com->sc_awdl_lock) IOLockFree(com->sc_awdl_lock);
+        mwx_free_mem(com->sc_awdl_tx_trace);
+        com->sc_awdl_tx_trace=NULL;
 		mwx_free_mem(com);
 		com = NULL;
 	}
@@ -9441,6 +9490,185 @@ static uint64_t mwx_awdl_now()
     return ns / 1000;
 }
 
+// MtkWireless: all TX diagnostic state (including TXWI sidecars) is protected
+// by sc_awdl_lock. The doorbell/reset hooks can enter with mwx_txq_lock held:
+// the order is TX queue -> AWDL, never the reverse. No diagnostic helper calls
+// DMA, waits, allocates per packet, or changes firmware/native TX feedback.
+static mtkawdl::HalTxTrace::Observer mwx_awdl_tx_trace_observer(mwx_softc *sc,uint16_t wcid)
+{
+    using T=mtkawdl::HalTxTrace;
+    T::Observer o={};
+    o.session=sc->sc_awdl_native_session; o.epoch=sc->sc_awdl_epoch;
+    o.channel=sc->sc_awdl_roc.channel; // last ROC context, NOT measured RF channel
+    if(sc->sc_awdl_enabled) o.flags|=T::Enabled;
+    if(sc->sc_awdl_stopping) o.flags|=T::Stopping;
+    if(sc->sc_resetting) o.flags|=T::Resetting;
+    if(sc->sc_detaching) o.flags|=T::Detaching;
+    if(sc->sc_ic.ic_if.if_flags&IFF_RUNNING) o.flags|=T::Running;
+    if(wcid>=MWX_WTBL_STA && wcid<MWX_WTBL_STA+3) {
+        unsigned i=wcid-MWX_WTBL_STA;
+        if(sc->sc_awdl_peer_used[i]) o.flags|=T::PeerPresent;
+        if(sc->sc_awdl_tx_trace) o.incarnation=sc->sc_awdl_tx_trace->peerIncarnation[i];
+    }
+    return o;
+}
+
+static void mwx_awdl_tx_trace_prepare(mwx_softc *sc,mwx_txwi *mt,
+    ieee80211_node *ni,const mt76_txwi &built,size_t length)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    // Our just-built, fixed-size cached TXWI, not an unchecked hardware buffer
+    // or a second parse of frame payload. Keep requested rate separate from TXS.
+    uint32_t d1=le32toh(built.txwi[1]), d2=le32toh(built.txwi[2]);
+    uint32_t d3=le32toh(built.txwi[3]), d5=le32toh(built.txwi[5]);
+    uint16_t wcid=static_cast<uint16_t>(d1&MT_TXD1_WLAN_IDX_MASK);
+    if(wcid<MWX_WTBL_STA || wcid>=MWX_WTBL_STA+3 ||
+       ni!=&sc->sc_awdl_peers[wcid-MWX_WTBL_STA].ni ||
+       (d5&MT_TXD5_PID)!=mtkawdl::txPidUnicast || (d2&MT_TXD2_MULTICAST) ||
+       (d2&MT_TXD2_FRAME_TYPE_MASK)!=MT_TXD2_FRAME_TYPE(IEEE80211_FC0_TYPE_DATA>>IEEE80211_FC0_TYPE_SHIFT)) return;
+    using T=mtkawdl::HalTxTrace;
+    T::Token candidate={};
+    if(mt->mt_idx>=T::tokenCapacity) {
+        IOLockLock(sc->sc_awdl_lock);
+        sc->sc_awdl_tx_trace->add(sc->sc_awdl_tx_trace->counters.skipped);
+        sc->sc_awdl_tx_trace->faults|=T::MembershipLost;
+        IOLockUnlock(sc->sc_awdl_lock); return;
+    }
+    candidate.token=mt->mt_idx; candidate.wcid=wcid; candidate.pid=mtkawdl::txPidUnicast;
+    if(length<=UINT32_MAX) { candidate.length=static_cast<uint32_t>(length); candidate.flags|=T::LengthKnown; }
+    if(d3&MT_TXD3_SN_VALID) {
+        candidate.sequence=static_cast<uint16_t>((d3&MT_TXD3_SEQ)>>16);
+        candidate.flags|=T::SequenceKnown;
+    }
+    if(d2&MT_TXD2_FIX_RATE) {
+        candidate.requestedRate=static_cast<uint16_t>((le32toh(built.txwi[6])&MT_TXD6_TX_RATE_MASK)>>MT_TXD6_TX_RATE_SHIFT);
+        candidate.flags|=T::RequestedRateKnown;
+    }
+    unsigned channel=ni->ni_chan ? ieee80211_chan2ieee(&sc->sc_ic,ni->ni_chan) : 0;
+    if(channel && channel<=UINT8_MAX) { candidate.channel=channel; candidate.flags|=T::ChannelKnown; }
+    IOLockLock(sc->sc_awdl_lock);
+    const auto o=mwx_awdl_tx_trace_observer(sc,wcid);
+    candidate.session=o.session; candidate.epoch=o.epoch; candidate.incarnation=o.incarnation;
+    if(o.session && o.incarnation && (o.flags&T::PeerPresent)) candidate.flags|=T::ContextKnown;
+    sc->sc_awdl_tx_trace->prepare(mt->mt_awdl_tx,candidate);
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_submit(mwx_softc *sc,mwx_txwi *mt)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    // All traffic shares these tokens. An untraced occupant can leave a stale
+    // TX-free behind too; only successful DMA admission creates this witness.
+    sc->sc_awdl_tx_trace->poolSubmitted(mt->mt_idx);
+    if(mt->mt_awdl_tx.id) sc->sc_awdl_tx_trace->submit(mt->mt_awdl_tx,
+        mwx_awdl_tx_trace_observer(sc,mt->mt_awdl_tx.wcid),mwx_awdl_now());
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_failed(mwx_softc *sc,mwx_txwi *mt,int error)
+{
+    if(!mt->mt_awdl_tx.id || !sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    sc->sc_awdl_tx_trace->failed(mt->mt_awdl_tx,
+        mwx_awdl_tx_trace_observer(sc,mt->mt_awdl_tx.wcid),mwx_awdl_now(),static_cast<uint32_t>(error));
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_reclaim(mwx_softc *sc,mwx_txwi *mt)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) {
+        mt->mt_awdl_tx={}; return;
+    }
+    IOLockLock(sc->sc_awdl_lock);
+    sc->sc_awdl_tx_trace->poolReclaimed(mt->mt_idx);
+    if(mt->mt_awdl_tx.id) sc->sc_awdl_tx_trace->reclaim(mt->mt_awdl_tx,
+        mwx_awdl_tx_trace_observer(sc,mt->mt_awdl_tx.wcid),mwx_awdl_now());
+    else mt->mt_awdl_tx={};
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_complete(mwx_softc *sc,mwx_txwi *mt,const mtk_wlan_tx_freed &f)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    sc->sc_awdl_tx_trace->poolCompleted(mt->mt_idx);
+    if(mt->mt_awdl_tx.id) sc->sc_awdl_tx_trace->complete(mt->mt_awdl_tx,f,
+        mwx_awdl_tx_trace_observer(sc,mt->mt_awdl_tx.wcid),mwx_awdl_now());
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_orphan(mwx_softc *sc,const mtk_wlan_tx_freed &f)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    IOLockLock(sc->sc_awdl_lock);
+    if(f.msdu>=sc->sc_txwi.mt_count) sc->sc_awdl_tx_trace->add(sc->sc_awdl_tx_trace->counters.outOfRangeFree);
+    else sc->sc_awdl_tx_trace->orphanFree(f,mwx_awdl_now());
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_txs(mwx_softc *sc,const uint8_t *data,size_t length)
+{
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    // Reader-based Rust parser; this is observation, never token matching or RA.
+    mtk_wlan_tx_status parsed={};
+    bool valid=mtk_wlan_txs_parse(data,length,&parsed);
+    IOLockLock(sc->sc_awdl_lock);
+    if(valid) sc->sc_awdl_tx_trace->observeTxs(parsed,mwx_awdl_tx_trace_observer(sc,parsed.wcid),mwx_awdl_now());
+    else sc->sc_awdl_tx_trace->add(sc->sc_awdl_tx_trace->counters.txsMalformed);
+    IOLockUnlock(sc->sc_awdl_lock);
+}
+
+static void mwx_awdl_tx_trace_publish(mwx_softc *sc,IOService *controller)
+{
+    using T=mtkawdl::HalTxTrace;
+    controller->setProperty("MTKAWDLTXTraceVersion",uint64_t(1),32);
+    controller->setProperty("MTKAWDLTXTraceAvailable",sc->sc_awdl_tx_trace!=NULL);
+    if(!sc->sc_awdl_tx_trace || !sc->sc_awdl_lock) return;
+    auto &trace=*sc->sc_awdl_tx_trace;
+    IOLockLock(sc->sc_awdl_lock);
+    trace.snapshotBegin(mwx_awdl_tx_trace_observer(sc,0),mwx_awdl_now());
+    if(sc->sc_txwi.mt_count>T::tokenCapacity) trace.faults|=T::SnapshotMismatch;
+    for(unsigned i=0;i<T::tokenCapacity;++i) {
+        if(!sc->sc_txwi.mt_data || i>=sc->sc_txwi.mt_count) {
+            if(trace.live[i]) trace.faults|=T::SnapshotMismatch;
+            continue;
+        }
+        const auto &t=sc->sc_txwi.mt_data[i].mt_awdl_tx;
+        if(trace.live[i]!=t.id || (t.id && t.token!=i)) { trace.faults|=T::SnapshotMismatch; continue; }
+        trace.snapshotToken(t,mwx_awdl_tx_trace_observer(sc,t.wcid));
+    }
+    trace.snapshotEnd();
+    IOLockUnlock(sc->sc_awdl_lock);
+    // Existing controller watchdog/gate serializes publishers. Copies happen
+    // outside all HAL locks, including after native sync canceled its timer.
+    // IOKit's byte-copy overload takes void *, not const void *.
+    auto &p=trace.published; auto &s=p.summary; const auto &c=s.counters;
+    controller->setProperty("MTKAWDLTXTraceCount",s.eventCount,64);
+    controller->setProperty("MTKAWDLTXTraceTXSCount",s.txsCount,64);
+    controller->setProperty("MTKAWDLTXTraceAtUS",s.atUS,64);
+    controller->setProperty("MTKAWDLTXTraceFaults",s.faults,64);
+    controller->setProperty("MTKAWDLTXTraceSummary",&s,sizeof(s));
+    controller->setProperty("MTKAWDLTXTrace",p.events,sizeof(p.events));
+    controller->setProperty("MTKAWDLTXTraceTXS",p.txs,sizeof(p.txs));
+    controller->setProperty("MTKAWDLTXTraceOldest",&p.oldest,sizeof(p.oldest));
+    controller->setProperty("MTKAWDLTXTraceOldestCurrent",&p.oldestCurrent,sizeof(p.oldestCurrent));
+    controller->setProperty("MTKAWDLTXTraceOutstanding",s.outstanding,64);
+    controller->setProperty("MTKAWDLTXTraceCurrentOutstanding",s.currentOutstanding,64);
+    controller->setProperty("MTKAWDLTXTraceAmbiguousOutstanding",s.ambiguousOutstanding,64);
+    controller->setProperty("MTKAWDLTXTraceOldestAgeUS",s.oldestAgeUS,64);
+    controller->setProperty("MTKAWDLTXTraceSubmitted",c.submitted,64);
+    controller->setProperty("MTKAWDLTXTraceAcked",c.freeAcked,64);
+    controller->setProperty("MTKAWDLTXTraceFailed",c.freeFailed,64);
+    controller->setProperty("MTKAWDLTXTraceNotCurrent",c.freeNotCurrent,64);
+    controller->setProperty("MTKAWDLTXTraceUnattributed",c.freeUnattributed,64);
+    controller->setProperty("MTKAWDLTXTraceUnobservedReclaim",c.reclaimUnobserved,64);
+    controller->setProperty("MTKAWDLTXTraceTransmissions",c.transmissions,64);
+    controller->setProperty("MTKAWDLTXTraceRetries",c.retries,64);
+    controller->setProperty("MTKAWDLTXTraceCountUnknown",c.countUnknown,64);
+    controller->setProperty("MTKAWDLTXTraceMaxLatencyUS",c.latencyMaxUS,64);
+}
+
 // Only one operation may own the secondary firmware context. Never hold the
 // lock across MCU waits: replies arrive on the workloop that owns the gate.
 class MwxAwdlCall {
@@ -9520,6 +9748,8 @@ static void mwx_awdl_quiesce(mwx_softc *sc,bool drainCalls)
 {
     if (!sc || !sc->sc_awdl_lock) return;
     IOLockLock(sc->sc_awdl_lock);
+    if(sc->sc_awdl_tx_trace) sc->sc_awdl_tx_trace->contextEnded(
+        sc->sc_awdl_native_session,sc->sc_awdl_epoch,mwx_awdl_now());
     ++sc->sc_awdl_epoch;
     sc->sc_awdl_stopping=true;
     sc->sc_awdl_enabled=false;
@@ -9878,7 +10108,12 @@ static int mwx_awdl_remove_station(mwx_softc *sc,uint32_t epoch,unsigned index)
     if(sc->sc_awdl_epoch!=epoch) return ECANCELED;
     if(rv || status) return rv ? rv : EIO;
     sc->sc_awdl_station_pending[index]=false;
-    if(index<3) sc->sc_awdl_peer_used[index]=false;
+    if(index<3) {
+        sc->sc_awdl_peer_used[index]=false;
+        IOLockLock(sc->sc_awdl_lock);
+        if(sc->sc_awdl_tx_trace) sc->sc_awdl_tx_trace->peerChanged(index);
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
     return 0;
 }
 
@@ -10080,8 +10315,9 @@ IOReturn MtkMwx::awdlPrepareChannel(uint8_t channel)
     return error ? kIOReturnIOError : kIOReturnSuccess;
 }
 
-IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
+IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *timing)
 {
+    if(timing) *timing={};
     MwxAwdlCall call(com);
     if(!call.valid()) return kIOReturnNotReady;
     if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
@@ -10112,8 +10348,10 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     if(infra && channel!=infra) {
         if(!mwx_awdl_offchan_enabled()) return kIOReturnBadArgument;
         if(!com->sc_awdl_infra_ps) awdlInfraSleep(channel);
-        if(!com->sc_awdl_infra_ps || mwx_awdl_now()-com->sc_awdl_infra_ps_at<2000)
+        if(!com->sc_awdl_infra_ps || mwx_awdl_now()-com->sc_awdl_infra_ps_at<2000) {
+            ++com->sc_awdl_roc_pm_blocked;
             return kIOReturnNotReady;
+        }
         if(durationMs>mwxAwdlOffChannelMaxMs) durationMs=mwxAwdlOffChannelMaxMs;
     }
     int abortRv=mwx_awdl_abort(com);
@@ -10148,9 +10386,31 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs)
     }
     com->sc_awdl_token_used[token]=now ? now : 1;
     com->sc_awdl_roc.request(token,channel,now);
+    com->sc_awdl_roc_timing={};
+    com->sc_awdl_roc_timing.session=com->sc_awdl_native_session;
+    com->sc_awdl_roc_timing.epoch=operation.epoch;
+    com->sc_awdl_roc_timing.token=token;
+    com->sc_awdl_roc_timing.channel=channel;
+    com->sc_awdl_roc_timing.infraChannel=infra;
+    com->sc_awdl_roc_timing.issuedAtUS=now;
+    com->sc_awdl_roc_timing.pmAtUS=infra && channel!=infra ? com->sc_awdl_infra_ps_at : 0;
+    com->sc_awdl_roc_timing.queueStatus=EINPROGRESS;
+    AwdlRocTiming ownTiming=com->sc_awdl_roc_timing;
     IOLockUnlock(com->sc_awdl_lock);
     int rv=mwx_mcu_send_msg(com,0x00020027,request,sizeof(request),NULL);
     uint64_t queuedAt=mwx_awdl_now();
+    ownTiming.queueReturnedAtUS=queuedAt; ownTiming.queueStatus=rv;
+    IOLockLock(com->sc_awdl_lock);
+    if(com->sc_awdl_roc_timing.session==ownTiming.session &&
+       com->sc_awdl_roc_timing.epoch==operation.epoch &&
+       com->sc_awdl_roc_timing.token==token && com->sc_awdl_roc_timing.issuedAtUS==now) {
+        ownTiming.grantAtUS=com->sc_awdl_roc_timing.grantAtUS;
+        com->sc_awdl_roc_timing=ownTiming;
+    }
+    IOLockUnlock(com->sc_awdl_lock);
+    // Return partial observations even if disable/reset happened in commandSleep.
+    // Never attach the replacement session's grant to this caller's record.
+    if(timing) *timing=ownTiming;
     if(!rv) {
         IOLockLock(com->sc_awdl_lock);
         com->sc_awdl_roc_queue_delay_us=queuedAt-now;
@@ -10204,6 +10464,19 @@ bool MtkMwx::awdlGrantSnapshot(mtkawdl::Reservation &grant)
     return ready;
 }
 
+bool MtkMwx::awdlRocTimingSnapshot(AwdlRocTiming &timing)
+{
+    timing={};
+    if(!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    bool ready=com->sc_awdl_enabled && !com->sc_resetting && !com->sc_detaching &&
+        !com->sc_awdl_stopping && com->sc_awdl_roc_timing.session==com->sc_awdl_native_session &&
+        com->sc_awdl_roc_timing.epoch==com->sc_awdl_epoch;
+    if(ready) timing=com->sc_awdl_roc_timing;
+    IOLockUnlock(com->sc_awdl_lock);
+    return ready && timing.issuedAtUS;
+}
+
 bool MtkMwx::awdlIsEnabled()
 {
     if(!com || !com->sc_awdl_lock) return false;
@@ -10216,11 +10489,13 @@ bool MtkMwx::awdlIsEnabled()
 void MtkMwx::awdlPublishDiagnostics()
 {
     if(!com || !com->sc_awdl_lock) return;
+    mwx_awdl_tx_trace_publish(com,mwxController());
     IOLockLock(com->sc_awdl_lock);
     uint64_t events=com->sc_awdl_roc_events, grants=com->sc_awdl_roc_grants,
              rejected=com->sc_awdl_roc_rejected;
     bool pending=com->sc_awdl_roc.pending;
     mtkawdl::Reservation radio=com->sc_awdl_roc;
+    AwdlRocTiming timing=com->sc_awdl_roc_timing;
     uint64_t delay=com->sc_awdl_roc_grant_delay_us, maxDelay=com->sc_awdl_roc_max_grant_delay_us;
     uint64_t commandResults=com->sc_awdl_roc_command_results, commandFailed=com->sc_awdl_roc_command_failed,
              commandMalformed=com->sc_awdl_roc_command_malformed, commandAt=com->sc_awdl_roc_command_result_us;
@@ -10275,6 +10550,20 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKWiFiPMF",com->sc_ic.ic_bss != NULL &&
         (com->sc_ic.ic_bss->ni_flags & IEEE80211_NODE_MFP) != 0);
     mwxController()->setProperty("MTKAWDLFirmwareContext","p2p-discovery");
+    // CNM advertises logical channel management, not simultaneous RF. DBDC
+    // stays a raw NIC value until chip/firmware scheduling is established.
+    auto &capa=com->sc_capa;
+    bool featuresKnown=capa.fw_features_loaded && !capa.fw_features_error && capa.fw_features.present;
+    mwxController()->setProperty("MTKWiFiPHYCapabilitiesValid",capa.phy_valid);
+    mwxController()->setProperty("MTKWiFiPHYCapabilities",&capa.phy,sizeof(capa.phy));
+    mwxController()->setProperty("MTKWiFiPHYDBDC",static_cast<uint64_t>(capa.phy.dbdc),32);
+    mwxController()->setProperty("MTKWiFiPHYHWPath",static_cast<uint64_t>(capa.phy.hw_path),32);
+    mwxController()->setProperty("MTKWiFiPHYRawNSS",static_cast<uint64_t>(capa.phy.nss),32);
+    mwxController()->setProperty("MTKWiFiFirmwareFeaturesKnown",featuresKnown);
+    mwxController()->setProperty("MTKWiFiFirmwareFeaturesStatus",static_cast<uint64_t>(capa.fw_features_error),32);
+    mwxController()->setProperty("MTKWiFiFirmwareFeatures",static_cast<uint64_t>(capa.fw_features.flags),32);
+    mwxController()->setProperty("MTKWiFiFirmwareFeatureSegment",static_cast<uint64_t>(capa.fw_features.segment),32);
+    mwxController()->setProperty("MTKWiFiFirmwareCNM",featuresKnown && (capa.fw_features.flags & MTK_WLAN_FW_CAP_CNM));
     mwxController()->setProperty("MTKAWDLROCStateObservedAtUS",observed,64);
     mwxController()->setProperty("MTKAWDLROCEvents",events,64);
     mwxController()->setProperty("MTKAWDLROCGrants",grants,64);
@@ -10319,6 +10608,13 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCAbortRetryAtUS",abortRetryAt,64);
     mwxController()->setProperty("MTKAWDLROCQueueDelayUS",queueDelay,64);
     mwxController()->setProperty("MTKAWDLROCMaxQueueDelayUS",maxQueueDelay,64);
+    mwxController()->setProperty("MTKAWDLROCTimingSession",timing.session,64);
+    mwxController()->setProperty("MTKAWDLROCTimingEpoch",static_cast<uint64_t>(timing.epoch),32);
+    mwxController()->setProperty("MTKAWDLROCTimingToken",static_cast<uint64_t>(timing.token),32);
+    mwxController()->setProperty("MTKAWDLROCIssuedAtUS",timing.issuedAtUS,64);
+    mwxController()->setProperty("MTKAWDLROCQueueReturnedAtUS",timing.queueReturnedAtUS,64);
+    mwxController()->setProperty("MTKAWDLROCPMSubmittedAtUS",timing.pmAtUS,64);
+    mwxController()->setProperty("MTKAWDLROCPMBlocked",com->sc_awdl_roc_pm_blocked,64);
     mwxController()->setProperty("MTKAWDLBSSBaseChannel",static_cast<uint64_t>(com->sc_awdl_channel),32);
     mwxController()->setProperty("MTKAWDLROCSubmitted",com->sc_awdl_roc_submitted,64);
     mwxController()->setProperty("MTKAWDLROCSendFailed",com->sc_awdl_roc_send_failed,64);
@@ -10613,6 +10909,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
         IOLockUnlock(com->sc_awdl_lock); return kIOReturnAborted;
     }
     com->sc_awdl_native_tx.cancel(wcid);
+    if(com->sc_awdl_tx_trace) com->sc_awdl_tx_trace->peerChanged(index);
     memset(&node,0,sizeof(node)); node.wcid=wcid;
     mwx_awdl_reset_rate(com,index);
     if(add) memcpy(node.ni.ni_macaddr,address,6);

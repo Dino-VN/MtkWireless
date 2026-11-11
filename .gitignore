@@ -5,3 +5,4 @@ dist/
 rust/target/
 third_party/Lilu.kext
 diagnostics/
+scripts/__pycache__/

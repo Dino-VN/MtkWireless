@@ -1,7 +1,8 @@
 //! Packets on the RX rings that are not plain 802.11 frames: classification
 //! (`mwx_dma_rx_process`) and TX-free reports (`mwx_mac_tx_free`).
 
-use mtk_common::bytes::le32_at;
+use mtk_common::bytes::{le32_at, Reader};
+use mtk_common::Result;
 
 pub const PKT_TYPE_TXS: u32 = 0;
 pub const PKT_TYPE_NORMAL: u32 = 2;
@@ -38,6 +39,42 @@ pub fn classify(packet: &[u8]) -> Option<Class> {
 /// (they start at dword 2).
 pub fn txs_records(len: usize) -> usize {
     (len / 4).saturating_sub(2) / 8
+}
+
+/// Diagnostic fields of one 8-dword TXS. This is NOT a DMA token completion:
+/// WCID/sequence/PID can recur across peer incarnations and HAL sessions.
+/// Kept in sync with `mtk_wlan_tx_status` in the C header, without bool/padding.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxStatus {
+    pub raw: [u32; 8],
+    pub errors: u32,
+    pub rate: u16,
+    pub wcid: u16,
+    pub sequence: u16,
+    pub pid: u8,
+    pub format: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<TxStatus>() == 44);
+
+/// Preserve all raw words, even for PPDU formats 2/3. The consumer must not
+/// interpret those as MPDU ACKs or attach an observer's lifetime to the sender.
+pub fn parse_txs(record: &[u8]) -> Result<TxStatus> {
+    let mut reader = Reader::new(record);
+    let mut raw = [0; 8];
+    for word in &mut raw {
+        *word = reader.le32()?;
+    }
+    Ok(TxStatus {
+        errors: raw[0] & 0x0007_0000,
+        rate: (raw[0] & 0x3fff) as u16,
+        wcid: ((raw[2] >> 16) & 0x3ff) as u16,
+        sequence: (raw[1] >> 20) as u16,
+        pid: (raw[3] >> 24) as u8,
+        format: ((raw[0] >> 23) & 3) as u8,
+        raw,
+    })
 }
 
 const TX_FREE0_MSDU_CNT_MASK: u32 = 0x03ff_0000;
@@ -154,6 +191,31 @@ mod tests {
         assert_eq!(classify(&[1, 2, 3]), None);
         assert_eq!(txs_records(8 + 32 * 2 + 4), 2);
         assert_eq!(txs_records(4), 0);
+    }
+
+    #[test]
+    fn txs_raw_fields_and_bounds() {
+        let words = [0xd987_abcd, 0xfff0_1234, 0x03ff_0000, 0xfd01_0203,
+                     0x8765_4321, 0xabcdef01, 0x0403_0201, 0xfedc_ba98];
+        let p = packet(&words);
+        let got = parse_txs(&p).unwrap();
+        assert_eq!(got.raw, words);
+        assert_eq!((got.rate, got.errors), (0x2bcd, 0x70000));
+        assert_eq!((got.wcid, got.sequence, got.pid, got.format), (1023, 4095, 253, 3));
+        for len in 0..32 {
+            assert!(parse_txs(&p[..len]).is_err(), "truncated at {len}");
+        }
+        let mut unaligned = std::vec![0x55];
+        unaligned.extend_from_slice(&p);
+        unaligned.extend_from_slice(&[0xaa; 7]);
+        assert_eq!(parse_txs(&unaligned[1..]).unwrap(), got);
+        assert_eq!(core::mem::offset_of!(TxStatus, errors), 32);
+        assert_eq!(core::mem::offset_of!(TxStatus, pid), 42);
+        for format in 0..4 {
+            let p = packet(&[format << 23, 0, 15 << 16, 125 << 24, 0, 0, 0, 0]);
+            let s = parse_txs(&p).unwrap();
+            assert_eq!((s.format, s.rate, s.errors), (format as u8, 0, 0));
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@
 
 Transport and workloop boundaries are mocks, not a proof of a device fence.
 History is deliberately never cleared, including between test instances.
+The ordinary-unicast diagnostic trace is unavailable in this UMI fixture; the
+separate test-awdl-tx-trace.py covers its enabled production hooks and exclusions.
 """
 from pathlib import Path
 import re
@@ -67,6 +69,7 @@ code = r'''
 #include <thread>
 #include <vector>
 #include <sys/types.h>
+#include <AWDL/AwdlTxTrace.hpp>
 using IOReturn=unsigned;
 constexpr unsigned kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnBadArgument=2,
     kIOReturnNoResources=3,kIOReturnNotFound=4,kIOReturnNoMemory=5,
@@ -134,6 +137,7 @@ struct mwx_vif {mwx_node vif_mn;uint8_t idx=2,omac_idx=3;};
 struct mwx_softc {
     IOLock *sc_awdl_lock=IOLockAlloc();
     mwx_awdl_native_tx_table sc_awdl_native_tx{};
+    mtkawdl::HalTxTrace *sc_awdl_tx_trace=nullptr;
     uint64_t sc_awdl_native_session=0;
     bool sc_awdl_enabled=true,sc_awdl_stopping=false,sc_resetting=false,sc_detaching=false;
     bool sc_awdl_busy=false;unsigned sc_awdl_calls=0;
@@ -156,6 +160,11 @@ struct mwx_softc {
     ~mwx_softc(){assert(!sc_awdl_busy && !sc_awdl_calls);IOLockFree(sc_awdl_lock);}
 };
 static bool mwx_awdl_current(mwx_softc *,uint32_t);
+// Model only the production trace-unavailable early return. Do not pretend
+// that this fixture validates the enabled parser/diagnostic path.
+static void mwx_awdl_tx_trace_txs(mwx_softc *sc,const uint8_t *,size_t){
+    assert(!sc->sc_awdl_tx_trace);
+}
 static uint64_t mtk_join_now(){return 1;}
 static void mwx_awdl_reset_rate(mwx_softc *sc,unsigned index){sc->sc_awdl_tx_status.rates[index]=0;}
 ''' + operations + function(source, 'static bool mwx_awdl_current(mwx_softc *sc,') + r'''
@@ -548,5 +557,6 @@ with tempfile.TemporaryDirectory(prefix='mtk-native-tx-') as td:
     cpp.write_text(code)
     subprocess.run(['clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g',
-                    str(cpp), '-o', str(exe)], check=True)
+                    '-I'+str(base / 'include'), '-I'+str(root / 'kext/Wifi'),
+                    '-I'+str(root / 'kext/include'), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

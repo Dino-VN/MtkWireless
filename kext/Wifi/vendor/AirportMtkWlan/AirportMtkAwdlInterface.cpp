@@ -597,6 +597,9 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     owner=controller; hal=transport; timer=NULL; bsd=NULL; timerAdded=false;
     stopping=enabled=false; queueHead=queueCount=0; templateLength=0;
     txSession=0;
+    int forwardMode=1;
+    PE_parse_boot_argn("amtk_awdl_forward",&forwardMode,sizeof(forwardMode));
+    forwardEnabled=forwardMode!=0; // 0 restores the greedy scheduler and legacy lead aging.
     // Configuration is tracked by the native peer manager; this backend keeps
     // the firmware context ready once registration succeeds.
     requestedChannel=grantedChannel=0; nextAction=requestDeadline=0;
@@ -706,7 +709,7 @@ void AirportMtkAwdlInterface::shutdownInGate()
     if(stopping) return;
     invalidateDataRxAdmission(); stopping=true;
     if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
-    awTimeline.reset();
+    awTimeline.reset(); resetForwardAdmission();
     setDataPathEnabled(false);
     if(timer) { timer->cancelTimeout(); timer->disable(); }
     if(hal && receiverRegistered) {
@@ -772,7 +775,7 @@ IOReturn AirportMtkAwdlInterface::setMacAddressInGate(ether_addr &mac)
     invalidateDataRxAdmission();
     state.init((uint8_t *)&mac,awdlNow());
     state.nativeElectionManaged=true;
-    awTimeline.reset();
+    awTimeline.reset(); resetForwardAdmission();
     bzero(nativePeerSamples,sizeof(nativePeerSamples));
     resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
     state.sequence=state.ownSequence=sequence;
@@ -961,7 +964,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
         enabled=false;
         finishAvailabilityWindowForDisable();
         state.discardControls(); state.holdClock(0);
-        awTimeline.reset(); drainCompletions();
+        awTimeline.reset(); resetForwardAdmission(); drainCompletions();
     }
     IOReturn status=stopping ? kIOReturnNotReady : hal->awdlEnable(state.mac,value);
     if(stopping) status=kIOReturnNotReady;
@@ -1361,11 +1364,14 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowStart(uint8_t channel,uint
     setProperty("MTKAWDLAWStartNotifications",awStartNotifications,64);
     setProperty("MTKAWDLAWWindowOpen",true);
     setProperty("MTKAWDLAWRadioEndUS",awTimeline.radioEnd,64);
+    rocTrace.start(txSession,awTimeline,awdlNow());
+    if(forwardEnabled) forward.nativeWindow(channel,awTimeline.radioEnd);
     postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START,&payload,sizeof(payload),true);
 }
 void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
 {
     if(!awTimeline.open) return;
+    const uint64_t endSession=txSession;
     if(now>awTimeline.radioEnd) now=awTimeline.radioEnd;
     struct __attribute__((packed)) NativeAwEnd {
         uint32_t role;
@@ -1381,13 +1387,17 @@ void AirportMtkAwdlInterface::notifyAvailabilityWindowEnd(uint64_t now)
     static_assert(offsetof(NativeAwEnd,stats)==16,"AW statistics offset");
     payload.endUsBE=__builtin_bswap32(static_cast<uint32_t>(now));
     setProperty("MTKAWDLLastAWEndUS",now,64);
+    // Capture the old grant identity before close or any native callback.
+    rocTrace.end(txSession,awTimeline,now,awdlNow());
     awTimeline.close();
     state.holdClock(0);
     setProperty("MTKAWDLAWEndNotifications",awTimeline.ends,64);
     setProperty("MTKAWDLAWWindowOpen",false);
     postMessage(APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END,&payload,sizeof(payload),true);
-    // End callbacks may enqueue the last part of a control transaction.
-    // Keep it deferred until native has consumed the preceding end event.
+    // End callbacks may enqueue the last part of a control transaction, or
+    // disable/enable and open a replacement session's AW. Only this session
+    // owns the deferred transaction; never release its replacement's controls.
+    if(txSession!=endSession) return;
     if(enabled && !stopping) state.releaseControls(awdlNow());
     else state.discardControls();
 }
@@ -1422,11 +1432,42 @@ void AirportMtkAwdlInterface::publishCacheDiagnostics()
     CACHE_DIAGNOSTIC("MTKAWDLCacheEventAddressTag",eventAddressTag);
     CACHE_DIAGNOSTIC("MTKAWDLCacheEventStatus",eventStatus);
 #undef CACHE_DIAGNOSTIC
+    publishRocDiagnostics();
+    if(hal) hal->awdlPublishDiagnostics();
+}
+void AirportMtkAwdlInterface::publishRocDiagnostics()
+{
+    // Both callers run in the controller gate. Keep completed/partial records
+    // when sync disables its timer; the existing watchdog still publishes them.
+    setProperty("MTKAWDLROCTraceVersion",static_cast<uint64_t>(1),32);
+    setProperty("MTKAWDLROCTraceCount",rocTrace.count,64);
+    setProperty("MTKAWDLROCTrace",rocTrace.samples,sizeof(rocTrace.samples));
+    setProperty("MTKAWDLForwardEnabled",forwardEnabled);
+    setProperty("MTKAWDLForwardActive",forward.active);
+    setProperty("MTKAWDLForwardSelected",forward.selected,64);
+    setProperty("MTKAWDLForwardExpired",forward.expired,64);
+    setProperty("MTKAWDLForwardInvalidated",forward.invalidated,64);
+    // Issued means handed to awdlReserve; admission may still refuse it. The
+    // ROC trace's issued flag/timestamp identifies actual firmware submission.
+    setProperty("MTKAWDLForwardIssued",forward.issued,64);
+    setProperty("MTKAWDLForwardPreempted",forward.preempted,64);
+    setProperty("MTKAWDLForwardResponseTimeouts",forward.responseTimeouts,64);
+    setProperty("MTKAWDLForwardSettlingTicks",forward.settlingTicks,64);
+    setProperty("MTKAWDLForwardTargetChannel",static_cast<uint64_t>(forward.plan.window.channel),32);
+    setProperty("MTKAWDLForwardTargetStartUS",forward.plan.window.start,64);
+    setProperty("MTKAWDLForwardTargetEndUS",forward.plan.window.end,64);
+    setProperty("MTKAWDLForwardSelectedAtUS",forward.selectedAt,64);
+    setProperty("MTKAWDLForwardRequestAtUS",forward.plan.requestAt,64);
+    setProperty("MTKAWDLForwardIssueByUS",forward.issueBy,64);
+    setProperty("MTKAWDLForwardIntent",forward.intentId,64);
+    auto *last=rocTrace.find(rocTrace.count);
+    if(last) setProperty("MTKAWDLROCTraceLast",last,sizeof(*last));
 }
 void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 {
     if(lastDiagnostic && now-lastDiagnostic<1000000) return;
     lastDiagnostic=now;
+    publishRocDiagnostics();
     hal->awdlPublishDiagnostics();
     setProperty("MTKAWDLNativeRxPackets",nativeRx,64);
     setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
@@ -1587,6 +1628,8 @@ void AirportMtkAwdlInterface::serviceInGate()
     // control transaction before opening another AW with the old snapshot.
     if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     ++serviceTicks;
+    const uint64_t serviceAt=awdlNow();
+    const uint64_t serviceSession=txSession;
     if(!hal->awdlIsEnabled()) {
         // Transport reset invalidates the secondary BSS and all grants.
         invalidateDataRxAdmission();
@@ -1600,20 +1643,27 @@ void AirportMtkAwdlInterface::serviceInGate()
         timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
         // Native still owns the start even when firmware loses its context.
         if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
-        awTimeline.reset();
+        // End delivery may have started a replacement frontend session. Its
+        // timer, queue and native AW are not part of this reset cleanup.
+        if(stopping || enabled || txSession!=serviceSession) return;
+        awTimeline.reset(); resetForwardAdmission();
         while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
         return;
+    }
+    if(forwardEnabled && forward.callId && forward.callSession==serviceSession) {
+        timer->setTimeoutMS(1); return;
     }
     // MtkWireless: back on the AP's channel (or AWDL off), say we are awake.
     hal->awdlInfraWakeIfIdle();
     uint64_t now=awdlNow();
+    if(!radioServiceCurrent(serviceSession)) return;
     // Change our sequence only between AWs: the open AW keeps its snapshot.
     if(!awTimeline.open) updatePresence(now);
     if(awTimeline.due(now)) {
         // The timestamp is the recorded radio/schedule edge, even if this
         // timer runs late. Administrative cancellation uses its observed time.
         notifyAvailabilityWindowEnd(awTimeline.radioEnd);
-        if(stopping || !enabled) return;
+        if(!radioServiceCurrent(serviceSession)) return;
         // Native EAW end is distinct from firmware ROC expiry. A grant can
         // cover several consecutive windows on the same channel.
         now=awdlNow();
@@ -1634,8 +1684,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             // in actual AW duration, including lateness of this window's start.
             // Close before abort so callbacks never observe an unpaired start.
             notifyAvailabilityWindowEnd(now);
-            if(stopping || !enabled) return;
-            hal->awdlAbort(); requestedChannel=grantedChannel=0;
+            if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession)) return;
             now=awdlNow();
         }
     }
@@ -1769,11 +1818,11 @@ void AirportMtkAwdlInterface::serviceInGate()
         }
     }
     // Peer programming can release the gate while waiting for firmware.
-    if(stopping || !enabled) return;
+    if(stopping || !enabled || txSession!=serviceSession) return;
     now=awdlNow();
     if(awTimeline.due(now)) {
         notifyAvailabilityWindowEnd(awTimeline.radioEnd);
-        if(stopping || !enabled) return;
+        if(!radioServiceCurrent(serviceSession)) return;
         now=awdlNow();
     }
     mtkawdl::Window window={};
@@ -1786,26 +1835,53 @@ void AirportMtkAwdlInterface::serviceInGate()
     uint8_t channel=window.channel;
     if(!channel || !hal->awdlChannelReachable(channel)) {
         if(awTimeline.open) notifyAvailabilityWindowEnd(now);
-        if(stopping || !enabled) return;
+        if(!radioServiceCurrent(serviceSession)) return;
         // An idle slot may already be preparing the following channel.
         // Preserve pending responses and live grants through idle slots.
         // Missing the original target does not expire firmware RF ownership.
         if(requestedChannel && requestedWindow.end<=now) {
             mtkawdl::Reservation pending={};
-            if(!hal->awdlGrantSnapshot(pending) ||
+            bool havePending=hal->awdlGrantSnapshot(pending);
+            if(!havePending ||
                ((!pending.pending && !pending.granted) || now>=pending.deadline)) {
+                // Cancellation clears this request before the normal observation
+                // below. Keep its timeout hold only in the submitting context.
+                if(havePending && pending.pending && forwardEnabled &&
+                   forwardContextSet && forwardTimingContextSet &&
+                   forwardContext==forwardTimingContext &&
+                   forwardTimingContext==forwardRadioContext())
+                    forward.observeReservation(state,pending,now);
                 state.holdClock(0);
-                hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                if(!abortRadioForService(serviceSession)) return;
+                now=awdlNow();
             }
         }
     }
     if(awTimeline.open && !awTimeline.matchesSchedule(state)) {
         notifyAvailabilityWindowEnd(now);
-        if(stopping || !enabled) return;
-        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession)) return;
+        now=awdlNow();
     }
     mtkawdl::Reservation grant={};
     bool grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
+    if(forwardEnabled) {
+        if(!radioServiceCurrent(serviceSession)) return;
+        const auto context=forwardRadioContext();
+        if(!forwardContextSet || !(context==forwardContext)) {
+            resetForwardAdmission(); forwardContext=context; forwardContextSet=true;
+            // Never relabel a live/late grant from the old radio context.
+            forwardGrantObservedAt=grant.grantObservedAt;
+        }
+        if(forwardTimingContextSet && forwardTimingContext==forwardContext) {
+            forward.observeReservation(state,grant,now);
+            if(grant.granted && grant.grantObservedAt && grant.grantObservedAt!=forwardGrantObservedAt) {
+                forwardGrantObservedAt=grant.grantObservedAt;
+                forwardTiming.observeRetained(grant.channel,grant.responseDelayUS,reserveWaitUS);
+            }
+        }
+    }
+    MtkMwx::AwdlRocTiming timing={};
+    if(hal->awdlRocTimingSnapshot(timing)) rocTrace.observe(timing);
     if(grant.granted && grant.grantObservedAt && grant.grantObservedAt!=grantLatencyObservedAt) {
         grantLatencyObservedAt=grant.grantObservedAt;
         // Accepted response latency is measured from submission, independently
@@ -1817,9 +1893,24 @@ void AirportMtkAwdlInterface::serviceInGate()
                          grant.token!=awTimeline.token ||
                          grant.grantObservedAt!=awTimeline.grantObservedAt)) {
         notifyAvailabilityWindowEnd(now<awTimeline.radioEnd ? now : awTimeline.radioEnd);
-        if(stopping || !enabled) return;
+        if(!radioServiceCurrent(serviceSession)) return;
     }
-    if(!grantReady || (!awTimeline.open && now-window.start<=8000 &&
+    if(forwardEnabled) {
+        if(!radioServiceCurrent(serviceSession)) return;
+        now=awdlNow();
+        if(!awTimeline.open) {
+            if(!mtkawdl::currentWindow(state,now,window)) { timer->setTimeoutMS(2); return; }
+            channel=window.channel;
+        }
+        grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
+        uint8_t reachable[mtkawdl::slots]={};
+        for(unsigned i=0;i<state.sequence.count && i<mtkawdl::slots;++i)
+            reachable[i]=state.sequence.channels[i] && hal->awdlChannelReachable(state.sequence.channels[i]);
+        forward.update(state,now,forwardRadioContext(),forwardTiming,reachable,awTimeline,grant,
+                       requestedWindow,requestedChannel,&reserveChannelTiming);
+    }
+    const bool forwardBlocks=forwardEnabled && forward.blocks(window,awTimeline.open,now);
+    if(forwardBlocks || !grantReady || (!awTimeline.open && now-window.start<=8000 &&
                        !mtkawdl::grantCoversWindow(window,grant,now))) {
         // Do not replace the last 2ms TX guard of a live grant with another
         // short ROC. Prepare the next EAW after closing this one.
@@ -1835,6 +1926,7 @@ void AirportMtkAwdlInterface::serviceInGate()
                 timer->setTimeoutMS(1); return;
             }
             mtkawdl::RadioPlan plan={};
+            const uint64_t planAt=now;
             // Once an EAW ended early, reserve its successor even when a
             // short presence still leaves us inside the start tolerance.
             // Reacquiring the closed EAW wastes the switching head start.
@@ -1844,8 +1936,18 @@ void AirportMtkAwdlInterface::serviceInGate()
             // instead of polling every 2ms.
             // A grant on the AP's channel also spans idle slots (planRadio).
             uint8_t onlyChannel=hal->awdlOnlyChannel();
-            if(!mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
-                                   onlyChannel,hal->awdlInfraChannel())) { timer->setTimeoutMS(onlyChannel ? 50 : 2); return; }
+            bool greedy=mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
+                                          onlyChannel,hal->awdlInfraChannel());
+            bool recovery=forwardEnabled && forward.active &&
+                (forwardBlocks || !greedy || !forward.allowsIntermediate(plan));
+            if(recovery) plan=forward.plan;
+            else if(!greedy) { timer->setTimeoutMS(onlyChannel ? 50 : 2); return; }
+            // Keep greedy acquisitions/native windows which fit before the
+            // intent's fixed preparation edge. An intent alone owns no RF.
+            const uint64_t intent=recovery ? forward.intentId : 0;
+            const auto issueContext=forwardRadioContext();
+            mtkawdl::ForwardSchedule issueSchedule{};
+            if(forwardEnabled) issueSchedule.capture(state);
             mtkawdl::Window target=plan.window;
             if(!target.channel || !hal->awdlChannelReachable(target.channel)) {
                 timer->setTimeoutMS(1); return;
@@ -1854,6 +1956,32 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // An early grant is for the upcoming EAW. Do not repeatedly
                 // abort/reacquire it just because the current EAW is late/idle.
                 timer->setTimeoutMS(1); return;
+            }
+            if(recovery && forward.canPreempt(awTimeline,grant,now,requestedWindow,requestedChannel)) {
+                // Only surplus airtime, after the ORIGINAL target ended. This
+                // does not weaken the short/future grant preservation below.
+                const uint64_t call=forward.beginCall(serviceSession);
+                if(!call) { timer->setTimeoutMS(1); return; }
+                hal->awdlAbort(); now=awdlNow();
+                const bool completed=forward.completeCall(call);
+                if(!radioServiceCurrent(serviceSession) || !completed) return;
+                if(forward.intentId!=intent || !forward.valid(state,forwardRadioContext(),now)) {
+                    if(now>forward.issueBy) forward.expire(); else forward.invalidate();
+                    timer->setTimeoutMS(1); return;
+                }
+                grant={}; hal->awdlGrantSnapshot(grant);
+                if((grant.pending || grant.granted) && now<grant.deadline) {
+                    timer->setTimeoutMS(1); return;
+                }
+                ++forward.preempted;
+                state.holdClock(0); requestedChannel=grantedChannel=0; requestDeadline=0;
+                // Retiring an old off-channel grant also retires its PM age.
+                // Wake now, then prepare below; otherwise the next service tick
+                // could wake an old PM=1 between preparation and requestAt.
+                hal->awdlInfraWakeIfIdle();
+            }
+            if(recovery && now<forward.prepareAt()) {
+                timer->setTimeoutUS(mtkawdl::rocPollDelayUS(now,forward.prepareAt())); return;
             }
             if(grant.granted && now<grant.deadline &&
                ((grant.channel==channel && (!awTimeline.emitted || now>=awTimeline.active.end)) ||
@@ -1867,13 +1995,38 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // must not delay the next reservation beyond its requestAt.
                 timer->setTimeoutMS(1); return;
             }
-            // MtkWireless: tell the AP we sleep before an off-channel ROC;
-            // awdlReserve waits ~2ms after it, so send it ahead of requestAt.
-            if(plan.requestAt<=now+3000) hal->awdlInfraSleep(target.channel);
-            if(plan.requestAt>now) {
-                uint64_t delay=plan.requestAt-now;
-                timer->setTimeoutUS(static_cast<uint32_t>(delay>2000 ? 2000 : delay)); return;
+            // MtkWireless: clip the poll at the PM preparation edge, not
+            // only at requestAt. A 2ms poll could previously step from just
+            // outside the 3ms preparation lead to <2ms before the request,
+            // guaranteeing a PM-age refusal even without any timer jitter.
+            uint64_t prepareAt=mtkawdl::rocPrepareAt(plan.requestAt);
+            if(now<prepareAt) {
+                timer->setTimeoutUS(mtkawdl::rocPollDelayUS(now,prepareAt)); return;
             }
+            const uint64_t pmCall=forwardEnabled ? forward.beginCall(serviceSession) : 0;
+            if(forwardEnabled && !pmCall) { timer->setTimeoutMS(1); return; }
+            hal->awdlInfraSleep(target.channel);
+            now=awdlNow();
+            const bool pmCompleted=!forwardEnabled || forward.completeCall(pmCall);
+            if(!radioServiceCurrent(serviceSession) || !pmCompleted) return;
+            // Revalidate after PM submission, before even rearming the timer.
+            // A callback may own a replacement session/plan; neither its timer
+            // nor its intent can be completed by this older preparation call.
+            if(forwardEnabled) {
+                if(!(issueContext==forwardRadioContext()) || !issueSchedule.matches(state) ||
+                   (recovery && (forward.intentId!=intent || !forward.valid(state,issueContext,now))) ||
+                   (!recovery && !forward.allowsIntermediate(plan))) {
+                    if(recovery && now>forward.issueBy) forward.expire(); else forward.invalidate();
+                    timer->setTimeoutMS(1); return;
+                }
+            }
+            if(plan.requestAt>now) {
+                timer->setTimeoutUS(mtkawdl::rocPollDelayUS(now,plan.requestAt)); return;
+            }
+            const uint64_t forwardCall=forwardEnabled ? forward.beginCall(serviceSession) : 0;
+            if(forwardEnabled && !forwardCall) { timer->setTimeoutMS(1); return; }
+            if(recovery) forward.issue();
+            if(forwardEnabled) { forwardTimingContext=issueContext; forwardTimingContextSet=true; }
             uint8_t parent[6],root[6];
             memcpy(parent,state.sync,6); memcpy(root,state.master,6);
             mtkawdl::Sequence sequence=state.sequence;
@@ -1887,11 +2040,29 @@ void AirportMtkAwdlInterface::serviceInGate()
             // firmware prepares this channel. Freeze the shared event/wire
             // clock through the first requested EAW, before entering HAL.
             state.holdClock(target.end);
-            uint64_t requestAt=now;
-            IOReturn status=hal->awdlReserve(target.channel,duration);
-            reserveStatus=status;
-            if(stopping || !enabled) return;
+            const uint64_t requestAt=awdlNow();
+            // planRadio uses the per-channel startup fallback, not the global
+            // lead. Record its unclamped ideal edge so late ticks stay visible.
+            const uint64_t traceId=rocTrace.begin(serviceSession,serviceAt,planAt,requestAt,
+                plan,recovery ? static_cast<uint32_t>(target.start-plan.requestAt) :
+                    reserveChannelTiming.lead(target.channel),hal->awdlInfraChannel());
+            timing={};
+            IOReturn status=hal->awdlReserve(target.channel,duration,&timing);
             now=awdlNow();
+            const bool completed=!forwardEnabled || forward.completeCall(forwardCall);
+            bool current=completed && !stopping && enabled && txSession==serviceSession &&
+                hal->awdlTxSession()==serviceSession;
+            rocTrace.finish(traceId,now,status,timing,current);
+            if(!current) {
+                // A transport reset can invalidate only the HAL session while
+                // commandSleep releases the gate. This one-shot still needs a
+                // next tick to run reset cleanup, but must not rearm over a
+                // replacement frontend session or teardown.
+                if(!stopping && enabled && txSession==serviceSession)
+                    timer->setTimeoutMS(1);
+                return;
+            }
+            reserveStatus=status;
             reserveWaitUS=now-requestAt;
             if(reserveWaitUS>reserveMaxWaitUS) reserveMaxWaitUS=reserveWaitUS;
             mtkawdl::Window after={};
@@ -1900,6 +2071,8 @@ void AirportMtkAwdlInterface::serviceInGate()
             // following equal-channel windows; its first missed AW stays absent.
             uint64_t checkTime=target.start;
             reserveInvalidReason=0;
+            if(forwardEnabled && (!(issueContext==forwardRadioContext()) || !issueSchedule.matches(state)))
+                reserveInvalidReason|=8;
             if(plannedRole!=state.syncRole || memcmp(parent,state.sync,6) ||
                memcmp(root,state.master,6) || memcmp(&sequence,&state.sequence,sizeof(sequence)))
                 reserveInvalidReason|=1;
@@ -1914,9 +2087,10 @@ void AirportMtkAwdlInterface::serviceInGate()
                     (submitted.pending || submitted.granted);
                 if(!usable) reserveInvalidReason|=4;
             }
+            if(auto *sample=rocTrace.find(traceId)) sample->invalidReason=reserveInvalidReason;
             if(reserveInvalidReason) {
                 ++reserveInvalidations; state.holdClock(0);
-                hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                if(!abortRadioForService(serviceSession)) return;
                 timer->setTimeoutMS(1); return;
             }
             if(status==kIOReturnSuccess) {
@@ -1930,23 +2104,26 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(!channel || !hal->awdlChannelReachable(channel)) { timer->setTimeoutMS(1); return; }
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
-    if(!awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
+    const auto nativeContext=forwardEnabled ? forwardRadioContext() : mtkawdl::ForwardRadioContext{};
+    if(!forwardBlocks && !awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
         state.nativeTimelineStarted=true;
         state.holdClock(window.end);
         state.holdControls();
         // Set lifecycle state before dispatch: native may synchronously call
         // back into sync/advertisers setters while receiving this event.
         notifyAvailabilityWindowStart(channel,now);
-        if(stopping || !enabled || !awTimeline.open) return;
+        if(stopping || !enabled || txSession!=serviceSession || !awTimeline.open) return;
+        if(forwardEnabled && !radioServiceCurrent(serviceSession)) return;
         mtkawdl::Window after={};
         mtkawdl::Reservation observed={};
         now=awdlNow();
         if(!mtkawdl::currentWindow(state,now,after) ||
            !awTimeline.matchesSchedule(state) ||
+           (forwardEnabled && !(nativeContext==forwardRadioContext())) ||
            !hal->awdlGrantSnapshot(observed) || observed.token!=grant.token ||
            observed.grantObservedAt!=grant.grantObservedAt || !observed.canTransmit(channel,now)) {
             if(awTimeline.open) notifyAvailabilityWindowEnd(now<awTimeline.radioEnd ? now : awTimeline.radioEnd);
-            if(enabled && !stopping) timer->setTimeoutMS(1);
+            if(radioServiceCurrent(serviceSession)) timer->setTimeoutMS(1);
             return;
         }
     }
@@ -2071,7 +2248,11 @@ void AirportMtkAwdlInterface::serviceInGate()
                     // re-register it once and retry before requeueing.
                     if(awdlRenewStationOnNoPeer()) {
                         const uint8_t *dst=(const uint8_t *)mbuf_data(m)+4;
-                        if(programDataPeer(dst,true)==kIOReturnSuccess)
+                        IOReturn peerStatus=programDataPeer(dst,true);
+                        // The firmware wait can replace/stop this session. This
+                        // dequeued frame still belongs to the old invocation.
+                        if(!radioServiceCurrent(serviceSession)) { mbuf_freem(m); return; }
+                        if(peerStatus==kIOReturnSuccess)
                             txStatus=hal->awdlTryTransmit(&m,channel);
                         if(txStatus==kIOReturnSuccess) {
                             if(m) mbuf_freem(m);
@@ -2101,18 +2282,40 @@ void AirportMtkAwdlInterface::serviceInGate()
             } else ++failed;
         }
     }
+    // Draining/peer repair may release the gate. An obsolete invocation must
+    // not clear radio state or rearm over teardown/a replacement session.
+    // radioServiceCurrent retains the one-shot needed for HAL-only reset cleanup.
+    if(!radioServiceCurrent(serviceSession)) return;
     if(!hal->awdlCanTransmit(channel)) { requestedChannel=0; grantedChannel=0; }
-    // Wake on the recorded radio end instead of overshooting it by a tick.
-    uint64_t delay=awTimeline.open && awTimeline.radioEnd>now ? awTimeline.radioEnd-now : 2000;
-    if(delay>2000) delay=2000;
-    if(awTimeline.open && awTimeline.matchesSchedule(state)) {
-        mtkawdl::Window next={};
-        uint64_t prepareAt=awTimeline.active.end-awTimeline.switchLeadUS();
-        if(prepareAt>now && mtkawdl::currentWindow(state,awTimeline.active.end,next) &&
-           next.channel && hal->awdlChannelReachable(next.channel) &&
-           !mtkawdl::grantCoversWindow(next,grant,next.start) && prepareAt-now<delay)
-            delay=prepareAt-now;
+    mtkawdl::Reservation live={};
+    bool snapshot=hal->awdlGrantSnapshot(live);
+    now=awdlNow();
+    uint64_t delay=2000;
+    if(awTimeline.open) {
+        bool current=snapshot && live.granted && live.channel==awTimeline.active.channel &&
+            live.token==awTimeline.token && live.grantObservedAt==awTimeline.grantObservedAt &&
+            awTimeline.matchesSchedule(state);
+        // setTimeoutUS is relative FROM NOW, not from the pre-drain sample.
+        // Due/revoked edges need the next turn to run the existing paired end
+        // path, never a fresh 2ms idle poll or recursive native/firmware dispatch.
+        delay=current && awTimeline.radioEnd>now ? awTimeline.radioEnd-now : 1;
+        if(current) {
+            mtkawdl::Window next={};
+            uint64_t early=awTimeline.switchLeadUS();
+            uint64_t prepareAt=awTimeline.active.end>early ? awTimeline.active.end-early : 0;
+            // Match the early-close predicates above, including preservation
+            // of the original future grant. A consumed edge has no open AW;
+            // a preserved grant must not turn an old edge into a 1us poll loop.
+            if(early && mtkawdl::currentWindow(state,awTimeline.active.end,next) &&
+               next.channel && hal->awdlChannelReachable(next.channel) &&
+               !mtkawdl::grantCoversWindow(next,live,next.start) &&
+               !mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,live,now)) {
+                uint64_t remaining=prepareAt>now ? prepareAt-now : 1;
+                if(remaining<delay) delay=remaining;
+            }
+        }
     }
+    if(delay>2000) delay=2000;
     timer->setTimeoutUS(static_cast<uint32_t>(delay));
 }
 

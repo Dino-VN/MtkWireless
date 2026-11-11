@@ -9,6 +9,8 @@
 #include <AWDL/AwdlProtocol.hpp>
 #include <AWDL/AwdlAdvertisers.hpp>
 #include <AWDL/AwdlTimeline.hpp>
+#include <AWDL/AwdlForwardAdmission.hpp>
+#include <AWDL/AwdlRocTrace.hpp>
 #include <IOKit/IOTimerEventSource.h>
 #include "MtkMwx.hpp"
 class AirportMtkWlan;
@@ -168,6 +170,8 @@ private:
     void service();
     void serviceInGate();
     void publishScheduler(uint64_t);
+    void publishRocDiagnostics();
+    mtkawdl::RocTrace rocTrace;
     IOReturn recordCacheControlResult(IOReturn,uint64_t);
     // MtkWireless: observations only. Native message delivery can precede
     // entry into the controller gate; use atomics also for publication.
@@ -183,6 +187,42 @@ private:
         uint64_t eventVersionOp=0, eventAddressTag=0, eventStatus=kIOReturnNotReady;
     };
     CacheDiagnostic cacheDiagnostic;
+    bool forwardEnabled=true;
+    mtkawdl::ForwardAdmission forward;
+    mtkawdl::RocChannelTiming forwardTiming;
+    mtkawdl::ForwardRadioContext forwardContext{},forwardTimingContext{};
+    bool forwardContextSet=false,forwardTimingContextSet=false;
+    uint64_t forwardGrantObservedAt=0;
+    mtkawdl::ForwardRadioContext forwardRadioContext() {
+        mtkawdl::ForwardRadioContext c{};
+        c.session=hal->awdlTxSession(); c.infra=hal->awdlInfraChannel(); c.only=hal->awdlOnlyChannel();
+        const auto *ic=hal->get80211Controller();
+        if(ic) {
+            c.joinAttempt=ic->ic_join_diag.Attempt; c.infraState=static_cast<uint8_t>(ic->ic_state);
+            if(c.infra && ic->ic_bss) memcpy(c.bssid,ic->ic_bss->ni_bssid,6);
+        }
+        return c;
+    }
+    void resetForwardAdmission() {
+        forward.reset(); forwardTiming={}; forwardGrantObservedAt=0;
+        forwardContextSet=forwardTimingContextSet=false;
+    }
+    bool radioServiceCurrent(uint64_t session) {
+        if(stopping || !enabled || txSession!=session) return false;
+        if(hal->awdlTxSession()==session) return true;
+        // A HAL-only reset still needs a one-shot for frontend cleanup. Never
+        // rearm over a replacement frontend session's timer or teardown.
+        timer->setTimeoutMS(1); return false;
+    }
+    bool abortRadioForService(uint64_t session) {
+        const uint64_t call=forwardEnabled ? forward.beginCall(session) : 0;
+        if(forwardEnabled && !call) { timer->setTimeoutMS(1); return false; }
+        hal->awdlAbort();
+        const bool completed=!forwardEnabled || forward.completeCall(call);
+        if(!radioServiceCurrent(session) || !completed) return false;
+        requestedChannel=grantedChannel=0; requestDeadline=0;
+        return true;
+    }
     uint64_t txSession = 0;
     uint64_t txStatusCompletions = 0, txStatusDiscarded = 0;
     void notifyAvailabilityWindowStart(uint8_t,uint64_t);

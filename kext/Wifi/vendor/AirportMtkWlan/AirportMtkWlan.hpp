@@ -256,8 +256,7 @@ public:
     UInt64 currentSpeed;
     UInt32 currentStatus;
     bool disassocIsVoluntary;
-    char geo_location_cc[3];
-    
+
     //pm
     thread_call_t powerOnThreadCall;
     thread_call_t powerOffThreadCall;

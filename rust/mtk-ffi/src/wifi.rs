@@ -5,7 +5,8 @@
 use core::ffi::c_char;
 
 use mtk_kernel::klog;
-use mtk_wlan::connac2::fw::{PatchImage, RamImage, Region};
+use mtk_wlan::connac2::capability::PhyCaps;
+use mtk_wlan::connac2::fw::{FwFeatures, PatchImage, RamImage, Region};
 
 const EINVAL: i32 = 22;
 
@@ -225,6 +226,55 @@ pub unsafe extern "C" fn mtk_wlan_ram_region(
     }
 }
 
+/// Read optional diagnostic firmware features without changing RAM loading.
+/// A missing feature is success with `present = false`; malformed data is
+/// EINVAL. The output is cleared before parsing, including on error.
+///
+/// # Safety
+/// `data` points to `len` bytes; `out` is writable and does not overlap it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_ram_features(
+    data: *const u8,
+    len: usize,
+    out: *mut FwFeatures,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return EINVAL;
+    };
+    *out = FwFeatures::default();
+    match RamImage::parse(unsafe { image(data, len) }).and_then(|img| img.features()) {
+        Ok(features) => {
+            *out = features;
+            0
+        }
+        Err(_) => EINVAL,
+    }
+}
+
+/// Copy the raw fields of a PHY capability TLV's payload. This does not infer
+/// simultaneous RF capability. On error the output is cleared.
+///
+/// # Safety
+/// `data` points to `len` bytes; `out` is writable and does not overlap it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_phy_caps_parse(
+    data: *const u8,
+    len: usize,
+    out: *mut PhyCaps,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return EINVAL;
+    };
+    *out = PhyCaps::default();
+    match PhyCaps::parse(unsafe { image(data, len) }) {
+        Ok(caps) => {
+            *out = caps;
+            0
+        }
+        Err(_) => EINVAL,
+    }
+}
+
 #[repr(C)]
 pub struct MtkWlanRxInfo {
     pub rxd: [u32; 5],
@@ -343,6 +393,29 @@ pub extern "C" fn mtk_wlan_txs_records(len: usize) -> usize {
     mtk_wlan::connac2::event::txs_records(len)
 }
 
+/// Raw TXS fields only: this record has no DMA-token lifetime identity.
+///
+/// # Safety
+/// `record` points to `len` readable bytes; `out` is writable when nonnull.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_wlan_txs_parse(
+    record: *const u8,
+    len: usize,
+    out: *mut mtk_wlan::connac2::event::TxStatus,
+) -> bool {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return false;
+    };
+    *out = Default::default();
+    match mtk_wlan::connac2::event::parse_txs(unsafe { image(record, len) }) {
+        Ok(status) => {
+            *out = status;
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[repr(C)]
 pub struct MtkWlanTxFreeIter {
     words: *const u8,
@@ -454,6 +527,265 @@ pub unsafe extern "C" fn mtk_wlan_dma_rx_segment(
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    const FEATURES: FwFeatures = FwFeatures {
+        present: true,
+        segment: 2,
+        flags: 0xc0,
+    };
+
+    fn feature_metadata() -> Vec<u8> {
+        let mut data = vec![b'#'; 16];
+        data.extend_from_slice(&[20, 0, 0, 0, 16, 0, 0, 4, 2, 0xc0]);
+        data.extend_from_slice(&[0; 14]);
+        data
+    }
+
+    fn ram_image(metadata: &[u8]) -> Vec<u8> {
+        let mut data = vec![0xaa; 3];
+        data.extend_from_slice(metadata);
+        let mut region = [0; 40];
+        region[16..20].copy_from_slice(&0x9000_0000u32.to_le_bytes());
+        region[20..24].copy_from_slice(&3u32.to_le_bytes());
+        region[24] = mtk_wlan::connac2::fw::FW_FEATURE_OVERRIDE_ADDR;
+        data.extend_from_slice(&region);
+        let mut trailer = [0; 36];
+        trailer[2] = 1;
+        data.extend_from_slice(&trailer);
+        data
+    }
+
+    #[test]
+    fn c_abi_layouts_and_function_signatures() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(size_of::<FwFeatures>(), 3);
+        assert_eq!(align_of::<FwFeatures>(), 1);
+        assert_eq!(offset_of!(FwFeatures, present), 0);
+        assert_eq!(offset_of!(FwFeatures, segment), 1);
+        assert_eq!(offset_of!(FwFeatures, flags), 2);
+        assert_eq!(size_of::<PhyCaps>(), 12);
+        assert_eq!(align_of::<PhyCaps>(), 1);
+        assert_eq!(offset_of!(PhyCaps, nss), 4);
+        assert_eq!(offset_of!(PhyCaps, dbdc), 5);
+        assert_eq!(offset_of!(PhyCaps, hw_path), 10);
+        assert_eq!(offset_of!(PhyCaps, he), 11);
+        assert_eq!(mtk_wlan::connac2::fw::FW_CAP_CNM, 0x80);
+        let _: unsafe extern "C" fn(*const u8, usize, *mut FwFeatures) -> i32 =
+            mtk_wlan_ram_features;
+        let _: unsafe extern "C" fn(*const u8, usize, *mut PhyCaps) -> i32 =
+            mtk_wlan_phy_caps_parse;
+
+        // The separate diagnostic API must not grow/change the download ABI.
+        assert_eq!(size_of::<MtkWlanRamInfo>(), 40);
+        assert_eq!(offset_of!(MtkWlanRamInfo, chip_id), 0);
+        assert_eq!(offset_of!(MtkWlanRamInfo, eco_code), 1);
+        assert_eq!(offset_of!(MtkWlanRamInfo, regions), 2);
+        assert_eq!(offset_of!(MtkWlanRamInfo, fw_ver), 3);
+        assert_eq!(offset_of!(MtkWlanRamInfo, build_date), 14);
+        assert_eq!(offset_of!(MtkWlanRamInfo, override_addr), 32);
+        assert_eq!(offset_of!(MtkWlanRamInfo, start_option), 36);
+    }
+
+    #[test]
+    fn ram_features_ffi_reads_shipped_images() {
+        for name in ["mwx-mt7922_ram_code_1", "mwx-mt7961_ram_code_1"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../firmware/wifi")
+                .join(name);
+            let data = std::fs::read(path).unwrap();
+            let mut out = FwFeatures::default();
+            assert_eq!(
+                unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut out) },
+                0
+            );
+            assert_eq!(out, FEATURES, "fixture {name}");
+        }
+    }
+
+    #[test]
+    fn ram_features_ffi_distinguishes_present_and_absent() {
+        let metadata = feature_metadata();
+        let data = ram_image(&metadata);
+        let mut out = FwFeatures::default();
+        assert_eq!(
+            unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut out) },
+            0
+        );
+        assert_eq!(out, FEATURES);
+        let mut no_feature = metadata.clone();
+        no_feature[23] = 0x99;
+        for metadata in [vec![], no_feature] {
+            let data = ram_image(&metadata);
+            out = FEATURES;
+            assert_eq!(
+                unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut out) },
+                0
+            );
+            assert_eq!(out, FwFeatures::default());
+        }
+        let mut zero_flags = metadata;
+        zero_flags[25] = 0;
+        let data = ram_image(&zero_flags);
+        assert_eq!(
+            unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut out) },
+            0
+        );
+        assert_eq!(
+            out,
+            FwFeatures {
+                flags: 0,
+                ..FEATURES
+            }
+        );
+    }
+
+    #[test]
+    fn ram_features_ffi_clears_output_on_all_errors() {
+        let metadata = feature_metadata();
+        let good = ram_image(&metadata);
+        let mut out = FEATURES;
+        for len in [0, 1, usize::MAX] {
+            assert_eq!(
+                unsafe { mtk_wlan_ram_features(core::ptr::null(), len, &mut out) },
+                EINVAL
+            );
+            assert_eq!(out, FwFeatures::default());
+            out = FEATURES;
+        }
+        assert_eq!(
+            unsafe { mtk_wlan_ram_features(good.as_ptr(), good.len(), core::ptr::null_mut()) },
+            EINVAL
+        );
+        let mut failures = vec![vec![], vec![0; 35]];
+        // The descriptor table stays intact, so these are metadata errors,
+        // not merely whole-image truncations caught by RamImage::parse.
+        for len in 1..metadata.len() {
+            failures.push(ram_image(&metadata[..len]));
+        }
+        let mut bad = metadata.clone();
+        bad[16..18].copy_from_slice(&u16::MAX.to_le_bytes());
+        failures.push(ram_image(&bad));
+        let mut bad = metadata.clone();
+        bad[22] = 1; // inner padding cannot consume bytes from the table
+        failures.push(ram_image(&bad));
+        let mut bad = metadata.clone();
+        bad.extend_from_slice(&metadata[20..]); // duplicate feature
+        bad[16] = 40;
+        failures.push(ram_image(&bad));
+        let mut bad = metadata.clone();
+        bad.push(0); // malformed record after an otherwise valid feature
+        bad[16] = 21;
+        failures.push(ram_image(&bad));
+        let mut bad = metadata;
+        bad.push(0); // an oversized but in-bounds feature payload
+        bad[16] = 21;
+        bad[20] = 17;
+        failures.push(ram_image(&bad));
+        let mut bad = good.clone();
+        let table = bad.len() - 36 - 40;
+        bad[table + 20..table + 24].copy_from_slice(&u32::MAX.to_le_bytes());
+        failures.push(bad);
+        let mut bad = good;
+        let trailer = bad.len() - 36;
+        bad[trailer + 2] = u8::MAX;
+        failures.push(bad);
+        for (i, data) in failures.iter().enumerate() {
+            out = FEATURES;
+            assert_eq!(
+                unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut out) },
+                EINVAL,
+                "case {i}"
+            );
+            assert_eq!(out, FwFeatures::default(), "case {i}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_errors_do_not_change_ram_download_ffi() {
+        let data = ram_image(&[0x12]);
+        let mut features = FEATURES;
+        assert_eq!(
+            unsafe { mtk_wlan_ram_features(data.as_ptr(), data.len(), &mut features) },
+            EINVAL
+        );
+        assert_eq!(features, FwFeatures::default());
+        let mut info = MtkWlanRamInfo {
+            chip_id: 0,
+            eco_code: 0,
+            regions: 0,
+            fw_ver: [0; 11],
+            build_date: [0; 16],
+            override_addr: 0,
+            start_option: 0,
+        };
+        assert_eq!(
+            unsafe { mtk_wlan_ram_parse(data.as_ptr(), data.len(), &mut info) },
+            0
+        );
+        assert_eq!(info.regions, 1);
+        assert_eq!(info.override_addr, 0x9000_0000);
+        assert_eq!(info.start_option, mtk_wlan::connac2::fw::FW_START_OVERRIDE);
+        let mut region = MtkWlanFwRegion {
+            addr: 0,
+            len: 0,
+            mode: 0,
+            offset: 0,
+            feature: 0,
+            download: false,
+        };
+        assert_eq!(
+            unsafe { mtk_wlan_ram_region(data.as_ptr(), data.len(), 0, &mut region) },
+            0
+        );
+        assert_eq!(
+            (region.addr, region.offset, region.len),
+            (0x9000_0000, 0, 3)
+        );
+        assert!(region.download);
+    }
+
+    #[test]
+    fn phy_caps_ffi_preserves_raw_bytes_and_clears_errors() {
+        let bytes = [
+            0x80, 0x81, 0x82, 0x83, 0xff, 0x85, 0x86, 0x87, 0x88, 0x89, 0xfe, 0x8b,
+        ];
+        let expected = PhyCaps::parse(&bytes).unwrap();
+        let mut extended = bytes.to_vec();
+        extended.extend_from_slice(&[0xaa; 20]);
+        let mut out = PhyCaps::default();
+        for data in [bytes.as_slice(), extended.as_slice()] {
+            assert_eq!(
+                unsafe { mtk_wlan_phy_caps_parse(data.as_ptr(), data.len(), &mut out) },
+                0
+            );
+            assert_eq!(out, expected);
+        }
+        for len in 0..12 {
+            out = expected;
+            assert_eq!(
+                unsafe { mtk_wlan_phy_caps_parse(bytes.as_ptr(), len, &mut out) },
+                EINVAL
+            );
+            assert_eq!(out, PhyCaps::default());
+        }
+        for len in [0, 12, usize::MAX] {
+            out = expected;
+            assert_eq!(
+                unsafe { mtk_wlan_phy_caps_parse(core::ptr::null(), len, &mut out) },
+                EINVAL
+            );
+            assert_eq!(out, PhyCaps::default());
+        }
+        assert_eq!(
+            unsafe { mtk_wlan_phy_caps_parse(bytes.as_ptr(), bytes.len(), core::ptr::null_mut()) },
+            EINVAL
+        );
     }
 }
 

@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
 """Local, production-extracted coverage for the gated native AWDL lifecycle.
 
-No cargo, kext, hardware, or upstream-file writes. All companion scenarios run
-with strict ASan/UBSan, without recovery or suppression. An isolated, expected-
-failure old-reference negative control proves packed alignment detection.
-The one permitted retained Wi-Fi archive supplies the REAL State/DataPeers/Timeline implementation. Source
-bodies are copied verbatim, including invalidation, polling, and gate dispatch.
+No kext, hardware, or upstream-file writes. All companion scenarios run with
+strict ASan/UBSan, without recovery or suppression. An isolated, expected-failure
+old-reference negative control proves packed alignment detection. --fresh-ffi
+builds the current Wi-Fi Rust core offline using the installed pinned nightly in
+a new target directory, checking Cargo artifacts and source/archive provenance.
+Without it, the previously retained archive is accepted only when its recorded
+Rust inputs still match. Both supply the REAL State/DataPeers/Timeline code.
+Source bodies are copied verbatim, including invalidation, polling, and dispatch.
 Only private OS/IOKit/HAL boundaries are modeled.  The unchanged native-control
 and native-window assertion blocks are read as AST string literals, not executed
 as extractors, and are run on the new complete extraction.
 
 This is a companion, NOT a repair of the upstream extractors.  In particular it
 is not the whole MI-discovery fixture, the UMI terminal-state table, or the
-KERNEL-only RX gate/BPF/scratch-layout contract.  The retained Rust archive is not
-sanitizer-instrumented; the extracted C++ and its host boundaries are.
+KERNEL-only RX gate/BPF/scratch-layout contract. The Rust archive is not sanitizer-
+instrumented; the extracted C++ and its host boundaries are. The HAL reserve
+boundary returns absent timing by default; only explicitly injected observations
+are measured test inputs, never inferred from synthetic grants.
 
-Run with python3 -I -B scripts/test-awdl-native-lifecycle.py.  Every invocation
-creates a new diagnostics directory and retains its commands, sources and logs.
+Run with python3 -I -B scripts/test-awdl-native-lifecycle.py --fresh-ffi.
+Every invocation creates a new diagnostics directory and retains commands,
+sources and logs. --compare-head-upstream reruns unchanged upstream extractors
+with only their production-source reads redirected to git HEAD snapshots; it
+does not build or claim to validate an entire HEAD tree.
 """
 from __future__ import annotations
 
@@ -56,8 +64,8 @@ INTERFACE_GROUPS = {
     "bsd_datapath": "getHardwareAssists setHardwareAssists publishBSDOffloadState prepareBSDInterface enable enableGated enableInGate disable disableGated disableInGate dataPathGated enableDatapath disableDatapath setDataPathEnabled submitNative drainCompletions inputNative",
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
-    "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishScheduler serviceInGate receive",
+    "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady setSyncInGate finishAvailabilityWindowForDisable",
+    "timer_polling_windows": "makeFrame buildAmsdu output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
     "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
@@ -201,6 +209,8 @@ PREAMBLE = r'''
 #include <cerrno>
 #include <AWDL/AwdlProtocol.hpp>
 #include <AWDL/AwdlTimeline.hpp>
+#include <AWDL/AwdlForwardAdmission.hpp>
+#include <AWDL/AwdlRocTrace.hpp>
 #include <AWDL/AwdlAdvertisers.hpp>
 #define XYLog(...) ((void)0)
 #define IOLog(...) ((void)0)
@@ -238,6 +248,11 @@ void clock_interval_to_deadline(unsigned n,unsigned scale,AbsoluteTime *out) {
 }
 IOThread IOThreadSelf() { thread_local unsigned identity; return &identity; }
 bool failInterfaceAllocation=false;
+std::map<std::string,int> bootArguments;
+bool PE_parse_boot_argn(const char *name,void *value,int length) {
+ auto found=bootArguments.find(name); if(found==bootArguments.end())return false;
+ assert(length==sizeof(int)); memcpy(value,&found->second,sizeof(int)); return true;
+}
 struct Faults {
  bool social=true,base=false,virtualInit=false,timer=false,timerAdd=false,attach=false,
  resource=false,deferral=false,nativeStart=false,mac=false,macMismatch=false,
@@ -262,6 +277,8 @@ struct OSObject {
  virtual void release() { assert(refs); ++releases; if(--refs==0) { free(); delete this; } }
 };
 struct OSDictionary:OSObject {};
+struct OSIterator:OSObject { OSObject *getNextObject() { return nullptr; } };
+struct OSData:OSObject { unsigned getLength() { return 0; } void *getBytesNoCopy() { return nullptr; } };
 struct IOService:OSObject {
  std::map<std::string,uint64_t> properties;
  std::map<std::string,std::vector<uint8_t>> byteProperties;
@@ -276,6 +293,9 @@ struct IOService:OSObject {
  }
  OSObject *getProperty(const char *key) { return properties.count(key)&&properties[key] ? this : nullptr; }
  void removeProperty(const char *key) { properties.erase(key); stringProperties.erase(key); byteProperties.erase(key); }
+ // No GPU-registry match in this host model; no GPU readiness claim is made.
+ static OSDictionary *serviceMatching(const char *name) { assert(!strcmp(name,"IOPCIDevice")); return nullptr; }
+ static OSIterator *getMatchingServices(OSDictionary *) { return nullptr; }
  static OSDictionary *resourceMatching(const char *name) { assert(!strcmp(name,"IOBSD")); return new OSDictionary; }
  static IOService *copyMatchingService(OSDictionary *) { return fault.resource ? nullptr : new IOService; }
 };
@@ -352,10 +372,14 @@ unsigned ifnet_capabilities_supported(ifnet_t p) { return p->supported; }
 int ifnet_set_lladdr(ifnet_t p,const void *mac,unsigned n) { assert(n==6); ++bsdBoundary.lladdrCalls; memcpy(p->mac,mac,n); return 0; }
 struct Packet { std::vector<uint8_t> bytes; unsigned flags=1; };
 using mbuf_t=Packet *;
-constexpr unsigned MBUF_DONTWAIT=0,MBUF_PKTHDR=1;
+constexpr unsigned MBUF_DONTWAIT=0,MBUF_PKTHDR=1,MBUF_WAITOK=2;
 int mbuf_allocpacket(unsigned flags,size_t n,unsigned *chunks,mbuf_t *out) {
- assert(flags==MBUF_DONTWAIT&&*chunks==1); *out=new Packet; (*out)->bytes.resize(n); return 0;
+ assert((flags==MBUF_DONTWAIT||flags==MBUF_WAITOK)&&*chunks==1); *out=new Packet; (*out)->bytes.resize(n); return 0;
 }
+// Deliberately single-segment mbufs; kernel chain allocation is outside coverage.
+mbuf_t mbuf_next(mbuf_t) { return nullptr; }
+size_t mbuf_len(mbuf_t p) { return p->bytes.size(); }
+size_t mbuf_maxlen(mbuf_t p) { return p->bytes.size(); }
 void mbuf_freem(mbuf_t p) { delete p; }
 void *mbuf_data(mbuf_t p) { return p->bytes.data(); }
 size_t mbuf_pkthdr_len(mbuf_t p) { return p->bytes.size(); }
@@ -387,23 +411,29 @@ HAL_AFTER_ABI = r'''
    out=injected.front(); injected.pop_front(); return true; }
  };
  struct IC { uint8_t ic_myaddr[6]={2,1,2,3,4,5}; int ic_state=4; bool ic_wcl_mac_reconfig=false;
+  struct { uint64_t Attempt=0; } ic_join_diag;
+  struct Node { uint8_t ni_bssid[6]={2,9,9,9,9,9}; } modelBss; Node *ic_bss=&modelBss;
   struct { unsigned if_flags=IFF_RUNNING; } ic_if;
  };
  struct Com {
   IOLock *sc_awdl_lock=nullptr;
   bool sc_awdl_enabled=false,sc_awdl_stopping=false,sc_resetting=false,sc_detaching=false;
   uint64_t sc_awdl_native_session=0;
+  uint32_t sc_awdl_epoch=0; AwdlRocTiming sc_awdl_roc_timing{};
   void *sc_awdl_context=nullptr; AwdlReceive sc_awdl_receive=nullptr;
   IC sc_ic; TerminalBoundary sc_awdl_native_tx;
  } storage;
  Com *com=&storage;
  IC &ic=storage.sc_ic;
  bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false;
- uint8_t infraChannel=0,requested=0,preparedChannel=0;
+ // Firmware startup has a ready infrastructure link. NativeFixture later
+ // removes this modeled link after the actual first-sync readiness check.
+ uint8_t infraChannel=6,requested=0,preparedChannel=0;
  unsigned reserves=0,aborts=0,prepares=0,transmits=0,enables=0,disables=0,publishes=0,wakes=0,sleeps=0;
  unsigned receiverSets=0,receiverClears=0,transportEpoch=0;
  uint32_t duration=0; mtkawdl::Reservation grant{};
- IOReturn enableStatus=0,peerDeleteResult=0,tryStatus=0;
+ IOReturn enableStatus=0,peerDeleteResult=0,tryStatus=0,reserveResult=0;
+ std::function<void(AwdlRocTiming &)> onReserveTiming;
  std::function<void()> onReserve,onPrepare,wait;
  std::function<void(bool)> onPeer,onEnable;
  MtkMwx() { storage.sc_awdl_lock=IOLockAlloc(); assert(storage.sc_awdl_lock); }
@@ -420,10 +450,19 @@ HAL_AFTER_ABI = r'''
  bool awdlDensePresenceAllowed(uint8_t) { return dense; }
  bool awdlIsEnabled() { return on; }
  bool awdlGrantSnapshot(mtkawdl::Reservation &out) { out=grant; return on; }
+ bool awdlRocTimingSnapshot(AwdlRocTiming &);
  bool awdlCanTransmit(unsigned c) { return grant.canTransmit(c,clockUS.load()); }
  void awdlAbort() { gatedBoundary(); ++aborts; grant.cancel(); }
  IOReturn awdlPrepareChannel(unsigned c) { gatedBoundary(); ++prepares; preparedChannel=c; if(onPrepare)onPrepare(); return 0; }
- IOReturn awdlReserve(unsigned c,unsigned ms) { gatedBoundary(); ++reserves; requested=c; duration=ms; if(onReserve)onReserve(); return 0; }
+ IOReturn awdlReserve(uint8_t c,uint32_t ms,AwdlRocTiming *timing=nullptr) {
+  if(timing)*timing={}; gatedBoundary(); ++reserves; requested=c; duration=ms;
+  // Boundary-only input: never manufacture timing from the modeled clock or
+  // grant. Keep this invocation's explicit partial output across callback reentry.
+  AwdlRocTiming own{}; const IOReturn result=reserveResult;
+  auto timingHook=onReserveTiming; if(timingHook)timingHook(own);
+  auto hook=onReserve; if(hook)hook();
+  if(timing)*timing=own; return result;
+ }
  IOReturn awdlPeer(const uint8_t *,bool add) { gatedBoundary(); if(onPeer)onPeer(add); return add?0:peerDeleteResult; }
  IOReturn awdlRxBlockAck(const uint8_t *,uint8_t,uint16_t,uint16_t,bool value) { gatedBoundary(); return value?kIOReturnUnsupported:0; }
  IOReturn awdlEnable(const uint8_t *,bool);
@@ -520,7 +559,10 @@ struct IOTimerEventSource:OSObject {
  void setTimeoutUS(unsigned n) { pending=true; us=n; }
  void cancelTimeout() { pending=false; us=0; mark("timer-cancel"); }
  void disable() { enabled=false; mark("timer-disable"); }
- void fire() { gatedBoundary(); action(target,this); }
+ void enable() { enabled=true; mark("timer-enable"); }
+ // Consume the one-shot before dispatch. A callback must explicitly rearm it.
+ // Tests may also force entry to exercise synchronous native callback reentry.
+ void fire() { gatedBoundary(); pending=false; us=0; action(target,this); }
 };
 IOReturn WorkLoop::addEventSource(OSObject *o) {
  if(dynamic_cast<IOTimerEventSource *>(o)) { if(fault.timerAdd)return kIOReturnError; }
@@ -690,12 +732,13 @@ struct NativeFixture:AirportMtkAwdlInterface {
   assert(mwx_awdl_native_history_init());
   assert(initWithController(&controller,&mac,&radio)); assert(attach(&controller));
   assert(start(&controller)); assert(enable(0)==0); assert(setSync(true)==0);
+  assert(enabled&&readyGateBypassed); radio.infraChannel=0;
   afMode.mode=3; syncParams.synchronization_frame_period=440;
   timer->calls=0; return *timer;
  }
  NativeFixture():radio(controller.hal),t(initialize()),clock(t) {}
  ~NativeFixture() override {
-  onStart=onEnd=nullptr; radio.onPeer=nullptr; radio.onReserve=nullptr; radio.wait=nullptr; radio.onEnable=nullptr;
+  onStart=onEnd=nullptr; radio.onPeer=nullptr; radio.onReserve=nullptr; radio.onReserveTiming=nullptr; radio.wait=nullptr; radio.onEnable=nullptr;
   gate.enter([&]{shutdown(); stop(&controller); if(attached)detach(&controller); free(); return 0;});
   assert(refs==1&&retains==releases);
  }
@@ -1144,7 +1187,7 @@ def generate(ex: Extractor) -> str:
     text = PREAMBLE
     text += ex.structure(VAR, "apple80211_channel")
     text += "\n".join(ex.structure(IOCTL, name) for name in STRUCT_NAMES)
-    text += HAL_SUPPORT + abi + HAL_AFTER_ABI
+    text += HAL_SUPPORT + abi + ex.structure(HAL_HEADER, "AwdlRocTiming") + HAL_AFTER_ABI
     text += RESOURCES + ex.structure(NATIVE_ETH, "RegistrationInfo") + NATIVE_AFTER_REGISTRATION
     text += "\n".join(pure) + "\n};\n" + OWNER_SUPPORT + owner_decl + "\n};\n"
     text += "class AirportMtkAwdlInterface:public IO80211AWDLProtocol {\n OSDeclareDefaultStructors(AirportMtkAwdlInterface)\npublic:\n"
@@ -1155,9 +1198,12 @@ def generate(ex: Extractor) -> str:
     text += ex.span(HAL, module_start, module_end, "module-lifetime native history/session declarations")
     text += ex.function(HAL, "mwx_awdl_native_history_init") + ex.function(HAL, "mwx_awdl_native_new_session")
     text += ex.function(INTERFACE, "awdlNow") + ex.function(HAL, "mwx_awdl_now")
-    for name in ["awdlSetReceiver", "awdlTxSession", "awdlTakeTxResult", "awdlInterfaceReady"]:
+    for name in ["awdlSetReceiver", "awdlTxSession", "awdlTakeTxResult", "awdlInterfaceReady", "awdlRocTimingSnapshot"]:
         text += ex.function(HAL, "MtkMwx::" + name)
     text += POST_TYPES
+    for helper in ["awdlTickUS", "awdlScheduleService", "peerScheduleKnown", "awdlAmsduEnabled",
+                   "awdlPeerGateMode", "awdlPeerGateSlackUS", "awdlRenewStationOnNoPeer", "amsduZero", "amsduWrite"]:
+        text += ex.function(INTERFACE, helper)
     for name in names:
         text += ex.function(INTERFACE, "AirportMtkAwdlInterface::" + name)
     for name in ["NativeRxAllocation", "~NativeRxAllocation", "currentPeer"]:
@@ -1207,13 +1253,26 @@ struct OriginalGateEntry {
     return prefix + "\n#define AirportMtkAwdlInterface " + fixture + "\n" + ex.assertions(VENDOR / ("tests/awdl/test-"+kind+".py"), marker) + "\n#undef AirportMtkAwdlInterface\n"
 
 
+def rust_input_hashes() -> dict[str, str]:
+    paths = set((ROOT / "rust").glob("*.toml")) | {ROOT / "rust/Cargo.lock"}
+    for crate in (ROOT / "rust").glob("mtk-*"):
+        paths.update(crate.rglob("*.rs"))
+        paths.update(crate.rglob("*.toml"))
+    for folder in [ROOT / "rust/targets", ROOT / "rust/.cargo"]:
+        paths.update(p for p in folder.rglob("*") if p.is_file())
+    return {str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in sorted(paths)}
+
+
 def protected_hashes() -> dict[str, str]:
-    # Do not read any other worker's scripts. Protect tracked production, Rust,
-    # the upstream runner, and every upstream fixture (including untracked ones).
+    # Protect production/Rust inputs and upstream fixtures, including new headers
+    # and untracked Rust source. Do not hash unrelated workers' local scripts.
     result = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", "kext", "rust", "scripts/test-awdl.sh"],
                             check=True, stdout=subprocess.PIPE)
     paths = {ROOT / p.decode() for p in result.stdout.split(b"\0") if p}
     paths |= {p for p in (VENDOR / "tests/awdl").rglob("*") if p.is_file()}
+    paths.update((VENDOR / "include/AWDL").glob("*.hpp"))
+    paths.add(Path(__file__).resolve())
+    paths.update(ROOT / p for p in rust_input_hashes())
     return {str(p.relative_to(ROOT)): digest(p.read_bytes()) for p in sorted(paths)}
 
 
@@ -1239,12 +1298,162 @@ def archive_provenance() -> dict:
             "rust_sanitizer_instrumented": False}
 
 
+class CommandLog:
+    """Small shared runner; commands, complete output and exit codes are retained."""
+    def __init__(self, out: Path, env: dict) -> None:
+        self.out, self.env, self.commands = out, env, []
+
+    def __call__(self, name: str, command: list[str], timeout: int = 120,
+                 run_env: dict | None = None, *, cwd: Path = ROOT) -> int:
+        command = [str(arg) for arg in command]
+        started = time.monotonic()
+        effective = run_env or self.env
+        entry = {"name": name, "command": command, "shell_command": shlex.join(command), "cwd": str(cwd),
+                 "started_at": utc(), "timeout_seconds": timeout,
+                 "environment": {k: effective[k] for k in ["PATH", "ASAN_OPTIONS", "UBSAN_OPTIONS", "SDKROOT", "DEVELOPER_DIR",
+                    "RUSTUP_TOOLCHAIN", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_NET_OFFLINE"] if k in effective}}
+        with (self.out / (name+".log")).open("wb") as log:
+            log.write(("$ "+shlex.join(command)+"\nCWD "+str(cwd)+"\n"+json.dumps(entry["environment"])+"\n").encode())
+            log.flush()
+            try:
+                proc = subprocess.run(command, cwd=cwd, env=effective, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
+                status = proc.returncode
+            except subprocess.TimeoutExpired:
+                status = 124
+                log.write(b"\nHOST TIMEOUT\n")
+            except OSError as error:
+                status = 127
+                log.write((repr(error)+"\n").encode())
+        entry.update({"exit_code": status, "ended_at": utc(), "elapsed_seconds": round(time.monotonic()-started, 6),
+                      "log": str(self.out / (name+".log"))})
+        self.commands.append(entry)
+        (self.out / "commands.json").write_text(json.dumps(self.commands, indent=2)+"\n")
+        return status
+
+    def output(self, name: str) -> str:
+        return (self.out / (name+".log")).read_text().split("\n", 3)[3]
+
+    def checked(self, name: str, command: list[str], timeout: int = 120, *, cwd: Path = ROOT) -> str:
+        status = self(name, command, timeout, cwd=cwd)
+        if status:
+            raise RuntimeError(f"{name} exited {status}; see {self.out / (name+'.log')}")
+        return self.output(name)
+
+
+def host_environment() -> dict:
+    env = os.environ.copy()
+    for key in ["CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH", "LIBRARY_PATH"]:
+        env.pop(key, None)
+    env.update(ASAN_OPTIONS="halt_on_error=1:abort_on_error=1:detect_stack_use_after_return=1",
+               UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
+    return env
+
+
+def build_fresh_archive(out: Path, run: CommandLog) -> dict:
+    """Build a new host-only wifi archive; no installs, network or shared target."""
+    before = rust_input_hashes()
+    (out / "rust-inputs.before.json").write_text(json.dumps(before, indent=2)+"\n")
+    channel = re.search(r'^channel\s*=\s*"([^"]+)"',
+                        (ROOT / "rust/rust-toolchain.toml").read_text(), re.MULTILINE).group(1)
+    installed = run.checked("installed-toolchains", ["rustup", "toolchain", "list"])
+    if not any(line.split()[0] == channel or line.split()[0].startswith(channel+"-")
+               for line in installed.splitlines() if line.split()):
+        raise RuntimeError("Pinned toolchain is not installed (will not download): "+channel)
+    env = run.env
+    if "DEVELOPER_DIR" not in env and "CommandLineTools" in run.checked("xcode-select", ["xcode-select", "-p"]):
+        env["DEVELOPER_DIR"] = "/Applications/Xcode.app/Contents/Developer"
+    env["RUSTUP_TOOLCHAIN"] = channel
+    rustc = run.checked("pinned-rustc", ["rustup", "which", "--toolchain", channel, "rustc"]).strip()
+    cargo = run.checked("pinned-cargo", ["rustup", "which", "--toolchain", channel, "cargo"]).strip()
+    env.update(RUSTC=rustc, RUSTC_WRAPPER="", RUSTC_WORKSPACE_WRAPPER="", CARGO_NET_OFFLINE="true")
+    for key in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "CARGO_BUILD_TARGET"]:
+        env.pop(key, None)
+    run.checked("rustc-version", [rustc, "--version", "--verbose"])
+    run.checked("cargo-version", [cargo, "--version", "--verbose"])
+    host = out / "rust-host"
+    host.mkdir(exist_ok=False)
+    output = run.checked("cargo-build", [cargo, "build", "--offline", "--locked", "-p", "mtk-ffi",
+                         "--no-default-features", "--features", "wifi", "--target-dir", str(host),
+                         "--message-format=json-render-diagnostics"], 300, cwd=ROOT / "rust")
+    rows = [json.loads(line) for line in output.splitlines() if line.startswith('{')]
+    assert any(r.get("reason") == "build-finished" and r.get("success") for r in rows), "Cargo build did not finish"
+    artifacts = {r["target"]["name"]: r for r in rows if r.get("reason") == "compiler-artifact"}
+    ffi, wlan = artifacts["mtk_ffi"], artifacts["mtk_wlan"]
+    assert not ffi["fresh"] and not wlan["fresh"], "new target unexpectedly reused compiled crates"
+    assert "wifi" in ffi["features"] and "bt" not in ffi["features"] and "mtk_bt" not in artifacts
+    assert Path(ffi["target"]["src_path"]).resolve() == ROOT / "rust/mtk-ffi/src/lib.rs"
+    archive = next(Path(name).resolve() for name in ffi["filenames"] if name.endswith(".a"))
+    assert archive.is_file() and host.resolve() in archive.parents
+    dependency_line = archive.with_suffix(".d").read_text().splitlines()[0].split(": ", 1)[1]
+    dependencies = {str(Path(p).resolve().relative_to(ROOT)) for p in shlex.split(dependency_line) if p.endswith(".rs")}
+    assert dependencies and dependencies <= before.keys(), "archive dependency has no source fingerprint"
+    after = rust_input_hashes()
+    (out / "rust-inputs.after.json").write_text(json.dumps(after, indent=2)+"\n")
+    assert before == after, "Rust inputs changed during the fresh build; rerun on stable sources"
+    return {"mode": "fresh-offline-host", "archive": str(archive), "sha256": digest(archive.read_bytes()),
+            "size": archive.stat().st_size, "toolchain": channel, "rustc": rustc, "cargo": cargo,
+            "ffi_artifact": ffi, "wlan_artifact": wlan, "rust_sources": before,
+            "archive_rs_dependencies": sorted(dependencies), "rust_sanitizer_instrumented": False}
+
+
+def compare_head_upstream(out: Path, run: CommandLog, env: dict, results: dict) -> None:
+    """Keep extractors unchanged; redirect only their three production C++ inputs."""
+    folder = out / "head-source"
+    folder.mkdir()
+    mapping, sources = {}, {}
+    commit = run.checked("head-commit", ["git", "-C", str(ROOT), "rev-parse", "HEAD"]).strip()
+    for path in [INTERFACE, OWNER, HAL]:
+        relative = str(path.relative_to(ROOT))
+        text = run.checked("head-source-"+path.stem, ["git", "-C", str(ROOT), "show", commit+":"+relative])
+        snapshot = folder / path.name
+        snapshot.write_text(text)
+        mapping[str(path.resolve())] = str(snapshot)
+        sources[relative] = {"snapshot": str(snapshot), "sha256": digest(text.encode())}
+    manifest = folder / "mapping.json"
+    manifest.write_text(json.dumps(mapping, indent=2)+"\n")
+    driver = out / "head-extractor.py"
+    driver.write_text('''from pathlib import Path
+import json, runpy, sys
+script, manifest = Path(sys.argv[1]), Path(sys.argv[2])
+mapping = json.loads(manifest.read_text())
+original = Path.read_text
+def read_source(path, *args, **kwargs):
+    target = mapping.get(str(path.resolve()))
+    return original(Path(target) if target else path, *args, **kwargs)
+Path.read_text = read_source
+sys.argv = [str(script)]
+runpy.run_path(str(script), run_name="__main__")
+''')
+    results["head_upstream"] = {}
+    shared = {}
+    for fixture in sorted((VENDOR / "tests/awdl").glob("test-*.py")):
+        name = "head-upstream-"+fixture.stem
+        results["head_upstream"][fixture.name] = run(name, [sys.executable, "-I", "-B", str(driver),
+                                                            str(fixture), str(manifest)], 120, env)
+        current = set(re.findall(r"\berror: (.+)", run.output("upstream-"+fixture.stem)))
+        baseline = set(re.findall(r"\berror: (.+)", run.output(name)))
+        if current or baseline:
+            shared[fixture.name] = {"shared": sorted(current & baseline),
+                                    "current_only": sorted(current-baseline), "head_only": sorted(baseline-current)}
+    current_failed = sorted(name for name, status in results["upstream"].items() if status)
+    head_failed = sorted(name for name, status in results["head_upstream"].items() if status)
+    results["head_comparison"] = {
+        "commit": commit, "sources": sources, "current_failed": current_failed, "head_failed": head_failed,
+        "same_failed_suites": current_failed == head_failed, "compiler_errors": shared,
+        "scope": "Only production .cpp reads use HEAD. Untouched upstream extractors, current C++ headers and current wifi Rust archive; not a full HEAD build."}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--diagnostics", type=Path, help="new empty directory below build/diagnostics")
-    parser.add_argument("--skip-upstream", action="store_true", help="only companion; default also reruns the 13 unchanged extractors without cargo")
+    parser.add_argument("--fresh-ffi", action="store_true", help="fresh offline wifi archive from the installed pinned nightly")
+    parser.add_argument("--skip-upstream", action="store_true", help="only companion; default also reruns the 13 unchanged extractors")
+    parser.add_argument("--compare-head-upstream", action="store_true", help="also supply git HEAD production sources to unchanged extractors")
     args = parser.parse_args()
+    if args.skip_upstream and args.compare_head_upstream:
+        parser.error("--compare-head-upstream requires the upstream runs")
     base = ROOT / "build/diagnostics"
+    base.mkdir(parents=True, exist_ok=True)
     if args.diagnostics:
         out = args.diagnostics.resolve()
         if not out.is_relative_to(base.resolve()):
@@ -1252,39 +1461,17 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=False)
     else:
         out = Path(tempfile.mkdtemp(prefix="awdl-native-lifecycle-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")+"-", dir=base))
-    commands: list[dict] = []
     before = protected_hashes()
     (out / "protected-before.json").write_text(json.dumps(before, indent=2)+"\n")
-    env = os.environ.copy()
-    for key in ["CPATH", "CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH", "LIBRARY_PATH"]:
-        env.pop(key, None)
-    env.update({"ASAN_OPTIONS": "halt_on_error=1:abort_on_error=1:detect_stack_use_after_return=1",
-                "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"})
+    env = host_environment()
+    run = CommandLog(out, env)
     results: dict = {"diagnostics": str(out), "started_at": utc(), "companion": {}, "upstream": {}}
-
-    def run(name: str, command: list[str], timeout: int, run_env: dict | None = None) -> int:
-        started = time.monotonic()
-        effective = run_env or env
-        entry = {"name": name, "command": command, "shell_command": shlex.join(command), "cwd": str(ROOT),
-                 "started_at": utc(), "timeout_seconds": timeout,
-                 "environment": {k: effective[k] for k in ["PATH", "ASAN_OPTIONS", "UBSAN_OPTIONS", "SDKROOT", "DEVELOPER_DIR"] if k in effective}}
-        with (out / (name+".log")).open("wb") as log:
-            log.write(("$ "+shlex.join(command)+"\nCWD "+str(ROOT)+"\n"+json.dumps(entry["environment"])+"\n").encode())
-            log.flush()
-            try:
-                proc = subprocess.run(command, cwd=ROOT, env=effective, stdout=log, stderr=subprocess.STDOUT, timeout=timeout)
-                status = proc.returncode
-            except subprocess.TimeoutExpired:
-                status = 124
-                log.write(b"\nHOST TIMEOUT\n")
-        entry.update({"exit_code": status, "ended_at": utc(), "elapsed_seconds": round(time.monotonic()-started, 6),
-                      "log": str(out / (name+".log"))})
-        commands.append(entry)
-        (out / "commands.json").write_text(json.dumps(commands, indent=2)+"\n")
-        return status
+    archive, provenance = None, None
+    print("AWDL native lifecycle evidence: "+str(out), flush=True)
 
     try:
-        provenance = archive_provenance()
+        provenance = build_fresh_archive(out, run) if args.fresh_ffi else archive_provenance()
+        archive = Path(provenance["archive"])
         (out / "archive-provenance.json").write_text(json.dumps(provenance, indent=2)+"\n")
         ex = Extractor()
         source = generate(ex)
@@ -1302,7 +1489,7 @@ def main() -> int:
         for name in ["lifecycle", "native-controls", "native-windows"]:
             executable = out / name
             cpp = out / ("host-main.cpp" if name == "lifecycle" else name+".cpp")
-            command = flags + [str(cpp), str(ARCHIVE), "-o", str(executable)]
+            command = flags + [str(cpp), str(archive), "-o", str(executable)]
             results["compile"][name] = run("compile-"+name, command, 120)
             if results["compile"][name]:
                 continue
@@ -1322,12 +1509,15 @@ def main() -> int:
             bindir = out / "bin"
             bindir.mkdir()
             wrapper = bindir / "clang++"
-            wrapper.write_text("#!/bin/sh\nexec /usr/bin/clang++ \"$@\" "+shlex.quote(str(ARCHIVE))+"\n")
+            wrapper.write_text("#!/bin/sh\ncase \" $* \" in *\" -c \"*) exec /usr/bin/clang++ \"$@\" ;; esac\n"
+                               "exec /usr/bin/clang++ \"$@\" "+shlex.quote(str(archive))+"\n")
             wrapper.chmod(0o700)
             upstream_env = env.copy()
             upstream_env["PATH"] = str(bindir)+os.pathsep+env.get("PATH", "")
             for fixture in sorted((VENDOR / "tests/awdl").glob("test-*.py")):
                 results["upstream"][fixture.name] = run("upstream-"+fixture.stem, [sys.executable, "-I", "-B", str(fixture)], 120, upstream_env)
+            if args.compare_head_upstream:
+                compare_head_upstream(out, run, upstream_env, results)
     except Exception as error:
         results["error"] = repr(error)
         (out / "error.log").write_text(repr(error)+"\n")
@@ -1335,15 +1525,19 @@ def main() -> int:
         after = protected_hashes()
         changes = {k: {"before": before.get(k), "after": after.get(k)} for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
         results.update({"ended_at": utc(), "protected_files": len(before), "protected_changes": changes,
-                        "archive_unchanged": digest(ARCHIVE.read_bytes()) == ARCHIVE_SHA256,
+                        "archive_unchanged": bool(archive and archive.is_file() and digest(archive.read_bytes()) == provenance["sha256"]),
+                        "archive_mode": provenance.get("mode", "validated-retained") if provenance else None,
                         "test_awdl_sh_executed": False,
                         "limitations": ["Not the complete unchanged MI-discovery fixture", "No replica or coverage claim for the UMI terminal-state table",
                                         "Non-KERNEL host build omits RX gate/lifetime/BPF scratch-pointer guards and kernel-only trace calls",
                                         "Modeled HAL awdlEnable includes its own epoch-cancellation rule; production HAL operation/quiesce/epoch correctness is not validated",
+                                        "HAL awdlReserve is a boundary model with absent timing by default; awdlRocTimingSnapshot and the timing ABI are extracted verbatim",
+                                        "Startup models an associated channel-6 link for the real first-sync readiness check, then NativeFixture drops it; GPU registry enumeration is not exercised",
+                                        "Mbufs are single-segment host models; extracting buildAmsdu does not validate kernel chain allocation",
                                         "Preheld-gate upstream assertion companions do not validate original extractor compatibility or every original setup/dispatch assumption",
                                         "Private native ownership/copy/stop/reentrancy, firmware, RF and IOKit contracts remain unproved; host boundary models are not hardware verification",
                                         "ASan/UBSan do not establish race freedom; no TSan or native/kernel execution",
-                                        "Only C++ is sanitizer-instrumented; retained Rust archive is real but not instrumented",
+                                        "Only C++ is sanitizer-instrumented; the provenance-checked Rust archive is real but not instrumented",
                                         "Upstream extractors are unchanged; companion success does not make their extraction failures pass"]})
         (out / "protected-after.json").write_text(json.dumps(after, indent=2)+"\n")
         (out / "results.json").write_text(json.dumps(results, indent=2)+"\n")
@@ -1352,6 +1546,7 @@ def main() -> int:
     failed |= any(status for status in results["companion"].values())
     failed |= any(not control["expected_alignment_detected"] for control in results.get("negative_controls", {}).values())
     failed |= any(status for status in results["upstream"].values())
+    failed |= any(status for status in results.get("head_upstream", {}).values())
     return int(failed)
 
 

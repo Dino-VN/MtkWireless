@@ -187,7 +187,6 @@ bool AirportMtkWlan::init(OSDictionary *properties)
     setProperty("MTKAWDLCreateStatus",static_cast<uint64_t>(static_cast<uint32_t>(kIOReturnNotReady)),32);
 #endif
     power_state = 0;
-    memset(geo_location_cc, 0, sizeof(geo_location_cc));
     return ret;
 }
 
@@ -1016,36 +1015,65 @@ getHARDWARE_VERSION(OSObject *object,
     return kIOReturnSuccess;
 }
 
+// MtkWireless: validate the three-byte Apple country string, not an AP Country
+// IE (whose third byte is an environment). This is syntax validation, not a
+// regulatory policy or an ISO-country lookup. Keep 00, XX/ZZ and Apple's X0-X3
+// locale codes distinct; none is a geographic country or an alias for one.
+static bool mtkCopyCountryCode(const char *source,
+                               uint8_t (&country)[APPLE80211_MAX_CC_LEN])
+{
+    static_assert(APPLE80211_MAX_CC_LEN == 3, "Apple country string size");
+    if (!source || !source[0] || !source[1] || source[2] != '\0')
+        return false;
+    uint8_t a = source[0], b = source[1];
+    if (a >= 'a' && a <= 'z') a -= 'a' - 'A';
+    if (b >= 'a' && b <= 'z') b -= 'a' - 'A';
+    const bool alpha2 = a >= 'A' && a <= 'Z' && b >= 'A' && b <= 'Z';
+    const bool world = a == '0' && b == '0';
+    const bool appleLocale = a == 'X' && b >= '0' && b <= '3';
+    if (!alpha2 && !world && !appleLocale)
+        return false;
+    country[0] = a;
+    country[1] = b;
+    country[2] = '\0';
+    return true;
+}
+
 IOReturn AirportMtkWlan::
 getCOUNTRY_CODE(OSObject *object,
                                 struct apple80211_country_code_data *cd)
 {
-    char user_override_cc[3];
-    const char *cc_fw = fHalService->getDriverInfo()->getFirmwareCountryCode();
-
     if (!cd)
-        return kIOReturnError;
+        return kIOReturnBadArgument;
+    memset(cd, 0, sizeof(*cd));
     cd->version = APPLE80211_VERSION;
-    memset(user_override_cc, 0, sizeof(user_override_cc));
-    PE_parse_boot_argn("amtk_cc", user_override_cc, 3);
-    /* user_override_cc > firmware_cc > geo_location_cc */
-    strncpy((char*)cd->cc, user_override_cc[0] ? user_override_cc : ((cc_fw[0] == 'Z' && cc_fw[1] == 'Z' && geo_location_cc[0]) ? geo_location_cc : cc_fw), sizeof(cd->cc));
+    auto info = fHalService ? fHalService->getDriverInfo() : nullptr;
+    // This HAL getter exposes host-configured alpha2, currently 00, not EEPROM
+    // geography or firmware policy readback. The former amtk_cc override and
+    // geolocation hints changed reporting only; do not substitute either for
+    // the domain used by the channel/power commands and both WCL channel lists.
+    if (!info || !mtkCopyCountryCode(info->getFirmwareCountryCode(), cd->cc))
+        return kIOReturnNotReady;
     return kIOReturnSuccess;
 }
 
 IOReturn AirportMtkWlan::
 setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
 {
-    if (!data)
+    uint8_t requested[APPLE80211_MAX_CC_LEN] = {};
+    if (!data || !mtkCopyCountryCode(reinterpret_cast<const char *>(data->cc), requested))
         return kIOReturnBadArgument;
-    if (data->cc[0] != 'x' && data->cc[0] != 'X' &&
-        memcmp(geo_location_cc, data->cc, sizeof(geo_location_cc)) != 0) {
-        memcpy(geo_location_cc, data->cc, sizeof(geo_location_cc));
-        if (fNetIf)
-            static_cast<AirportMtkSkywalkInterface *>(fNetIf)->handleWCLEvent(
-                IEEE80211_EVT_COUNTRY_CODE_UPDATE, nullptr);
-    }
-    return kIOReturnSuccess;
+    apple80211_country_code_data effective = {};
+    IOReturn status = getCOUNTRY_CODE(object, &effective);
+    if (status != kIOReturnSuccess)
+        return status;
+    if (memcmp(requested, effective.cc, sizeof(requested)) == 0)
+        return kIOReturnSuccess; // Already configured; no change to announce.
+    // No HAL country-policy setter exists. This includes requests to reset to
+    // 00/XX/ZZ or select an Apple pseudo-locale: acknowledging a different code
+    // would claim a channel/power policy we did not apply. Leave the deferred,
+    // command-gated WCL notification path for actual effective-domain changes.
+    return kIOReturnUnsupported;
 }
 
 IOReturn AirportMtkWlan::

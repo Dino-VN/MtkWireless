@@ -51,13 +51,41 @@ other unsigned kexts are still loaded afterwards.
 |---|---|
 | `-novht` | disable 802.11ac |
 | `-noht40` | disable 40 MHz channels |
-| `amtk_cc=XX` | override the country code |
+| `amtk_cc=XX` | ignored; the former reporting-only override did not apply a regulatory policy (see below) |
 | `amtk_he=0` | do not offer 802.11ax (offered by default since 1.0.1, 80 MHz; `mtkctl knob 0x1002` does the same at runtime for the next join) |
 | `amtk_awdl=0` | disable native AWDL (on by default on Tahoe) |
 | `amtk_6ghz=1` | scan and report 6 GHz on chips that have it (MT7922, MT7921K); off by default: 6 GHz joins need SAE hash-to-element or OWE, not implemented ([WIFI-6GHZ.md](WIFI-6GHZ.md)) |
 | `amtk_roam=0` | no in-driver roaming: stay on the joined BSSID until the link drops ([ROAMING.md](ROAMING.md)) |
 | `amtk_awdl_offchan=0` | keep AWDL on the AP channel while associated (no PM handshake; AirDrop to phones on other channels fails) |
 | `amtk_pmf=0` | no 802.11w PMF and therefore no WPA3-SAE: WPA3-transition networks are shown to macOS as WPA2-PSK again, WPA3-only and PMF-required networks cannot be joined (the 1.0.0 behaviour) |
+
+## Country code and Location
+
+The current HAL initializes its configured country identifier to `00`. Despite
+its name, `getFirmwareCountryCode()` returns that host setting, not decoded
+EEPROM geography or verified firmware regulatory readback. `00` does not prove
+that the existing channel/power settings implement a compliant worldwide policy.
+
+On Tahoe 25G332, System Information's **Location** is a regulatory-locale
+classification, not a PCI-slot location. The native country-to-locale mapping
+returns **Unknown** for `00`; the UI can display that country string as `0`.
+**Those displayed values remain unchanged by the current reporting correction.**
+
+Country queries now consistently use the HAL identifier. The old `amtk_cc`
+override and geolocation fallback changed reporting without applying channel or
+power limits, so neither is used. Country-setting requests succeed only when
+already configured; a different well-formed code returns unsupported, malformed
+inputs are rejected, and neither rejection nor a no-op announces a country
+change. The legacy locale getter no longer invents FCC.
+
+Selecting a real country requires a coordinated HAL regulatory implementation,
+including hardware/firmware limits, channel/power updates and error handling.
+No country was inferred from the user's language or an AP's advertised Country
+IE, and no RF permissions are expanded by this reporting change.
+
+Offline regression: `python3 -I scripts/test-wifi-country-locale.py` (extracted
+C++ with ASan/UBSan and modeled HAL/IOKit boundaries, not native-runtime or RF
+validation).
 
 ## WPA3-Personal and PMF
 

@@ -78,6 +78,28 @@ pub fn data_queue_lifetime_us(s: &State, destination: &[u8; 6]) -> u32 {
 /// Lead before an EAW edge for the BSS and off-channel arbitration.
 pub const ROC_LEAD_US: u32 = 55_000;
 
+/// Prepare the AP's PM notification before the request deadline. The HAL
+/// still independently requires 2ms after successful submission; the extra
+/// 1ms is timer slack, not proof of an AP ACK or a substitute for a grant.
+pub const ROC_PREPARE_US: u64 = 3_000;
+
+pub fn roc_prepare_at(request_at: u64) -> u64 {
+    request_at.saturating_sub(ROC_PREPARE_US)
+}
+
+/// Wake exactly at the next preparation/request edge when it is closer
+/// than the regular 2ms service poll. Zero means the edge is already due.
+pub fn roc_poll_delay_us(now: u64, deadline: u64) -> u32 {
+    deadline.saturating_sub(now).min(2_000) as u32
+}
+
+/// End-to-end host readiness for a matched ROC. An early grant can arrive
+/// while the send helper still holds up the caller. Taking the later edge
+/// counts that overlap once, unlike adding call time to response time.
+pub fn roc_ready_delay_us(call_at: u64, returned_at: u64, grant_at: u64) -> u64 {
+    returned_at.max(grant_at).saturating_sub(call_at)
+}
+
 /// Bounded history of accepted ROC response/preparation delays.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +177,52 @@ impl RocChannelTiming {
             .map_or(fallback, |e| e.timing.lead_us)
     }
 
+    /// For the forward-recovery path only. Its bounded resampling policy can
+    /// revisit a channel even with a large old lead; the greedy/legacy path
+    /// must keep using `lead` and its eight-other-observation expiry.
+    pub fn lead_retained(&self, channel: u8, fallback: u32) -> u32 {
+        self.entries
+            .iter()
+            .find(|e| e.channel == channel && e.timing.count != 0)
+            .map_or(fallback, |e| e.timing.lead_us)
+    }
+
     pub fn observe(&mut self, channel: u8, response_us: u32, preparation_us: u64) {
+        self.observe_sample(channel, response_us, preparation_us, false);
+    }
+
+    /// Use a separate instance, reset on radio-context changes. Eight new
+    /// samples of this channel replace an outlier, not grants to other peers.
+    pub fn observe_retained(&mut self, channel: u8, response_us: u32, preparation_us: u64) {
+        self.observe_sample(channel, response_us, preparation_us, true);
+    }
+
+    /// Selective recovery must not keep refreshing a now-fast channel's old
+    /// maximum before ordinary eight-other-observation aging can clear it.
+    /// A reduction larger than the 8ms issue margin earns that settling grace,
+    /// not a new lead estimate. `self` is the separate current-context history;
+    /// both histories must show the reduction, so an old radio context cannot
+    /// postpone a new channel's recovery. C++ bounds grace by eight absent cycles.
+    pub fn recovery_grace(&self, legacy: &Self, channel: u8) -> bool {
+        self.recent_peak_reduced(channel) && legacy.recent_peak_reduced(channel)
+    }
+
+    fn recent_peak_reduced(&self, channel: u8) -> bool {
+        if channel == 0 || channel > 165 {
+            return false;
+        }
+        self.entries
+            .iter()
+            .find(|e| e.channel == channel)
+            .is_some_and(|e| {
+                let fresh = self.observations.wrapping_sub(e.observed) < 8;
+                let last = e.timing.next.wrapping_sub(1) as usize % 8;
+                fresh && e.timing.count > 1
+                    && e.timing.lead_us.saturating_sub(e.timing.samples[last]) > 8000
+            })
+    }
+
+    fn observe_sample(&mut self, channel: u8, response_us: u32, preparation_us: u64, retain: bool) {
         if channel == 0 || channel > 165 {
             return;
         }
@@ -173,10 +240,10 @@ impl RocChannelTiming {
         };
         let observations = self.observations;
         let entry = &mut self.entries[index];
-        if observations.wrapping_sub(entry.observed) >= 8 {
+        if !retain && observations.wrapping_sub(entry.observed) >= 8 {
             entry.timing = RocLeadTiming::default();
         }
-        self.observations += 1;
+        self.observations = self.observations.wrapping_add(1);
         entry.observed = self.observations;
         entry.timing.observe(response_us, preparation_us);
     }
@@ -470,6 +537,73 @@ impl Timeline {
         self.emitted = false;
         self.last_window_start = 0;
         self.radio_end = 0;
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn every_poll_phase_hits_the_preparation_edge() {
+        let request = 1_000_000;
+        let prepare = roc_prepare_at(request);
+        let mut old_guard_misses = 0;
+        for phase in 0..2_000 {
+            let first = request - 10_000 + phase;
+            let mut now = first;
+            let mut submitted = None;
+            while now < request {
+                let deadline = if now < prepare {
+                    prepare
+                } else {
+                    submitted.get_or_insert(now);
+                    request
+                };
+                let delay = roc_poll_delay_us(now, deadline);
+                assert!((1..=2_000).contains(&delay));
+                now += delay as u64;
+            }
+            assert_eq!(now - submitted.unwrap(), 3_000);
+
+            // Negative control: the old capped poll steps past preparation
+            // for half of its phases and leaves <2ms of PM submission age.
+            now = first;
+            submitted = None;
+            while now < request {
+                if request <= now + 3_000 {
+                    submitted.get_or_insert(now);
+                }
+                now += (request - now).min(2_000);
+            }
+            if now - submitted.unwrap() < 2_000 {
+                old_guard_misses += 1;
+            }
+        }
+        assert_eq!(old_guard_misses, 999);
+    }
+
+    #[test]
+    fn deadline_arithmetic_saturates_without_extending_the_poll() {
+        assert_eq!(roc_prepare_at(0), 0);
+        assert_eq!(roc_prepare_at(2_999), 0);
+        assert_eq!(roc_prepare_at(u64::MAX), u64::MAX - 3_000);
+        assert_eq!(roc_poll_delay_us(123, 122), 0);
+        assert_eq!(roc_poll_delay_us(123, 123), 0);
+        assert_eq!(roc_poll_delay_us(123, 124), 1);
+        assert_eq!(roc_poll_delay_us(0, u64::MAX), 2_000);
+        assert_eq!(roc_poll_delay_us(u64::MAX - 10, u64::MAX), 10);
+        assert_eq!(roc_poll_delay_us(u64::MAX, 0), 0);
+    }
+
+    #[test]
+    fn readiness_counts_early_grant_overlap_once() {
+        let call = 1_000_000;
+        assert_eq!(roc_ready_delay_us(call, call + 80_000, call + 30_000), 80_000);
+        assert_eq!(roc_ready_delay_us(call, call + 30_000, call + 80_000), 80_000);
+        assert_eq!(roc_ready_delay_us(call, call, call), 0);
+        assert_eq!(roc_ready_delay_us(call, call - 1, call - 2), 0);
+        assert_eq!(roc_ready_delay_us(0, u64::MAX, 0), u64::MAX);
     }
 }
 

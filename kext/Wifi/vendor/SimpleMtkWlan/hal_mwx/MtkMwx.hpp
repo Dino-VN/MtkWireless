@@ -73,10 +73,21 @@ public:
     bool awdlTakeTxResult(AwdlTxResult &result);
     uint64_t awdlTxSession();
     IOReturn awdlEnable(const uint8_t *address, bool enable);
-    IOReturn awdlReserve(uint8_t channel, uint32_t durationMs);
+    struct AwdlRocTiming;
+    IOReturn awdlReserve(uint8_t channel, uint32_t durationMs, AwdlRocTiming *timing=nullptr);
     IOReturn awdlPrepareChannel(uint8_t channel);
     bool awdlCanTransmit(uint8_t channel);
     bool awdlGrantSnapshot(mtkawdl::Reservation &grant);
+    // Host observations for one ROC, not firmware/PHY retune timestamps.
+    // Session + epoch + token + issuedAt identify it across gate-releasing
+    // enqueue calls; queueReturnedAt is an upper bound on actual enqueue.
+    struct AwdlRocTiming {
+        uint64_t session, issuedAtUS, queueReturnedAtUS, grantAtUS, pmAtUS;
+        uint32_t epoch;
+        int32_t queueStatus;
+        uint8_t token, channel, infraChannel;
+    };
+    bool awdlRocTimingSnapshot(AwdlRocTiming &timing);
     bool awdlIsEnabled();
     // Native interface registration requires running firmware, not an AP
     // association or a configured/enabled secondary AWDL BSS.

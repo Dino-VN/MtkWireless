@@ -9,10 +9,18 @@ extern "C" {
 bool mtk_awdl_current_window(const mtkawdl::State *s, uint64_t now, mtkawdl::Window *out);
 bool mtk_awdl_multicast_ready(const mtkawdl::State *s, uint64_t now);
 uint32_t mtk_awdl_data_queue_lifetime_us(const mtkawdl::State *s, const uint8_t *destination);
+uint64_t mtk_awdl_roc_prepare_at(uint64_t requestAt);
+uint32_t mtk_awdl_roc_poll_delay_us(uint64_t now, uint64_t deadline);
+uint64_t mtk_awdl_roc_ready_delay_us(uint64_t callAt, uint64_t returnedAt, uint64_t grantAt);
 uint32_t mtk_awdl_roc_lead_observe(mtkawdl::RocLeadTiming *l, uint32_t responseUs, uint64_t preparationUs);
 uint32_t mtk_awdl_roc_channel_lead(const mtkawdl::RocChannelTiming *c, uint8_t channel, uint32_t fallback);
 void mtk_awdl_roc_channel_observe(mtkawdl::RocChannelTiming *c, uint8_t channel, uint32_t responseUs,
                                   uint64_t preparationUs);
+uint32_t mtk_awdl_roc_channel_lead_retained(const mtkawdl::RocChannelTiming *c, uint8_t channel, uint32_t fallback);
+void mtk_awdl_roc_channel_observe_retained(mtkawdl::RocChannelTiming *c, uint8_t channel,
+                                          uint32_t responseUs, uint64_t preparationUs);
+bool mtk_awdl_roc_channel_recovery_grace(const mtkawdl::RocChannelTiming *context,
+                                        const mtkawdl::RocChannelTiming *legacy, uint8_t channel);
 bool mtk_awdl_plan_radio(const mtkawdl::State *s, uint64_t now, mtkawdl::RadioPlan *out, uint32_t leadUs,
                          bool skipCurrent, const mtkawdl::RocChannelTiming *timing, uint8_t onlyChannel,
                          uint8_t homeChannel);
@@ -49,6 +57,15 @@ inline uint32_t dataQueueLifetimeUs(const State &s,const uint8_t *destination) {
 // arbitration before the next EAW. A live EAW is still closed only within
 // native's duration tolerance; this lead never fabricates an early AW-start.
 constexpr uint32_t rocLeadUs=55000;
+// Preparation has its own edge, so a 2ms poll cannot step over its 3ms
+// lead. The HAL still enforces PM age and all radio admission rules.
+inline uint64_t rocPrepareAt(uint64_t requestAt) { return mtk_awdl_roc_prepare_at(requestAt); }
+inline uint32_t rocPollDelayUS(uint64_t now,uint64_t deadline) {
+    return mtk_awdl_roc_poll_delay_us(now,deadline);
+}
+inline uint64_t rocReadyDelayUS(uint64_t callAt,uint64_t returnedAt,uint64_t grantAt) {
+    return mtk_awdl_roc_ready_delay_us(callAt,returnedAt,grantAt);
+}
 // Keep a bounded history of actual accepted ROC response/preparation delays.
 // A boot-time outlier must not permanently skip nearby AWs after firmware
 // recovers. Repeated polling of the same grant is not a timing observation.
@@ -76,6 +93,20 @@ struct RocChannelTiming {
     }
     void observe(uint8_t channel,uint32_t responseUs,uint64_t preparationUs) {
         mtk_awdl_roc_channel_observe(this,channel,responseUs,preparationUs);
+    }
+    // Separate, context-scoped instance for selective forward recovery ONLY.
+    // Unlike greedy planning, that path guarantees bounded resampling visits.
+    // Never silently give legacy/diagnostic-off planning retained-only aging.
+    uint32_t leadRetained(uint8_t channel,uint32_t fallback=rocLeadUs) const {
+        return mtk_awdl_roc_channel_lead_retained(this,channel,fallback);
+    }
+    void observeRetained(uint8_t channel,uint32_t responseUs,uint64_t preparationUs) {
+        mtk_awdl_roc_channel_observe_retained(this,channel,responseUs,preparationUs);
+    }
+    // Call on the current-context instance. Does not change either history or
+    // a lead; only asks whether normal legacy aging should get a bounded grace.
+    bool recoveryGrace(uint8_t channel,const RocChannelTiming &legacy) const {
+        return mtk_awdl_roc_channel_recovery_grace(this,&legacy,channel);
     }
 };
 // Prepare the BSS and ROC before the edge, and keep one grant for adjacent

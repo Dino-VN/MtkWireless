@@ -6,7 +6,7 @@
 //! to lie inside the image before it is handed out.
 
 use mtk_common::bytes::{le32_at, slice_at};
-use mtk_common::{Error, Result};
+use mtk_common::{Error, Reader, Result};
 
 // Download mode bits (`DL_MODE_*`) for the MCU "init download" command.
 pub const DL_MODE_ENCRYPT: u32 = 0x01;
@@ -149,8 +149,23 @@ impl<'a> PatchImage<'a> {
     }
 }
 
-/// WM RAM code image: region payloads back to back from offset 0, then the
-/// region table (40 bytes each), then a 36-byte trailer at the very end:
+/// Firmware-reported CNM offload flag (`MT792x_FW_CAP_CNM`, Linux v6.12).
+/// It is not evidence of independent radios or simultaneous RF operation.
+pub const FW_CAP_CNM: u8 = 0x80;
+
+/// Optional release-feature record, separate from the download plan.
+/// C ABI: `mtk_wlan_fw_features` in `kext/Wifi/mtk_wlan.h`.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FwFeatures {
+    pub present: bool,
+    pub segment: u8,
+    pub flags: u8,
+}
+
+/// WM RAM code image: region payloads back to back from offset 0, optional
+/// release metadata, the region table (40 bytes each), then a 36-byte trailer
+/// at the very end:
 ///
 /// ```text
 /// trailer: chip_id eco_code n_region format_ver format_flag reserved[2]
@@ -172,6 +187,20 @@ pub struct RamImage<'a> {
 
 const RAM_TRAILER_SIZE: usize = 36;
 const RAM_REGION_SIZE: usize = 40;
+const RELEASE_PREFIX_SIZE: usize = 16;
+const RELEASE_FEATURE_TAG: u8 = 4;
+const RELEASE_FEATURE_SIZE: usize = 16;
+
+/// Linux v6.12 `mt792x_realease_info`: the length excludes the four-byte
+/// header and padding. Used for both the outer container and inner records.
+fn release_record<'a>(reader: &mut Reader<'a>) -> Result<(u8, &'a [u8])> {
+    let len = reader.le16()? as usize;
+    let pad_len = reader.u8()? as usize;
+    let tag = reader.u8()?;
+    let payload = reader.take(len)?;
+    reader.skip(pad_len)?;
+    Ok((tag, payload))
+}
 
 impl<'a> RamImage<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self> {
@@ -238,6 +267,57 @@ impl<'a> RamImage<'a> {
             feature,
             download: feature & FW_FEATURE_NON_DL == 0,
         })
+    }
+
+    /// Optional diagnostic release features, following Linux v6.12's
+    /// `mt792x_get_offload_capability` layout but with bounded readers.
+    ///
+    /// An empty metadata gap or a valid release without tag 4 means absent.
+    /// A partial release, a non-16-byte feature payload, or duplicate feature
+    /// records is malformed. Unknown records are skipped with their padding;
+    /// the entire outer record is validated, even after a feature is found.
+    /// Prefix/suffix bytes are opaque, never searched for feature tags.
+    /// This is deliberately not called by the download parser.
+    pub fn features(&self) -> Result<FwFeatures> {
+        let mut image = Reader::new(self.data);
+        // The region table is a hard bound, not part of the metadata. Advance
+        // by every region's length, including NON_DL regions. Reader::skip
+        // checks each addition and rejects a payload sum beyond the table.
+        let mut metadata = Reader::new(image.take(self.table)?);
+        for _ in 0..self.regions {
+            let mut region = Reader::new(image.take(RAM_REGION_SIZE)?);
+            region.skip(20)?;
+            metadata.skip(region.le32()? as usize)?;
+        }
+        if metadata.is_empty() {
+            return Ok(FwFeatures::default());
+        }
+        metadata.skip(RELEASE_PREFIX_SIZE)?;
+        let (_, contents) = release_record(&mut metadata)?;
+        // Ignore the suffix after the outer record/padding (the shipped
+        // images use 16 '#' bytes); it is not another record stream.
+        let mut records = Reader::new(contents);
+        let mut features = FwFeatures::default();
+        while !records.is_empty() {
+            let (tag, contents) = release_record(&mut records)?;
+            if tag != RELEASE_FEATURE_TAG {
+                continue;
+            }
+            if features.present {
+                return Err(Error::Invalid("duplicate RAM release feature"));
+            }
+            if contents.len() != RELEASE_FEATURE_SIZE {
+                return Err(Error::Invalid("RAM release feature size"));
+            }
+            let mut payload = Reader::new(contents);
+            features = FwFeatures {
+                present: true,
+                segment: payload.u8()?,
+                flags: payload.u8()?,
+            };
+            payload.skip(14)?; // reserved, not required to be zero
+        }
+        Ok(features)
     }
 
     /// Start address for the "start firmware" command: the last region with
@@ -388,6 +468,292 @@ mod tests {
         d[n] = 200;
         assert!(RamImage::parse(&d).is_err());
         assert!(RamImage::parse(&d[..10]).is_err());
+    }
+
+    fn ram_with_metadata(payload: &[u8], metadata: &[u8], regions: &[(u32, u8)]) -> Vec<u8> {
+        let mut data = payload.to_vec();
+        data.extend_from_slice(metadata);
+        for (i, &(len, feature)) in regions.iter().enumerate() {
+            let mut region = [0; RAM_REGION_SIZE];
+            // These are not file offsets/lengths; the metadata parser must
+            // use the length at +20, not an address or decompressed length.
+            region[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            region[16..20].copy_from_slice(&(0x9000_0000 + i as u32 * 0x1000).to_le_bytes());
+            region[20..24].copy_from_slice(&len.to_le_bytes());
+            region[24] = feature;
+            data.extend_from_slice(&region);
+        }
+        let mut trailer = [0; RAM_TRAILER_SIZE];
+        trailer[2] = regions.len().try_into().unwrap();
+        data.extend_from_slice(&trailer);
+        data
+    }
+
+    fn record(tag: u8, payload: &[u8], padding: &[u8]) -> Vec<u8> {
+        let mut data = u16::try_from(payload.len()).unwrap().to_le_bytes().to_vec();
+        data.push(padding.len().try_into().unwrap());
+        data.push(tag);
+        data.extend_from_slice(payload);
+        data.extend_from_slice(padding);
+        data
+    }
+
+    fn feature_record(segment: u8, flags: u8) -> Vec<u8> {
+        let mut payload = [0; RELEASE_FEATURE_SIZE];
+        payload[0] = segment;
+        payload[1] = flags;
+        record(RELEASE_FEATURE_TAG, &payload, &[])
+    }
+
+    fn release_metadata(records: &[u8], padding: &[u8], suffix: &[u8]) -> Vec<u8> {
+        let mut data = vec![b'#'; RELEASE_PREFIX_SIZE];
+        data.extend(record(0, records, padding));
+        data.extend_from_slice(suffix);
+        data
+    }
+
+    fn features_from_metadata(metadata: &[u8]) -> Result<FwFeatures> {
+        let data = ram_with_metadata(&[0xaa; 3], metadata, &[(3, 0)]);
+        RamImage::parse(&data)?.features()
+    }
+
+    #[test]
+    fn shipped_ram_feature_metadata() {
+        // Observations of these exact repository fixtures, not universal
+        // properties of MT7921/MT7922 cards or proof of simultaneous radios.
+        for (name, payload_end, table) in [
+            ("mwx-mt7922_ram_code_1", 1_018_272, 1_018_416),
+            ("mwx-mt7961_ram_code_1", 796_912, 797_064),
+        ] {
+            let data = firmware(name);
+            let img = RamImage::parse(&data).unwrap();
+            let total: usize = (0..img.regions)
+                .map(|i| img.region(i).unwrap().data.len())
+                .sum();
+            assert_eq!(total, payload_end, "{name}");
+            assert_eq!(img.table, table, "{name}");
+            assert_eq!(&data[payload_end..payload_end + 16], &[b'#'; 16]);
+            assert_eq!(&data[table - 16..table], &[b'#'; 16]);
+            assert_eq!(
+                img.features(),
+                Ok(FwFeatures {
+                    present: true,
+                    segment: 2,
+                    flags: 0xc0
+                }),
+                "{name}"
+            );
+        }
+        assert_eq!(FW_CAP_CNM, 0x80);
+    }
+
+    #[test]
+    fn ram_features_are_optional_but_zero_flags_are_present() {
+        assert_eq!(features_from_metadata(&[]), Ok(FwFeatures::default()));
+        for records in [vec![], record(1, b"release name", &[0, 0])] {
+            let metadata = release_metadata(&records, &[], &[]);
+            assert_eq!(features_from_metadata(&metadata), Ok(FwFeatures::default()));
+        }
+        let metadata = release_metadata(&feature_record(0, 0), &[], &[]);
+        assert_eq!(
+            features_from_metadata(&metadata),
+            Ok(FwFeatures {
+                present: true,
+                segment: 0,
+                flags: 0
+            })
+        );
+        let data = ram_with_metadata(&[], &[], &[]);
+        assert_eq!(
+            RamImage::parse(&data).unwrap().features(),
+            Ok(FwFeatures::default())
+        );
+    }
+
+    #[test]
+    fn ram_features_sum_all_regions_including_non_downloaded() {
+        let metadata = release_metadata(&feature_record(9, 0x7f), &[], &[]);
+        let data = ram_with_metadata(
+            &[0x55; 13],
+            &metadata,
+            &[
+                (4, 0),
+                (7, FW_FEATURE_NON_DL),
+                (2, FW_FEATURE_OVERRIDE_ADDR),
+            ],
+        );
+        let img = RamImage::parse(&data).unwrap();
+        assert_eq!(
+            img.features(),
+            Ok(FwFeatures {
+                present: true,
+                segment: 9,
+                flags: 0x7f
+            })
+        );
+        assert!(!img.region(1).unwrap().download);
+        assert_eq!(img.region(2).unwrap().offset, 11);
+
+        // Even the maximum descriptor count is bounded and advances by the
+        // sum, not the first/last region alone. Zero lengths make progress.
+        let mut regions = vec![(0, FW_FEATURE_NON_DL); u8::MAX as usize];
+        *regions.last_mut().unwrap() = (1, FW_FEATURE_NON_DL);
+        let data = ram_with_metadata(&[0], &metadata, &regions);
+        assert_eq!(RamImage::parse(&data).unwrap().features(), img.features());
+    }
+
+    #[test]
+    fn release_records_preserve_raw_bytes_and_skip_unknowns_and_padding() {
+        let mut records = record(0x91, &vec![0x55; 0x102], &[0xfe; 255]);
+        let mut payload = [0xa5; RELEASE_FEATURE_SIZE]; // reserved bytes need not be zero
+        payload[0] = 0xff;
+        payload[1] = 0x7f; // do not invent CNM or normalize unrelated bits
+        records.extend(record(RELEASE_FEATURE_TAG, &payload, &[0xaa; 3]));
+        records.extend(record(0x92, &[], &[])); // zero-length unknown still advances
+        let metadata = release_metadata(&records, &[0xfd; 255], &[b'#'; 16]);
+        assert_eq!(
+            features_from_metadata(&metadata),
+            Ok(FwFeatures {
+                present: true,
+                segment: 0xff,
+                flags: 0x7f
+            })
+        );
+    }
+
+    #[test]
+    fn feature_tags_are_not_searched_for_outside_the_inner_record_stream() {
+        let fake = feature_record(2, 0xc0);
+        let records = record(0x81, &fake, &fake);
+        let mut metadata = release_metadata(&records, &fake, &fake);
+        metadata[..16].copy_from_slice(&fake[..16]); // prefix is opaque, not a magic signature
+        metadata[19] = RELEASE_FEATURE_TAG; // the outer tag is not an inner feature
+        let data = ram_with_metadata(&fake, &metadata, &[(fake.len() as u32, 0)]);
+        assert_eq!(
+            RamImage::parse(&data).unwrap().features(),
+            Ok(FwFeatures::default())
+        );
+
+        // A valid-looking feature outside the outer len cannot be consumed.
+        let metadata = release_metadata(&[], &[], &fake);
+        assert_eq!(features_from_metadata(&metadata), Ok(FwFeatures::default()));
+    }
+
+    #[test]
+    fn feature_payload_must_have_the_documented_size() {
+        for len in (0..RELEASE_FEATURE_SIZE).chain([17, 32, 256]) {
+            let records = record(RELEASE_FEATURE_TAG, &vec![0; len], &[]);
+            assert!(
+                features_from_metadata(&release_metadata(&records, &[], &[])).is_err(),
+                "{len}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_features_and_malformed_following_records_are_rejected() {
+        for second in [feature_record(0, 0), feature_record(2, 0xc0), vec![0, 0, 0]] {
+            let mut records = feature_record(0, 0);
+            records.extend(second);
+            let metadata = release_metadata(&records, &[], &[]);
+            assert!(features_from_metadata(&metadata).is_err());
+        }
+    }
+
+    #[test]
+    fn every_release_truncation_including_padding_is_rejected() {
+        let records = record(RELEASE_FEATURE_TAG, &[0; RELEASE_FEATURE_SIZE], &[1, 2, 3]);
+        let metadata = release_metadata(&records, &[4, 5], &[]);
+        // Rebuild an intact descriptor table after every truncated metadata
+        // gap. Neither a payload nor padding may borrow bytes from that table.
+        for len in 1..metadata.len() {
+            assert!(features_from_metadata(&metadata[..len]).is_err(), "{len}");
+        }
+        assert!(features_from_metadata(&metadata).unwrap().present);
+    }
+
+    #[test]
+    fn release_lengths_are_bounded_by_both_outer_payload_and_region_table() {
+        let good = release_metadata(&feature_record(2, 0xc0), &[], &[]);
+        for (offset, len) in [
+            (16, 19u16),
+            (16, 21),
+            (16, u16::MAX),
+            (20, 17),
+            (20, u16::MAX),
+        ] {
+            let mut metadata = good.clone();
+            metadata[offset..offset + 2].copy_from_slice(&len.to_le_bytes());
+            assert!(
+                features_from_metadata(&metadata).is_err(),
+                "offset {offset} length {len}"
+            );
+        }
+        // Declared outer padding must also fit before the descriptor table.
+        let mut metadata = good.clone();
+        metadata[18] = 1;
+        assert!(features_from_metadata(&metadata).is_err());
+
+        // A suffix provides ample bytes, but none belong to the inner record.
+        let mut metadata = good;
+        metadata.extend_from_slice(&[0; 255]);
+        metadata[22] = 255;
+        assert!(features_from_metadata(&metadata).is_err());
+        metadata[22] = 0;
+        metadata[20..22].copy_from_slice(&17u16.to_le_bytes());
+        assert!(features_from_metadata(&metadata).is_err());
+
+        // A partial header and an unknown tag with an oversized length must
+        // fail too; absence is only returned for a well-formed record stream.
+        for records in [
+            vec![0],
+            vec![0, 0],
+            vec![0, 0, 0],
+            vec![0xff, 0xff, 0, 0x99],
+        ] {
+            let metadata = release_metadata(&records, &[], &[]);
+            assert!(features_from_metadata(&metadata).is_err());
+        }
+    }
+
+    #[test]
+    fn ram_feature_region_lengths_and_offsets_never_wrap_or_cross_the_table() {
+        let metadata = release_metadata(&feature_record(2, 0xc0), &[], &[]);
+        for regions in [
+            vec![(u32::MAX, 0)],
+            vec![(u32::MAX, 0), (1, 0)],
+            vec![(1, 0), (u32::MAX, FW_FEATURE_NON_DL)],
+            vec![(u32::MAX, 0); u8::MAX as usize],
+            vec![(2 + metadata.len() as u32, 0)],
+        ] {
+            let data = ram_with_metadata(&[0], &metadata, &regions);
+            assert!(RamImage::parse(&data).unwrap().features().is_err());
+        }
+        // At the exact table boundary there is no metadata. Do not scan the
+        // region's payload for an otherwise valid release-feature record.
+        let data = ram_with_metadata(&[0], &metadata, &[(1 + metadata.len() as u32, 0)]);
+        assert_eq!(
+            RamImage::parse(&data).unwrap().features(),
+            Ok(FwFeatures::default())
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_does_not_change_the_download_plan() {
+        let payload = [1, 2, 3];
+        let data = ram_with_metadata(
+            &payload,
+            &[0x12], // truncated metadata, but the download region is intact
+            &[(3, FW_FEATURE_NON_DL | FW_FEATURE_OVERRIDE_ADDR)],
+        );
+        let img = RamImage::parse(&data).unwrap();
+        assert!(img.features().is_err());
+        let region = img.region(0).unwrap();
+        assert_eq!(region.data, payload);
+        assert_eq!(region.offset, 0);
+        assert!(!region.download);
+        assert_eq!(img.override_addr(), Ok(0x9000_0000));
+        assert_eq!(img.start_option(), Ok(FW_START_OVERRIDE));
     }
 
     #[test]

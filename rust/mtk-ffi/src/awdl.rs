@@ -257,6 +257,11 @@ export! {
     fn mtk_awdl_data_queue_lifetime_us(s: *const State, destination: *const u8) -> u32 {
         s.as_ref().map_or(0, |s| t::data_queue_lifetime_us(s, mac(destination).unwrap_or(&ZERO_MAC)))
     }
+    fn mtk_awdl_roc_prepare_at(request_at: u64) -> u64 { t::roc_prepare_at(request_at) }
+    fn mtk_awdl_roc_poll_delay_us(now: u64, deadline: u64) -> u32 { t::roc_poll_delay_us(now, deadline) }
+    fn mtk_awdl_roc_ready_delay_us(call_at: u64, returned_at: u64, grant_at: u64) -> u64 {
+        t::roc_ready_delay_us(call_at, returned_at, grant_at)
+    }
     fn mtk_awdl_roc_lead_observe(l: *mut RocLeadTiming, response_us: u32, preparation_us: u64) -> u32 {
         l.as_mut().map_or(t::ROC_LEAD_US, |l| l.observe(response_us, preparation_us))
     }
@@ -265,6 +270,32 @@ export! {
     }
     fn mtk_awdl_roc_channel_observe(c: *mut RocChannelTiming, channel: u8, response_us: u32, preparation_us: u64) {
         if let Some(c) = c.as_mut() { c.observe(channel, response_us, preparation_us) }
+    }
+    fn mtk_awdl_roc_channel_lead_retained(c: *const RocChannelTiming, channel: u8, fallback: u32) -> u32 {
+        c.as_ref().map_or(fallback, |c| c.lead_retained(channel, fallback))
+    }
+    fn mtk_awdl_roc_channel_observe_retained(c: *mut RocChannelTiming, channel: u8, response_us: u32, preparation_us: u64) {
+        if let Some(c) = c.as_mut() { c.observe_retained(channel, response_us, preparation_us) }
+    }
+    fn mtk_awdl_roc_channel_recovery_grace(context: *const RocChannelTiming, legacy: *const RocChannelTiming, channel: u8) -> bool {
+        match (context.as_ref(), legacy.as_ref()) {
+            (Some(context), Some(legacy)) => context.recovery_grace(legacy, channel),
+            _ => false,
+        }
+    }
+    // eligible points to exactly SLOTS bytes, one flag per schedule entry.
+    // All shared structs already participate in the AWDL layout comparison.
+    fn mtk_awdl_plan_forward(s: *const State, now: u64, release_at: u64, after_channel: u8,
+        timing: *const RocChannelTiming, eligible: *const u8, home_channel: u8, out: *mut RadioPlan) -> bool {
+        match (s.as_ref(), timing.as_ref(), eligible.cast::<[u8; p::SLOTS]>().as_ref(), out.as_mut()) {
+            (Some(s), Some(timing), Some(eligible), Some(out)) => {
+                match mtk_wlan::awdl::forward::plan_forward(s, now, release_at, after_channel, timing, eligible, home_channel) {
+                    Some(plan) => { *out = plan; true }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
     }
     fn mtk_awdl_plan_radio(s: *const State, now: u64, out: *mut RadioPlan, lead_us: u32, skip_current: bool, timing: *const RocChannelTiming, only_channel: u8, home_channel: u8) -> bool {
         match (s.as_ref().and_then(|s| t::plan_radio(s, now, lead_us, skip_current, timing.as_ref(), only_channel, home_channel)), out.as_mut()) {
@@ -368,6 +399,59 @@ pub extern "C" fn mtk_awdl_layout_len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forward_settling_ffi_is_null_safe_and_preserves_both_histories() {
+        let mut context = RocChannelTiming::default();
+        let mut legacy = RocChannelTiming::default();
+        for response in [500_000, 12_000] {
+            context.observe_retained(44, response, 0);
+            legacy.observe(44, response, 0);
+        }
+        let before = (context, legacy);
+        unsafe {
+            assert!(!mtk_awdl_roc_channel_recovery_grace(core::ptr::null(), &legacy, 44));
+            assert!(!mtk_awdl_roc_channel_recovery_grace(&context, core::ptr::null(), 44));
+            assert!(!mtk_awdl_roc_channel_recovery_grace(&context, &legacy, 0));
+            assert!(!mtk_awdl_roc_channel_recovery_grace(&context, &legacy, 166));
+            assert!(mtk_awdl_roc_channel_recovery_grace(&context, &legacy, 44));
+        }
+        assert_eq!((context, legacy), before);
+    }
+
+    #[test]
+    fn forward_planning_and_retained_ffi_are_null_safe_and_own_no_radio() {
+        let mut state = State::default();
+        state.init(&[2, 1, 2, 3, 4, 5], 10_000_000);
+        let mut timing = RocChannelTiming::default();
+        let eligible = [1u8; p::SLOTS];
+        let mut plan = RadioPlan::default();
+        unsafe {
+            for (s, t, flags) in [
+                (core::ptr::null(), &timing as *const _, eligible.as_ptr()),
+                (&state as *const _, core::ptr::null(), eligible.as_ptr()),
+                (&state as *const _, &timing as *const _, core::ptr::null()),
+            ] {
+                assert!(!mtk_awdl_plan_forward(s, 10_000_000, 0, 0, t, flags, 0, &mut plan));
+                assert_eq!(plan, RadioPlan::default());
+            }
+            assert!(!mtk_awdl_plan_forward(&state, 10_000_000, 0, 0, &timing,
+                eligible.as_ptr(), 0, core::ptr::null_mut()));
+            assert!(mtk_awdl_plan_forward(&state, 10_000_000, 0, 0, &timing,
+                eligible.as_ptr(), 0, &mut plan));
+            assert!(plan.request_at >= 10_000_000 + t::ROC_PREPARE_US);
+            assert_eq!(state.clock_hold_until, 0);
+            assert!(!state.controls_held && !state.native_timeline_started);
+            assert_eq!(mtk_awdl_roc_channel_lead_retained(core::ptr::null(), 44, 123), 123);
+            mtk_awdl_roc_channel_observe_retained(core::ptr::null_mut(), 44, 990_000, 20_000);
+            mtk_awdl_roc_channel_observe_retained(&mut timing, 44, 990_000, 20_000);
+            for _ in 0..100 {
+                mtk_awdl_roc_channel_observe_retained(&mut timing, 6, 12_000, 0);
+            }
+            assert_eq!(mtk_awdl_roc_channel_lead(&timing, 44, 123), 123);
+            assert_eq!(mtk_awdl_roc_channel_lead_retained(&timing, 44, 123), 1_000_000);
+        }
+    }
 
     #[test]
     fn replay_probe_ffi_null_and_bad_indices_fail_without_mutation() {
