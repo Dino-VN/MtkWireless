@@ -135,14 +135,32 @@ fi
 # ---------------------------------------------------------------- EFI
 info "OpenCore EFI"
 if [ -z "$EFI_ROOT" ]; then
-    uuid="$(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path 2>/dev/null |
-        grep -oE 'GPT,[0-9A-Fa-f-]{36}' | head -1 | cut -d, -f2)"
-    [ -n "$uuid" ] || die "not booted by OpenCore (no boot-path in NVRAM); use --efi /Volumes/EFI"
+    # boot-path ends in HD(n,GPT,<partition uuid>,start,size) or, for an
+    # MBR disk (e.g. a USB stick), HD(n,MBR,0x<disk signature>,start,size);
+    # start/size are in device blocks.
+    hd="$(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path 2>/dev/null |
+        grep -oE 'HD\([0-9]+,(GPT|MBR),[^,]+,0x[0-9A-Fa-f]+,0x[0-9A-Fa-f]+\)' | head -1)"
+    [ -n "$hd" ] || die "not booted by OpenCore (no boot-path in NVRAM); use --efi /Volumes/EFI"
+    hd="${hd#HD(}"; hd="${hd%)}"
+    IFS=, read -r _ scheme sig start size <<<"$hd"
+    start=$((start)) size=$((size))
     part=""
-    for d in $(diskutil list | awk '$2 == "EFI" { print $NF }'); do
-        if diskutil info "$d" | grep -qi "Partition UUID: *$uuid"; then part="$d"; break; fi
+    for d in $(diskutil list | grep -oE 'disk[0-9]+s[0-9]+$'); do
+        inf="$(diskutil info "$d" 2>/dev/null)" || continue
+        if [ "$scheme" = GPT ]; then
+            grep -qi "Partition UUID: *$sig" <<<"$inf" && { part="$d"; break; }
+            continue
+        fi
+        bs="$(sed -nE 's/^ *Device Block Size: *([0-9]+) Bytes.*/\1/p' <<<"$inf")"
+        off="$(sed -nE 's/^ *Partition Offset: *([0-9]+) Bytes.*/\1/p' <<<"$inf")"
+        len="$(sed -nE 's/^ *Disk Size:.*\(([0-9]+) Bytes\).*/\1/p' <<<"$inf")"
+        [ -n "$bs" ] && [ "$off" = $((start * bs)) ] && [ "$len" = $((size * bs)) ] || continue
+        # MBR disk signature (offset 440, little endian), when readable.
+        dsig="$(dd if="/dev/r${d%s*}" bs=512 count=1 2>/dev/null | od -An -tx4 -j440 -N4 | tr -d ' \n')"
+        [ -z "$dsig" ] || [ $((16#$dsig)) = $((sig)) ] || continue
+        part="$d"; break
     done
-    [ -n "$part" ] || die "boot EFI partition $uuid not found"
+    [ -n "$part" ] || die "boot partition ($scheme $sig) not found; use --efi /Volumes/EFI"
     mp="$(diskutil info "$part" | sed -n 's/^ *Mount Point: *//p')"
     if [ -z "$mp" ]; then
         diskutil mount "$part" >/dev/null || die "cannot mount $part"
