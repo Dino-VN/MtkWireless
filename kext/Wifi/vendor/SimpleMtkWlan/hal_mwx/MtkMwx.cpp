@@ -592,6 +592,10 @@ struct mwx_softc {
     uint32_t sc_awdl_epoch;
     bool sc_awdl_busy, sc_awdl_stopping;
     unsigned sc_awdl_calls;
+    // Primary task-queue work is not controller-gated (splnet is a no-op).
+    // Publish queued/in-flight setup admission under the AWDL lock instead.
+    unsigned sc_awdl_infra_busy, sc_awdl_init_busy;
+    bool sc_awdl_ns_pending;
     uint8_t sc_awdl_channel;
     uint64_t sc_awdl_token_used[256];
 
@@ -1200,6 +1204,32 @@ mwx_poll(struct mwx_softc *sc, uint32_t reg, uint32_t val, uint32_t mask,
 	return ETIMEDOUT;
 }
 
+// Exclude AWDL context setup while primary firmware work runs on a task
+// thread. No lock is held across a firmware wait; nested init/state/scan work
+// keeps admission closed until the outermost operation has published its flags.
+class MwxAwdlInfraOperation {
+    mwx_softc *sc;
+    bool initializing;
+public:
+    MwxAwdlInfraOperation(mwx_softc *s,bool init=false) : sc(NULL), initializing(init) {
+        if(!s || !s->sc_awdl_lock) return;
+        IOLockLock(s->sc_awdl_lock);
+        ++s->sc_awdl_infra_busy;
+        if(initializing) ++s->sc_awdl_init_busy;
+        sc=s;
+        IOLockUnlock(s->sc_awdl_lock);
+    }
+    ~MwxAwdlInfraOperation() {
+        if(!sc) return;
+        IOLockLock(sc->sc_awdl_lock);
+        if(initializing) --sc->sc_awdl_init_busy;
+        --sc->sc_awdl_infra_busy;
+        IOLockUnlock(sc->sc_awdl_lock);
+    }
+    MwxAwdlInfraOperation(const MwxAwdlInfraOperation&)=delete;
+    MwxAwdlInfraOperation& operator=(const MwxAwdlInfraOperation&)=delete;
+};
+
 /*
  * ifp specific functions
  */
@@ -1208,7 +1238,9 @@ static int mwx_init_running(struct ifnet *);
 int
 mwx_init(struct ifnet *ifp)
 {
-	struct ieee80211com *ic = &((struct mwx_softc *)ifp->if_softc)->sc_ic;
+	struct mwx_softc *sc = (struct mwx_softc *)ifp->if_softc;
+	MwxAwdlInfraOperation admission(sc,true);
+	struct ieee80211com *ic = &sc->sc_ic;
 	int rv;
 
 	if (ic->ic_event_handler)
@@ -1427,7 +1459,10 @@ mwx_stop(struct ifnet *ifp)
 	}
 
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+	if(sc->sc_awdl_lock) IOLockLock(sc->sc_awdl_lock);
 	sc->sc_ns_state = IEEE80211_S_INIT;
+	sc->sc_awdl_ns_pending = false;
+	if(sc->sc_awdl_lock) IOLockUnlock(sc->sc_awdl_lock);
 	sc->sc_sta_wcid = 0;
 	ifp->if_timer = 0;
 
@@ -1730,8 +1765,11 @@ mwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
         if (nstate == IEEE80211_S_ASSOC) ic->ic_join_diag.AssocRequestedAtUS = mtk_join_now();
         if (nstate == IEEE80211_S_RUN) ic->ic_join_diag.RunRequestedAtUS = mtk_join_now();
     }
+    if(sc->sc_awdl_lock) IOLockLock(sc->sc_awdl_lock);
     sc->sc_ns_state = nstate;
     sc->sc_ns_arg = arg;
+    sc->sc_awdl_ns_pending = true;
+    if(sc->sc_awdl_lock) IOLockUnlock(sc->sc_awdl_lock);
 
 	task_add(sc->sc_nswq, &sc->sc_newstate_task);
 	return 0;
@@ -1741,10 +1779,16 @@ void
 mwx_newstate_task(void *ptr)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)ptr;
+	MwxAwdlInfraOperation admission(sc);
 	struct ieee80211com *ic = &sc->sc_ic;
 	enum ieee80211_state ostate = ic->ic_state;
+	if(sc->sc_awdl_lock) IOLockLock(sc->sc_awdl_lock);
 	enum ieee80211_state nstate = sc->sc_ns_state;
 	int arg = sc->sc_ns_arg;
+	// Consume only the request captured here. A new request queued during
+	// an MCU wait sets pending again and survives this operation's destructor.
+	sc->sc_awdl_ns_pending = false;
+	if(sc->sc_awdl_lock) IOLockUnlock(sc->sc_awdl_lock);
 	int s = splnet();
 	int rv = 0;
 
@@ -5713,6 +5757,7 @@ mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 int
 mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 {
+	MwxAwdlInfraOperation admission(sc);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_channel *c;
 	struct mt76_connac_hw_scan_req	*req;
@@ -9734,12 +9779,15 @@ static const uint8_t mwx_fif_bit_set=1U<<0, mwx_fif_bit_clr=1U<<1;
 void mwx_awdl_restore_filter(mwx_softc *sc)
 {
     if(!sc->sc_awdl_filter_active) return;
+    const uint32_t epoch=sc->sc_awdl_epoch;
     mwx_rmw(sc,MT_WF_RFCR(0),sc->sc_awdl_filter,mwx_awdl_filter_mask);
     // Return firmware to MT76's default FIF set, then reapply the drops
     // that were active before this AWDL context.
     int filter=mt7921_mcu_set_rxfilter(sc,mwx_fif_enable,0,0);
+    if(sc->sc_awdl_epoch!=epoch) return;
     if(!filter && sc->sc_awdl_filter)
         filter=mt7921_mcu_set_rxfilter(sc,0,mwx_fif_bit_set,sc->sc_awdl_filter);
+    if(sc->sc_awdl_epoch!=epoch) return;
     MWX_DEV_LOG(sc,"AWDL disable rx-filter result=%d\n",filter);
     sc->sc_awdl_filter_active=false;
 }
@@ -9886,6 +9934,58 @@ static bool mwx_awdl_infra_joining(mwx_softc *sc)
         return true;
     return ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
         (ic->ic_flags & IEEE80211_F_RSNON) && !ic->ic_bss->ni_port_valid;
+}
+
+// Callers hold the controller gate and AWDL lock. Primary task threads
+// publish their admission markers under that lock; power_done publishes the
+// completed task's firmware/flag writes. Neither splnet nor the gate alone
+// serializes those threads.
+static bool mwx_awdl_sync_live(mwx_softc *sc)
+{
+    if(sc->sc_power_req!=sc->sc_power_done || sc->sc_awdl_init_busy) return false;
+    OSSynchronizeIO();
+    return !sc->sc_detaching && !sc->sc_resetting && !sc->sc_awdl_stopping &&
+        (sc->sc_ic.ic_if.if_flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING) &&
+        !sc->sc_ic.ic_wcl_mac_reconfig;
+}
+
+bool MtkMwx::awdlSyncSnapshot(AwdlSyncSnapshot &snapshot)
+{
+    snapshot={};
+    if(!com || !com->sc_awdl_lock) return false;
+    IOLockLock(com->sc_awdl_lock);
+    snapshot.epoch=com->sc_awdl_epoch;
+    snapshot.attached=!com->sc_detaching;
+    snapshot.wantedUp=(com->sc_ic.ic_if.if_flags & IFF_UP)!=0;
+    const bool live=mwx_awdl_sync_live(com);
+    snapshot.session=live && com->sc_awdl_enabled ? com->sc_awdl_native_session : 0;
+    snapshot.ready=live && !com->sc_awdl_busy && !com->sc_awdl_infra_busy &&
+        !com->sc_awdl_ns_pending && !mwx_awdl_infra_joining(com) &&
+        !(com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN));
+    IOLockUnlock(com->sc_awdl_lock);
+    return true;
+}
+
+static IOReturn mwx_awdl_sync_status_locked(mwx_softc *sc,uint32_t epoch,
+    const MtkMwx::AwdlSyncGuard *guard,bool setup)
+{
+    if(guard && !guard->current(guard->context,guard->generation)) return kIOReturnAborted;
+    if(sc->sc_awdl_epoch!=epoch) return kIOReturnAborted;
+    if(guard && mwx_awdl_now()>=guard->deadlineUS) return kIOReturnTimeout;
+    if(!mwx_awdl_sync_live(sc)) return kIOReturnNotReady;
+    if(setup && (sc->sc_awdl_infra_busy || sc->sc_awdl_ns_pending ||
+       mwx_awdl_infra_joining(sc) ||
+       (sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)))) return kIOReturnNotReady;
+    return kIOReturnSuccess;
+}
+
+static IOReturn mwx_awdl_sync_status(mwx_softc *sc,uint32_t epoch,
+    const MtkMwx::AwdlSyncGuard *guard,bool setup=true)
+{
+    IOLockLock(sc->sc_awdl_lock);
+    IOReturn status=mwx_awdl_sync_status_locked(sc,epoch,guard,setup);
+    IOLockUnlock(sc->sc_awdl_lock);
+    return status;
 }
 
 // MtkWireless: longest off-channel ROC while associated. The grant runs from
@@ -10140,10 +10240,11 @@ static int mwx_awdl_remove_context(mwx_softc *sc,uint32_t epoch)
     return rv;
 }
 
-IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
+IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable, const AwdlSyncGuard *guard)
 {
     mwx_softc *sc=com;
     if (!sc || !sc->sc_awdl_lock) return kIOReturnNotReady;
+    if(guard && (!enable || !guard->current || !guard->deadlineUS)) return kIOReturnBadArgument;
     MwxAwdlCall call(sc);
     if(!call.valid()) return enable ? kIOReturnNotReady : kIOReturnSuccess;
     if (!enable) {
@@ -10159,6 +10260,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
             // Restore only the filter bits this context changed; preserve
             // unrelated filter updates made while AWDL was enabled.
             mwx_awdl_restore_filter(sc);
+            if(sc->sc_awdl_epoch!=cleanup.epoch) return kIOReturnAborted;
             rv=mwx_awdl_remove_context(sc,cleanup.epoch);
         }
         if(cleanup.acquired() && sc->sc_awdl_epoch!=cleanup.epoch)
@@ -10178,39 +10280,37 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
         return rv ? kIOReturnIOError : kIOReturnSuccess;
     }
     if (!address || !mtkawdl::unicast(address)) return kIOReturnBadArgument;
-    // A duplicate native enable does not change firmware state. It must not
-    // fail merely because a ROC/peer command currently owns the MCU context.
+    const uint32_t expected=guard ? guard->epoch : sc->sc_awdl_epoch;
+    IOReturn check=mwx_awdl_sync_status(sc,expected,guard,false);
+    if(check!=kIOReturnSuccess) return check;
+    // A duplicate enable changes no firmware state, even if a peer/ROC or
+    // join currently owns admission. Power-off and stale guards still fail.
     IOLockLock(sc->sc_awdl_lock);
-    bool alreadyEnabled=sc->sc_awdl_enabled && !sc->sc_awdl_stopping &&
-        !sc->sc_detaching && !sc->sc_resetting &&
-        (sc->sc_ic.ic_if.if_flags & IFF_RUNNING);
+    bool alreadyEnabled=sc->sc_awdl_enabled;
     bool sameAddress=!memcmp(address,sc->sc_awdl_address,6);
     IOLockUnlock(sc->sc_awdl_lock);
     if(alreadyEnabled) return sameAddress ? kIOReturnSuccess : kIOReturnBusy;
-    /* 1.0.25: hold AWDL off until the infra link is actually joined. At boot
-     * airportd enables AWDL at the same moment as the first join, and the MCU
-     * waits are serialised (sc_ns_state blocks reservations while a wait is
-     * outstanding), so the first AUTH/ASSOC loses the race: state=3,
-     * driver=0xe00002bc, followed by a full rescan and ~1 minute without
-     * network. airportd retries this call by itself. */
-    if (sc->sc_ic.ic_state != IEEE80211_S_RUN) {
-        MWX_DEV_LOG(sc,"AWDL enable deferred until infra RUN (state=%d)\n",
-                    sc->sc_ic.ic_state);
-        return kIOReturnNotReady;
-    }
+    // Unassociated idle Wi-Fi is allowed. Actual scans, queued AUTH/ASSOC,
+    // incomplete RSN joins, power and MAC transitions keep their priority.
+    check=mwx_awdl_sync_status(sc,expected,guard);
+    if(check!=kIOReturnSuccess) return check;
     MwxAwdlOperation operation(sc);
-    if (!operation.valid()) {
-        MWX_DEV_LOG(sc,"AWDL enable blocked busy=%d stopping=%d reset=%d running=%d\n",
-                    sc->sc_awdl_busy,sc->sc_awdl_stopping,sc->sc_resetting,
-                    !!(sc->sc_ic.ic_if.if_flags & IFF_RUNNING));
-        return kIOReturnNotReady;
-    }
-    if(sc->sc_awdl_enabled) return !memcmp(address,sc->sc_awdl_address,6) ?
-        kIOReturnSuccess : kIOReturnBusy;
-    // A failed partial enable must be removed before retrying the same OMAC.
+    if (!operation.valid()) return kIOReturnNotReady;
+    check=mwx_awdl_sync_status(sc,expected,guard);
+    if(check!=kIOReturnSuccess || operation.epoch!=expected)
+        return check!=kIOReturnSuccess ? check : kIOReturnAborted;
+    // Check the SAME generation, epoch and absolute deadline after every
+    // firmware wait. A canceled/late setup remains tracked for OFF/reset or
+    // the next attempt; it never tears down a replacement epoch or publishes
+    // an enabled session merely because its last MCU command succeeded.
+    auto current=[&]() { return mwx_awdl_sync_status(sc,operation.epoch,guard); };
     if(sc->sc_awdl_configured) {
+        // A deferred attempt may have installed only part of the RX filter.
+        // Restore its saved drops before taking a fresh ownership snapshot.
+        mwx_awdl_restore_filter(sc);
+        if((check=current())!=kIOReturnSuccess) return check;
         int rv=mwx_awdl_remove_context(sc,operation.epoch);
-        if(!operation.valid()) return kIOReturnAborted;
+        if((check=current())!=kIOReturnSuccess) return check;
         if(rv) return kIOReturnIOError;
     }
     mwx_vif &v=sc->sc_awdl_vif;
@@ -10219,13 +10319,12 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     v.vif_mn.wcid=MWX_WTBL_RESERVED-1;
     memcpy(sc->sc_awdl_address,address,6);
     mwx_mac_wtbl_update(sc,v.vif_mn.wcid);
-    // Remember a partial context even if teardown interrupts a later wait.
     sc->sc_awdl_configured=true;
     mwxController()->setProperty("MTKAWDLFirmwareStage","device-bss");
     int rv=mt7921_mcu_uni_add_dev(sc,&v,&v.vif_mn,1);
     mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
     MWX_DEV_LOG(sc,"AWDL enable device-bss result=%d\n",rv);
-    if(!operation.valid()) return kIOReturnAborted;
+    if((check=current())!=kIOReturnSuccess) return check;
     if(rv) return kIOReturnIOError;
     // A separate multicast/legacy TX entry; no infrastructure encryption or
     // header translation. Firmware owns ACK/retries on the raw 802.11 frame.
@@ -10233,8 +10332,6 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     if(!m) { mwx_awdl_remove_context(sc,operation.epoch); return kIOReturnNoMemory; }
     uint16_t count=0;
     sta_rec_basic *basic=(sta_rec_basic *)mwx_append_tlv(m,&count,STA_REC_BASIC,sizeof(*basic));
-    // MT76's broadcast station record always uses CONNECTION_INFRA_BC,
-    // including an IBSS BSS; BC|IBSS is not a firmware connection type.
     basic->conn_type=htole32(STA_TYPE_BC | NETWORK_INFRA);
     basic->conn_state=CONN_STATE_PORT_SECURE;
     basic->extra_info=htole16(EXTRA_INFO_VER | EXTRA_INFO_NEW);
@@ -10253,39 +10350,35 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable)
     mwxController()->setProperty("MTKAWDLFirmwareStage","broadcast-station");
     sc->sc_awdl_station_pending[3]=true;
     rv=m ? mwx_mcu_send_mbuf(sc,MCU_UNI_CMD_STA_REC_UPDATE,m,&seq) : ENOBUFS;
-    if(!operation.valid()) return kIOReturnAborted;
+    if((check=current())!=kIOReturnSuccess) return check;
     if(!rv) rv=mwx_mcu_wait_resp_int(sc,MCU_UNI_CMD_STA_REC_UPDATE,seq,&status);
     mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
     mwxController()->setProperty("MTKAWDLFirmwareResponseStatus",static_cast<uint64_t>(status),32);
     MWX_DEV_LOG(sc,"AWDL enable broadcast-station transport=%d firmware=%u\n",rv,status);
-    if(!operation.valid()) return kIOReturnAborted;
+    if((check=current())!=kIOReturnSuccess) return check;
     if(!rv && !status) {
         mwxController()->setProperty("MTKAWDLFirmwareStage","tx-queues");
         rv=mt7921_mcu_set_tx(sc,&v);
         mwxController()->setProperty("MTKAWDLFirmwareTransportStatus",static_cast<uint64_t>(rv),32);
         MWX_DEV_LOG(sc,"AWDL enable tx-queues result=%d\n",rv);
     }
-    if(!operation.valid()) return kIOReturnAborted;
+    if((check=current())!=kIOReturnSuccess) return check;
     if(rv || status) {
         mwx_awdl_remove_context(sc,operation.epoch);
         return kIOReturnIOError;
     }
-    // AWDL group data carries the AWDL BSSID, which no firmware BSS owns.
-    // MT7921 firmware owns RFCR, so a direct register clear alone does not
-    // keep multicast (mDNS) from other-BSS peers: request it through the MCU.
-    // Unicast and action RX do not depend on this; record, do not fail.
+    // Remember ownership before the first wait, not after a possible reset.
     sc->sc_awdl_filter=mwx_read(sc,MT_WF_RFCR(0)) & mwx_awdl_filter_mask;
-    int filter=mt7921_mcu_set_rxfilter(sc,mwx_fif_enable|mwx_fif_other_bss,0,0);
-    if(!filter) filter=mt7921_mcu_set_rxfilter(sc,0,mwx_fif_bit_clr,mwx_awdl_filter_mask);
-    // An abort below still leaves teardown responsible for the firmware filter.
     sc->sc_awdl_filter_active=true;
+    int filter=mt7921_mcu_set_rxfilter(sc,mwx_fif_enable|mwx_fif_other_bss,0,0);
+    if((check=current())!=kIOReturnSuccess) return check;
+    if(!filter) filter=mt7921_mcu_set_rxfilter(sc,0,mwx_fif_bit_clr,mwx_awdl_filter_mask);
     mwxController()->setProperty("MTKAWDLRxFilterStatus",static_cast<uint64_t>(filter),32);
     MWX_DEV_LOG(sc,"AWDL enable rx-filter result=%d\n",filter);
-    if(!operation.valid()) return kIOReturnAborted;
+    if((check=current())!=kIOReturnSuccess) return check;
     IOLockLock(sc->sc_awdl_lock);
-    if(sc->sc_awdl_epoch!=operation.epoch || sc->sc_awdl_stopping) {
-        IOLockUnlock(sc->sc_awdl_lock); return kIOReturnAborted;
-    }
+    check=mwx_awdl_sync_status_locked(sc,operation.epoch,guard,true);
+    if(check!=kIOReturnSuccess) { IOLockUnlock(sc->sc_awdl_lock); return check; }
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
     for(unsigned i=0;i<3;++i) mwx_awdl_reset_rate(sc,i);
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();

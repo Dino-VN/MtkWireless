@@ -72,7 +72,24 @@ public:
     // Polling owns no interface pointer. Active + terminal capacity is 32.
     bool awdlTakeTxResult(AwdlTxResult &result);
     uint64_t awdlTxSession();
-    IOReturn awdlEnable(const uint8_t *address, bool enable);
+    struct AwdlSyncSnapshot {
+        uint64_t session;
+        uint32_t epoch;
+        bool attached, wantedUp, ready;
+    };
+    // Read on the controller gate. Epoch/session and primary-task admission
+    // markers are AWDL-lock protected; settled power and scan/join flags also
+    // veto setup. An idle unassociated radio is eligible.
+    bool awdlSyncSnapshot(AwdlSyncSnapshot &snapshot);
+    struct AwdlSyncGuard {
+        uint64_t generation, deadlineUS;
+        uint32_t epoch;
+        void *context;
+        bool (*current)(void *,uint64_t);
+    };
+    // The optional guard is borrowed only for this gate-ordered call. Its
+    // current callback must not sleep, acquire locks or call native services.
+    IOReturn awdlEnable(const uint8_t *address, bool enable, const AwdlSyncGuard *guard=nullptr);
     struct AwdlRocTiming;
     IOReturn awdlReserve(uint8_t channel, uint32_t durationMs, AwdlRocTiming *timing=nullptr);
     IOReturn awdlPrepareChannel(uint8_t channel);

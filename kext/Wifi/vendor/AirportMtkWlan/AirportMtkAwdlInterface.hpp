@@ -237,21 +237,36 @@ private:
     mbuf_t buildAmsdu(mbuf_t first, uint8_t channel, uint64_t now, unsigned &subframes);
     AirportMtkWlan *owner = NULL; MtkMwx *hal = NULL;
     IOTimerEventSource *timer = NULL; bool timerAdded = false, stopping = false, enabled = false;
-    // 1.0.41: the first firmware enable must not race NVRM's BAR1 remap, which
-    // holds PCIe and the registry busy for tens of seconds at boot. The request
-    // is acknowledged (airportd never retries) and completed from service().
-    // 1.0.44: also wait for the infra link to reach RUN. The HAL gate that used
-    // to reject the request (1.0.25) assumed airportd retries; it does not, so
-    // a single early request left AWDL dead for the whole boot.
+    // Preserve NVRM's first-enable BAR1 gate independently of association.
+    // One native generation owns both boot waiting and lifecycle recovery;
+    // the timer continues that request, never manufactures another ON.
     bool awdlSystemReady();
-    bool readyGatePending = false, readyGateBypassed = false, readyGateForce = false;
-    uint64_t readyGateStartUS = 0, readyGateWaitedUS = 0;
+    bool readyGateBypassed = false;
     uint64_t readyGateBypassCount = 0, readyGateCompletions = 0, readyGateChecks = 0;
     static constexpr uint64_t kReadyGateMaxUS = 180ull * 1000 * 1000;
-    // Firmware commandSleep releases the controller gate. Serialize sync
-    // transitions across that interval, including duplicate native requests.
+    static constexpr uint64_t kSyncRecoveryMaxUS = 15ull * 1000 * 1000;
+    struct SyncEnable {
+        enum Phase { None, Boot, Recovery, Applying } phase = None;
+        uint64_t generation = 0, acceptedAtUS = 0, deadlineUS = 0;
+        uint32_t epoch = 0;
+        unsigned rebinds = 0, attempts = 0;
+        bool deferred = false;
+    } syncEnable;
+    void cancelSyncEnable();
+    static bool syncEnableCurrent(void*,uint64_t);
+    IOReturn continueSyncEnable(uint64_t);
+    void serviceSyncEnable();
+    void scheduleSyncEnable();
+    void publishSyncStatus(IOReturn,const char*);
+    // Firmware commandSleep releases the controller gate. Validate the native
+    // generation after every owner sleep as well as inside firmware setup.
     IOThread syncOwner = NULL;
+    // Canceling intent during a synchronous OFF callback does not replace the
+    // teardown owner. Only an admitted non-recursive Sync request does that.
+    uint64_t syncRequestGeneration = 0;
     uint64_t syncRequests = 0, syncWaits = 0, syncFailures = 0;
+    uint64_t syncDeferred = 0, syncRecovered = 0, syncExpired = 0, syncCanceled = 0;
+    uint64_t syncEpochRebinds = 0, syncAttempts = 0;
     IOSkywalkPacketBufferPool *txPool = NULL, *rxPool = NULL;
     IOSkywalkTxSubmissionQueue *txSubmit = NULL;
     IOSkywalkTxCompletionQueue *txComplete = NULL;

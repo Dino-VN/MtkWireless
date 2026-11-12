@@ -350,6 +350,7 @@ IOReturn AirportMtkAwdlInterface::disableGated(OSObject*,void *arg,void *options
 }
 IOReturn AirportMtkAwdlInterface::disableInGate(unsigned int options)
 {
+    cancelSyncEnable();
     invalidateDataRxAdmission();
     // Stop submission before the native disable can tear down sync/peers.
     disableDatapath();
@@ -707,6 +708,7 @@ IOReturn AirportMtkAwdlInterface::shutdownGated(OSObject*,void *arg,void*,void*,
 void AirportMtkAwdlInterface::shutdownInGate()
 {
     if(stopping) return;
+    cancelSyncEnable();
     invalidateDataRxAdmission(); stopping=true;
     if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
     awTimeline.reset(); resetForwardAdmission();
@@ -771,6 +773,7 @@ IOReturn AirportMtkAwdlInterface::setMacAddressInGate(ether_addr &mac)
     if(stopping) return kIOReturnNotReady;
     if(enabled || syncOwner) return kIOReturnBusy;
     if(!mtkawdl::unicast((uint8_t *)&mac)) return kIOReturnBadArgument;
+    cancelSyncEnable();
     auto sequence=state.ownSequence;
     invalidateDataRxAdmission();
     state.init((uint8_t *)&mac,awdlNow());
@@ -800,6 +803,7 @@ IOReturn AirportMtkAwdlInterface::interfaceEnableGated(OSObject*,void *arg,void 
 IOReturn AirportMtkAwdlInterface::setInterfaceEnableInGate(bool value)
 {
     if(stopping) return kIOReturnNotReady;
+    if(!value) cancelSyncEnable();
     invalidateDataRxAdmission();
     // Native link transitions enable the Apple peer manager; sync is enabled
     // by the peer manager after the AWDL configuration transaction succeeds.
@@ -827,7 +831,7 @@ bool AirportMtkAwdlInterface::setLinkStateInGate(IO80211LinkState value,unsigned
 {
     if(stopping) return false;
     invalidateDataRxAdmission();
-    if(value==kIO80211NetworkLinkDown) setSync(false);
+    if(value==kIO80211NetworkLinkDown) { cancelSyncEnable(); setSync(false); }
     setProperty("MTKAWDLNativeLinkState",static_cast<uint64_t>(value),32);
     return super::setLinkState(value,reason);
 }
@@ -890,11 +894,9 @@ static bool peerScheduleKnown(const mtkawdl::Peer &p,uint64_t now)
 
 bool AirportMtkAwdlInterface::awdlSystemReady()
 {
-    // The HAL rejects awdlEnable unless the infra link is in RUN, and airportd
-    // never retries a rejected request. Wait for the join here instead: the
-    // request is acknowledged and completed later from service().
     if(!hal) return false;
-    if(!hal->awdlInfraChannel()) return false;
+    // This is the boot-time PCIe policy, not an AP-association requirement.
+    // Firmware, power, scan and join admission comes from the HAL snapshot.
     // nvrm-gpu-profile is published on the GPU's IOPCIDevice node once NVRM
     // has finished sizing/remapping BAR1; the accelerator nubs do not carry
     // it (verified on this machine: IOPCIDevice=1, IOAccelerator=0).
@@ -920,79 +922,249 @@ bool AirportMtkAwdlInterface::awdlSystemReady()
     // Everywhere else the profile never appears; do not stall AirDrop 180 s.
     return !nvidia || profile;
 }
+void AirportMtkAwdlInterface::cancelSyncEnable()
+{
+    if(syncEnable.phase!=SyncEnable::None) ++syncCanceled;
+    syncEnable.phase=SyncEnable::None;
+    // Fail closed on exhaustion instead of recycling a live generation.
+    if(syncEnable.generation!=UINT64_MAX) ++syncEnable.generation;
+    // Dropped native TX still owns deferred completions on this shared timer.
+    if(timer && !enabled && !completionCount) timer->cancelTimeout();
+}
+bool AirportMtkAwdlInterface::syncEnableCurrent(void *context,uint64_t generation)
+{
+    auto self=static_cast<AirportMtkAwdlInterface *>(context);
+    return !self->stopping && self->syncEnable.generation==generation &&
+        self->syncEnable.phase!=SyncEnable::None;
+}
+void AirportMtkAwdlInterface::scheduleSyncEnable()
+{
+    if(stopping || !timer || syncEnable.phase==SyncEnable::None) return;
+    uint64_t now=awdlNow();
+    uint64_t delay=syncEnable.phase==SyncEnable::Boot ? 500000 : 100000;
+    uint64_t remaining=syncEnable.deadlineUS>now ? syncEnable.deadlineUS-now : 1;
+    if(delay>remaining) delay=remaining;
+    timer->enable(); timer->setTimeoutUS(static_cast<uint32_t>(delay));
+}
+void AirportMtkAwdlInterface::publishSyncStatus(IOReturn status,const char *transition)
+{
+    MtkMwx::AwdlSyncSnapshot snapshot={};
+    const bool live=hal && hal->awdlSyncSnapshot(snapshot) && enabled && txSession &&
+        snapshot.session==txSession;
+    setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(status),32);
+    setProperty("MTKAWDLSyncEnabled",live);
+    setProperty("MTKAWDLSyncTransition",transition);
+    setProperty("MTKAWDLSyncRequests",syncRequests,64);
+    setProperty("MTKAWDLSyncWaits",syncWaits,64);
+    setProperty("MTKAWDLSyncFailures",syncFailures,64);
+    setProperty("MTKAWDLSyncDeferred",syncDeferred,64);
+    setProperty("MTKAWDLSyncRecoveryCompleted",syncRecovered,64);
+    setProperty("MTKAWDLSyncRecoveryExpired",syncExpired,64);
+    setProperty("MTKAWDLSyncRecoveryCanceled",syncCanceled,64);
+    setProperty("MTKAWDLSyncRecoveryEpochRebinds",syncEpochRebinds,64);
+    setProperty("MTKAWDLSyncRecoveryAttempts",syncAttempts,64);
+    setProperty("MTKAWDLSyncRecoveryPending",syncEnable.phase!=SyncEnable::None);
+    setProperty("MTKAWDLSyncRecoveryGeneration",syncEnable.generation,64);
+    setProperty("MTKAWDLSyncRecoveryDeadlineUS",syncEnable.deadlineUS,64);
+}
+IOReturn AirportMtkAwdlInterface::continueSyncEnable(uint64_t generation)
+{
+    if(!syncEnableCurrent(this,generation)) return kIOReturnAborted;
+    MtkMwx::AwdlSyncSnapshot snapshot={};
+    IOReturn status=kIOReturnNotReady;
+    uint64_t now=awdlNow();
+    if(now>=syncEnable.deadlineUS) status=kIOReturnTimeout;
+    else if(hal->awdlSyncSnapshot(snapshot) && snapshot.attached && snapshot.wantedUp) {
+        // Reset can occur between the native request's first snapshot and this
+        // one. Retire its real native AW and queued frames while txSession still
+        // identifies that owner; clearing the bool first would skip service.
+        if(enabled && (!txSession || snapshot.session!=txSession)) {
+            serviceInGate();
+            if(stopping) return kIOReturnNotReady;
+            if(generation!=syncEnable.generation) return kIOReturnAborted;
+            hal->awdlSyncSnapshot(snapshot);
+            if(!snapshot.attached || !snapshot.wantedUp) {
+                syncEnable.phase=SyncEnable::None; return kIOReturnNotReady;
+            }
+            if(awdlNow()>=syncEnable.deadlineUS) {
+                syncEnable.phase=SyncEnable::None; return kIOReturnTimeout;
+            }
+        }
+        if(snapshot.epoch!=syncEnable.epoch) {
+            if(syncEnable.rebinds>=8) { syncEnable.phase=SyncEnable::None; return kIOReturnAborted; }
+            syncEnable.epoch=snapshot.epoch; ++syncEnable.rebinds; ++syncEpochRebinds;
+        }
+        if(syncEnable.phase==SyncEnable::Boot) {
+            ++readyGateChecks;
+            const bool ready=awdlSystemReady();
+            const uint64_t waited=awdlNow()-syncEnable.acceptedAtUS;
+            setProperty("MTKAWDLReadyGateChecks",readyGateChecks,64);
+            setProperty("MTKAWDLReadyGateWaitedUS",waited,64);
+            if(!ready && waited<kReadyGateMaxUS) {
+                setProperty("MTKAWDLReadyGate","waiting");
+                if(!syncEnable.deferred) { syncEnable.deferred=true; ++syncDeferred; }
+                return kIOReturnNotReady;
+            }
+            readyGateBypassed=true; ++readyGateCompletions;
+            if(!ready) ++readyGateBypassCount;
+            setProperty("MTKAWDLReadyGate",ready ? "ready" : "bypassed");
+            setProperty("MTKAWDLReadyGateCompletions",readyGateCompletions,64);
+            setProperty("MTKAWDLReadyGateBypass",readyGateBypassCount,64);
+            // The deadline can only shorten. Boot completion does not renew
+            // an accepted request's lifetime on every retry/epoch change.
+            const uint64_t recoveryEnd=awdlNow()+kSyncRecoveryMaxUS;
+            if(syncEnable.deadlineUS>recoveryEnd) syncEnable.deadlineUS=recoveryEnd;
+            syncEnable.phase=SyncEnable::Recovery;
+        }
+        // A genuine duplicate ON needs no firmware operation. Never trust a
+        // stale frontend bool after the HAL has quiesced its native session.
+        if(enabled && txSession && snapshot.session==txSession) {
+            syncEnable.phase=SyncEnable::None;
+            if(syncEnable.deferred) ++syncRecovered;
+            timer->setTimeoutMS(1); return kIOReturnSuccess;
+        }
+        enabled=false; txSession=0;
+        if(snapshot.ready) {
+            if(syncEnable.attempts>=16) { syncEnable.phase=SyncEnable::None; return kIOReturnTimeout; }
+            ++syncEnable.attempts; ++syncAttempts;
+            syncEnable.phase=SyncEnable::Applying;
+            MtkMwx::AwdlSyncGuard guard={generation,syncEnable.deadlineUS,
+                syncEnable.epoch,this,syncEnableCurrent};
+            status=hal->awdlEnable(state.mac,true,&guard);
+            if(stopping) return kIOReturnNotReady;
+            if(generation!=syncEnable.generation) return kIOReturnAborted;
+            invalidateDataRxAdmission();
+            hal->awdlSyncSnapshot(snapshot);
+            now=awdlNow();
+            if(status==kIOReturnSuccess && now<syncEnable.deadlineUS &&
+               snapshot.epoch==guard.epoch && snapshot.session) {
+                enabled=true; txSession=snapshot.session;
+                syncEnable.phase=SyncEnable::None;
+                if(syncEnable.deferred) ++syncRecovered;
+                nextAction=0; timer->enable(); timer->setTimeoutMS(1);
+                return kIOReturnSuccess;
+            }
+            if(status==kIOReturnSuccess) {
+                // The HAL may commit just before expiry and return just after
+                // it. An enable this ticket cannot publish must not leave an
+                // orphan context running. Never roll back a replacement epoch.
+                if(snapshot.epoch==guard.epoch && snapshot.session) {
+                    IOReturn rollback=hal->awdlEnable(state.mac,false);
+                    hal->awdlInfraWakeIfIdle();
+                    setProperty("MTKAWDLSyncRollbackStatus",static_cast<uint64_t>(rollback),32);
+                    if(stopping) return kIOReturnNotReady;
+                    if(generation!=syncEnable.generation) return kIOReturnAborted;
+                    hal->awdlSyncSnapshot(snapshot);
+                    now=awdlNow();
+                }
+                status=kIOReturnNotReady;
+            }
+            // Keep real transport/firmware/allocation errors as failures.
+            // Only a still-current transient lifecycle refusal is deferred.
+            if(now>=syncEnable.deadlineUS &&
+               (status==kIOReturnNotReady || status==kIOReturnAborted)) status=kIOReturnTimeout;
+        }
+        if((status==kIOReturnNotReady ||
+            (status==kIOReturnAborted && (!snapshot.ready || snapshot.epoch!=syncEnable.epoch))) &&
+           snapshot.attached && snapshot.wantedUp && awdlNow()<syncEnable.deadlineUS) {
+            syncEnable.phase=SyncEnable::Recovery;
+            if(!syncEnable.deferred) { syncEnable.deferred=true; ++syncDeferred; }
+            return status;
+        }
+    }
+    syncEnable.phase=SyncEnable::None;
+    return status;
+}
+void AirportMtkAwdlInterface::serviceSyncEnable()
+{
+    if(stopping || syncEnable.phase==SyncEnable::None || syncOwner) return;
+    const uint64_t generation=syncEnable.generation;
+    syncOwner=IOThreadSelf();
+    IOReturn status=continueSyncEnable(generation);
+    if(generation==syncEnable.generation && !stopping) {
+        const bool pending=syncEnable.phase!=SyncEnable::None;
+        if(status!=kIOReturnSuccess && !pending) { ++syncFailures; if(status==kIOReturnTimeout) ++syncExpired; }
+        publishSyncStatus(status,pending ? "deferred" : (enabled ? "enabled" : "failed"));
+    }
+    syncOwner=NULL;
+    _fCommandGate->commandWakeup(&syncOwner,false);
+}
 IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
 {
     if(stopping || !hal || !timer || !_fCommandGate) return kIOReturnNotReady;
     ++syncRequests;
     IOThread caller=IOThreadSelf();
-    uint64_t deadline=awdlNow()+3000000;
+    // A rejected synchronous recursion cannot wait for its own stack. Native
+    // disable/leave/shutdown also cancel explicitly before their callbacks.
+    if(syncOwner==caller) return kIOReturnBusy;
+    cancelSyncEnable();
+    if(value && syncEnable.generation==UINT64_MAX) return kIOReturnNoResources;
+    const uint64_t generation=syncEnable.generation, acceptedAt=awdlNow();
+    syncRequestGeneration=generation;
+    const uint64_t deadline=acceptedAt+3000000;
+    if(!value) { invalidateDataRxAdmission(); enabled=false; }
     while(syncOwner) {
-        // A synchronous callback cannot wait for its own stack to unwind.
-        if(syncOwner==caller) return kIOReturnBusy;
+        if(stopping) return kIOReturnNotReady;
+        if(generation!=syncEnable.generation) return kIOReturnAborted;
         if(awdlNow()>=deadline) return kIOReturnTimeout;
         ++syncWaits;
         AbsoluteTime wake;
         clock_interval_to_deadline(10,kMillisecondScale,&wake);
         _fCommandGate->commandSleep(&syncOwner,wake,THREAD_UNINT);
-        if(stopping) return kIOReturnNotReady;
     }
+    if(stopping) return kIOReturnNotReady;
+    if(generation!=syncEnable.generation) return kIOReturnAborted;
     invalidateDataRxAdmission(); syncOwner=caller;
-    setProperty("MTKAWDLSyncTransition",value ? "enabling" : "disabling");
-    // 1.0.41: hold the first enable until the GPU bring-up stops reconfiguring
-    // PCIe. Airportd never retries a rejected request, so acknowledge it and
-    // finish the firmware enable from service() once the accelerator is up.
-    if(value && !enabled && !readyGateBypassed && !readyGateForce) {
-        if(!readyGatePending) { readyGatePending=true; readyGateStartUS=awdlNow(); }
-        uint64_t waited=awdlNow()-readyGateStartUS;
-        if(waited<kReadyGateMaxUS && !awdlSystemReady()) {
-            readyGateWaitedUS=waited;
-            setProperty("MTKAWDLReadyGate","waiting");
-            setProperty("MTKAWDLReadyGateWaitedUS",readyGateWaitedUS,64);
-            setProperty("MTKAWDLSyncTransition","deferred");
-            if(timer) { timer->enable(); timer->setTimeoutMS(500); }
-            syncOwner=NULL;
-            _fCommandGate->commandWakeup(&syncOwner,false);
-            return kIOReturnSuccess;
+    IOReturn status=kIOReturnNotReady;
+    if(value) {
+        MtkMwx::AwdlSyncSnapshot snapshot={}; hal->awdlSyncSnapshot(snapshot);
+        if(enabled && (!txSession || snapshot.session!=txSession)) serviceInGate();
+        if(!stopping && generation==syncEnable.generation) {
+            syncEnable.acceptedAtUS=acceptedAt;
+            syncEnable.phase=readyGateBypassed ? SyncEnable::Recovery : SyncEnable::Boot;
+            syncEnable.deadlineUS=acceptedAt+kSyncRecoveryMaxUS+
+                (readyGateBypassed ? 0 : kReadyGateMaxUS);
+            syncEnable.epoch=snapshot.epoch; syncEnable.rebinds=syncEnable.attempts=0;
+            syncEnable.deferred=false;
+            status=continueSyncEnable(generation);
         }
-        if(waited>=kReadyGateMaxUS) ++readyGateBypassCount;
-        readyGatePending=false; readyGateBypassed=true;
-        setProperty("MTKAWDLReadyGate",waited>=kReadyGateMaxUS ? "bypassed" : "ready");
-        setProperty("MTKAWDLReadyGateBypass",readyGateBypassCount,64);
-    }
-    if(!value) {
-        readyGatePending=false;
-        enabled=false;
+    } else {
         finishAvailabilityWindowForDisable();
-        state.discardControls(); state.holdClock(0);
-        awTimeline.reset(); resetForwardAdmission(); drainCompletions();
+        // End delivery can synchronously cancel intent via native Link Down.
+        // Its recursive setSync is Busy, not a replacement teardown. Still
+        // finish this OFF unless a newer non-recursive request took ownership.
+        if(!stopping && generation==syncRequestGeneration) {
+            state.discardControls(); state.holdClock(0);
+            awTimeline.reset(); resetForwardAdmission(); txSession=0;
+            resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending));
+            trafficActive=trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
+            timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
+            while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
+            drainTxStatus(); drainCompletions();
+            if(!stopping && generation==syncRequestGeneration) {
+                status=hal->awdlEnable(state.mac,false);
+                // The canceled tick must not leave the infrastructure dozing.
+                hal->awdlInfraWakeIfIdle(); drainCompletions();
+                // Submission during the firmware wait can rearm the shared
+                // timer. Cancel only this OFF's now-empty completion wake, not
+                // a newer request or a batch queued by a completion callback.
+                if(!stopping && generation==syncRequestGeneration &&
+                   !enabled && !completionCount) timer->cancelTimeout();
+            }
+        }
     }
-    IOReturn status=stopping ? kIOReturnNotReady : hal->awdlEnable(state.mac,value);
     if(stopping) status=kIOReturnNotReady;
-    invalidateDataRxAdmission();
-    if(status==kIOReturnSuccess) enabled=value;
-    txSession=enabled ? hal->awdlTxSession() : 0;
-    if(!enabled) {
-        drainTxStatus();
-        // MtkWireless: the tick that would send PM=0 is canceled below.
-        hal->awdlInfraWakeIfIdle();
-        resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false; trafficPeerInstalled=false;
-        bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
-        // Firmware commandSleep releases the gate. Submission can queue drop
-        // completions during that wait, so drain again before canceling tick.
-        drainCompletions();
-        timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
-        while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
-    } else if(!stopping) {
-        nextAction=0; timer->setTimeoutMS(1);
+    else if(generation!=(value ? syncEnable.generation : syncRequestGeneration)) status=kIOReturnAborted;
+    else {
+        const bool pending=syncEnable.phase!=SyncEnable::None;
+        if(status!=kIOReturnSuccess && !pending) { ++syncFailures; if(status==kIOReturnTimeout) ++syncExpired; }
+        publishSyncStatus(status,pending ? "deferred" :
+            (status==kIOReturnSuccess ? (enabled ? "enabled" : "disabled") : "failed"));
+        // Success acknowledges intent, not firmware enable or a native AW.
+        if(pending) status=kIOReturnSuccess;
+        setProperty("MTKAWDLSyncRequestStatus",static_cast<uint64_t>(status),32);
     }
-    if(status!=kIOReturnSuccess) ++syncFailures;
-    setProperty("MTKAWDLSyncEnableStatus",static_cast<uint64_t>(status),32);
-    setProperty("MTKAWDLSyncEnabled",enabled);
-    setProperty("MTKAWDLSyncTransition",status==kIOReturnSuccess ? (enabled ? "enabled" : "disabled") : "failed");
-    setProperty("MTKAWDLSyncRequests",syncRequests,64);
-    setProperty("MTKAWDLSyncWaits",syncWaits,64);
-    setProperty("MTKAWDLSyncFailures",syncFailures,64);
-    XYLog("AWDL sync request=%d enabled=%d status=0x%x waits=%llu\n",value,enabled,status,syncWaits);
+    scheduleSyncEnable();
     invalidateDataRxAdmission(); syncOwner=NULL;
     _fCommandGate->commandWakeup(&syncOwner,false);
     return status;
@@ -1280,31 +1452,11 @@ void AirportMtkAwdlInterface::tick(OSObject *o,IOTimerEventSource*)
 void AirportMtkAwdlInterface::service()
 {
     retain(); drainTxStatus(); drainCompletions();
-    // 1.0.41: finish the enable that was acknowledged while the GPU bring-up
-    // still owned PCIe. service() only runs from the timer, so taking the
-    // command gate from here cannot deadlock with the sync owner.
-    if(readyGatePending && !enabled && !stopping) {
-        ++readyGateChecks;
-        bool ready=awdlSystemReady();
-        bool expire=awdlNow()-readyGateStartUS>=kReadyGateMaxUS;
-        setProperty("MTKAWDLReadyGateChecks",readyGateChecks,64);
-        setProperty("MTKAWDLReadyGateWaitedUS",awdlNow()-readyGateStartUS,64);
-        if(ready || expire) {
-            readyGatePending=false;
-            ++readyGateCompletions;
-            setProperty("MTKAWDLReadyGate",expire && !ready ? "bypassed" : "completed");
-            setProperty("MTKAWDLReadyGateCompletions",readyGateCompletions,64);
-            if(expire && !ready) ++readyGateBypassCount;
-            setProperty("MTKAWDLReadyGateBypass",readyGateBypassCount,64);
-            // The deferred request must not re-enter the gate below.
-            readyGateForce=true;
-            setSync(true);
-            readyGateForce=false;
-        } else if(timer) {
-            timer->setTimeoutMS(500);
-        }
-    }
+    serviceSyncEnable();
     serviceInGate();
+    // Reset/native-end cleanup can cancel the shared timer. Reconcile the
+    // surviving request AFTER that cleanup, without replacing its generation.
+    scheduleSyncEnable();
     release();
 }
 
@@ -1624,13 +1776,11 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 void AirportMtkAwdlInterface::serviceInGate()
 {
     if(!enabled || stopping) return;
-    // Native end dispatch can reenter the timer/service path. Finish its
-    // control transaction before opening another AW with the old snapshot.
-    if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     ++serviceTicks;
     const uint64_t serviceAt=awdlNow();
-    const uint64_t serviceSession=txSession;
-    if(!hal->awdlIsEnabled()) {
+    const uint64_t serviceSession=txSession, serviceGeneration=syncRequestGeneration;
+    MtkMwx::AwdlSyncSnapshot syncSnapshot={}; hal->awdlSyncSnapshot(syncSnapshot);
+    if(!hal->awdlIsEnabled() || syncSnapshot.session!=serviceSession) {
         // Transport reset invalidates the secondary BSS and all grants.
         invalidateDataRxAdmission();
         state.holdClock(0);
@@ -1645,11 +1795,15 @@ void AirportMtkAwdlInterface::serviceInGate()
         if(awTimeline.open) notifyAvailabilityWindowEnd(awdlNow());
         // End delivery may have started a replacement frontend session. Its
         // timer, queue and native AW are not part of this reset cleanup.
-        if(stopping || enabled || txSession!=serviceSession) return;
+        if(stopping || enabled || txSession!=serviceSession || syncRequestGeneration!=serviceGeneration) return;
+        txSession=0;
         awTimeline.reset(); resetForwardAdmission();
         while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
         return;
     }
+    // A live control transaction can delay new AWs, but never retirement of a
+    // session that firmware lost. Check that ownership before this early return.
+    if(state.controlsHeld && !awTimeline.open) { timer->setTimeoutMS(1); return; }
     if(forwardEnabled && forward.callId && forward.callSession==serviceSession) {
         timer->setTimeoutMS(1); return;
     }
@@ -2781,7 +2935,15 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_PARAMS(apple80211_awdl_sync_param
     setProperty("MTKAWDLPSFPeriodMS",static_cast<uint64_t>(state.psfPeriod),32);
     return kIOReturnSuccess;
 }
-IOReturn AirportMtkAwdlInterface::getAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,0,uint32_t(enabled)}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getAWDL_SYNC_ENABLED(apple80211_awdl_sync_enabled *d)
+{
+    if(!d) return kIOReturnBadArgument;
+    MtkMwx::AwdlSyncSnapshot snapshot={};
+    const bool live=!stopping && enabled && txSession && hal &&
+        hal->awdlSyncSnapshot(snapshot) && snapshot.session==txSession;
+    *d={APPLE80211_VERSION,0,uint32_t(live)};
+    return kIOReturnSuccess;
+}
 IOReturn AirportMtkAwdlInterface::setAWDL_CONFIG(apple80211_awdl_config_request *d)
 {
     // Tahoe uses this request to commit the peer-manager configuration. The

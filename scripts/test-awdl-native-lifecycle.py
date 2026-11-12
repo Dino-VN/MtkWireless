@@ -64,7 +64,7 @@ INTERFACE_GROUPS = {
     "bsd_datapath": "getHardwareAssists setHardwareAssists publishBSDOffloadState prepareBSDInterface enable enableGated enableInGate disable disableGated disableInGate dataPathGated enableDatapath disableDatapath setDataPathEnabled submitNative drainCompletions inputNative",
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
-    "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady setSyncInGate finishAvailabilityWindowForDisable",
+    "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
     "timer_polling_windows": "makeFrame buildAmsdu output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
     "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
@@ -228,13 +228,16 @@ using IOReturn=unsigned; using UInt=unsigned; using UInt32=uint32_t; using SInt3
 using apple80211_wme_ac=unsigned; using AbsoluteTime=uint64_t; using IOThread=void *;
 constexpr unsigned kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnNoMemory=2,
  kIOReturnBadArgument=3,kIOReturnUnsupported=4,kIOReturnNotFound=5,kIOReturnError=6,
- kIOReturnNoResources=7,kIOReturnBusy=8,kIOReturnTimeout=9,
+ kIOReturnNoResources=7,kIOReturnBusy=8,kIOReturnTimeout=9,kIOReturnAborted=12,kIOReturnIOError=13,
  kIOReturnOutputSuccess=0,kIOReturnOutputDropped=1,
  kMillisecondScale=1,THREAD_UNINT=0,THREAD_AWAKENED=10,THREAD_TIMED_OUT=11,
  APPLE80211_C_FLAG_20MHZ=1,APPLE80211_C_FLAG_2GHZ=8,APPLE80211_C_FLAG_5GHZ=16,
  APPLE80211_M_AWDL_AVAILABILITY_WINDOW_START=41,
  APPLE80211_M_AWDL_AVAILABILITY_WINDOW_EXTENSIONS_END=43,
- IFF_RUNNING=0x40;
+ IFF_RUNNING=0x40,IFF_UP=1;
+constexpr int IEEE80211_M_STA=1,IEEE80211_S_SCAN=0,IEEE80211_S_AUTH=2,IEEE80211_S_ASSOC=3,IEEE80211_S_RUN=4;
+constexpr unsigned IEEE80211_F_RSNON=1,MWX_FLAG_SCANNING=1,MWX_FLAG_BGSCAN=2;
+void OSSynchronizeIO() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 enum IO80211LinkState { kIO80211NetworkLinkDown=0,kIO80211NetworkLinkUp=1 };
 struct ether_addr { uint8_t bytes[6]; };
 struct apple80211_awdl_config_request; // native opaque version prefix
@@ -410,14 +413,18 @@ HAL_AFTER_ABI = r'''
   bool take(AwdlTxResult &out) { assert(heldHalLocks); ++takes; if(injected.empty())return false;
    out=injected.front(); injected.pop_front(); return true; }
  };
- struct IC { uint8_t ic_myaddr[6]={2,1,2,3,4,5}; int ic_state=4; bool ic_wcl_mac_reconfig=false;
+ struct IC { uint8_t ic_myaddr[6]={2,1,2,3,4,5}; int ic_state=4,ic_opmode=IEEE80211_M_STA; bool ic_wcl_mac_reconfig=false;
+  unsigned ic_flags=IEEE80211_F_RSNON;
   struct { uint64_t Attempt=0; } ic_join_diag;
-  struct Node { uint8_t ni_bssid[6]={2,9,9,9,9,9}; } modelBss; Node *ic_bss=&modelBss;
-  struct { unsigned if_flags=IFF_RUNNING; } ic_if;
+  struct Node { uint8_t ni_bssid[6]={2,9,9,9,9,9}; bool ni_port_valid=true; } modelBss; Node *ic_bss=&modelBss;
+  struct { unsigned if_flags=IFF_UP|IFF_RUNNING; } ic_if;
  };
  struct Com {
   IOLock *sc_awdl_lock=nullptr;
-  bool sc_awdl_enabled=false,sc_awdl_stopping=false,sc_resetting=false,sc_detaching=false;
+  bool sc_awdl_enabled=false,sc_awdl_stopping=false,sc_resetting=false,sc_detaching=false,sc_awdl_busy=false;
+  int sc_ns_state=IEEE80211_S_RUN; unsigned sc_flags=0;
+  SInt32 sc_power_req=0,sc_power_done=0;
+  unsigned sc_awdl_infra_busy=0,sc_awdl_init_busy=0; bool sc_awdl_ns_pending=false;
   uint64_t sc_awdl_native_session=0;
   uint32_t sc_awdl_epoch=0; AwdlRocTiming sc_awdl_roc_timing{};
   void *sc_awdl_context=nullptr; AwdlReceive sc_awdl_receive=nullptr;
@@ -439,7 +446,7 @@ HAL_AFTER_ABI = r'''
  MtkMwx() { storage.sc_awdl_lock=IOLockAlloc(); assert(storage.sc_awdl_lock); }
  ~MtkMwx() override { if(storage.sc_awdl_lock)IOLockFree(storage.sc_awdl_lock); }
  uint64_t awdlTxSession(); bool awdlTakeTxResult(AwdlTxResult &);
- bool awdlInterfaceReady();
+ bool awdlInterfaceReady(); bool awdlSyncSnapshot(AwdlSyncSnapshot &);
  IC *get80211Controller() { return com ? &com->sc_ic : nullptr; }
  bool awdlChannelAllowed(unsigned c) { return fault.social&&(c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8)||(allow11&&c==11)); }
  uint8_t awdlInfraChannel() { return infraChannel; }
@@ -465,7 +472,7 @@ HAL_AFTER_ABI = r'''
  }
  IOReturn awdlPeer(const uint8_t *,bool add) { gatedBoundary(); if(onPeer)onPeer(add); return add?0:peerDeleteResult; }
  IOReturn awdlRxBlockAck(const uint8_t *,uint8_t,uint16_t,uint16_t,bool value) { gatedBoundary(); return value?kIOReturnUnsupported:0; }
- IOReturn awdlEnable(const uint8_t *,bool);
+ IOReturn awdlEnable(const uint8_t *,bool,const AwdlSyncGuard *guard=nullptr);
  IOReturn awdlTransmit(mbuf_t m,unsigned) { gatedBoundary(); ++transmits; mbuf_freem(m); return 0; }
  IOReturn awdlTryTransmit(mbuf_t *m,unsigned c) { if(tryStatus)return tryStatus; auto status=awdlTransmit(*m,c); *m=nullptr; return status; }
  void awdlPublishDiagnostics() { ++publishes; }
@@ -701,15 +708,19 @@ IOReturn awdlControllerMessage(IO80211Controller *owner,IO80211SkywalkInterface 
  gatedBoundary(); assert(owner&&sync&&!heldHalLocks); auto b=static_cast<const uint8_t *>(p);
  owner->messages.push_back({id,{b,b+n}}); auto hook=owner->onMessage; if(hook)hook(id); return owner->messageStatus;
 }
-IOReturn MtkMwx::awdlEnable(const uint8_t *,bool value) {
+IOReturn MtkMwx::awdlEnable(const uint8_t *,bool value,const AwdlSyncGuard *guard) {
  // An unshared, never-enabled transport may be quiesced in partial/final free.
  // Live firmware operations remain gate-ordered; waits require full gate depth.
  assert((!value&&!on&&!_fCommandGate)||gateDepth);
- unsigned epoch=transportEpoch; if(value)++enables; else {++disables; ++transportEpoch;}
+ unsigned epoch=transportEpoch; if(value)++enables; else {++disables; ++transportEpoch; ++storage.sc_awdl_epoch;}
  if(onEnable)onEnable(value); if(wait)wait();
  // MCU transport commit is a boundary, not a replacement interface lifecycle.
  // A canceled in-flight enable cannot restart a transport stopped by teardown.
  IOReturn status=value&&epoch!=transportEpoch?kIOReturnNotReady:enableStatus;
+ if(value&&guard) {
+  IOReturn lifecycle=mwx_awdl_sync_status(&storage,guard->epoch,guard);
+  if(lifecycle!=kIOReturnSuccess)status=lifecycle;
+ }
  if(!status) {
   IOLockLock(storage.sc_awdl_lock);
   if(value&&!storage.sc_awdl_enabled)storage.sc_awdl_native_session=mwx_awdl_native_new_session();
@@ -889,7 +900,7 @@ void checkSync() {
   d.radio.onEnable=[&](bool value){if(value&&first.exchange(false))gate.commandSleep(&firmwareEvent,clockUS.load()+10000,THREAD_UNINT);};
   IOReturn a=99,b=99;
   // Real nested native-interface callback puts the first firmware wait at depth >= 3.
-  nativeInterfaceHook=[&]{if(first.load())assert(d.setSync(true)==0);};
+  nativeInterfaceHook=[&]{if(first.load())assert(d.setSync(true)==kIOReturnAborted);};
   std::thread one([&]{a=d.setInterfaceEnable(true);});
   {std::unique_lock<std::mutex> lock(w.lock);assert(w.cv.wait_for(lock,std::chrono::seconds(3),[&]{return w.begun;}));}
   std::thread two([&]{b=d.setSync(true);});
@@ -917,7 +928,7 @@ void checkSync() {
   {std::unique_lock<std::mutex> g(lock);assert(cv.wait_for(g,std::chrono::seconds(3),[&]{return begun;}));}
   std::thread two([&]{b=d.setSync(false);});
   {std::unique_lock<std::mutex> g(lock);assert(cv.wait_for(g,std::chrono::seconds(3),[&]{return second;}));release=true;cv.notify_all();}
-  one.join();two.join();d.radio.onEnable=nullptr;gate.sleepHook=nullptr;assert(a==0&&b==0&&!d.enabled&&!d.txSession&&!d.syncOwner);
+  one.join();two.join();d.radio.onEnable=nullptr;gate.sleepHook=nullptr;assert(a==kIOReturnAborted&&b==0&&!d.enabled&&!d.txSession&&!d.syncOwner);
  } noResources();
  // Owner teardown genuinely enters while a retained public request sleeps.
  resetFaults(); {
@@ -1018,7 +1029,12 @@ void checkModulePoll() {
   auto saved=radio.com;radio.com=nullptr;MtkMwx::AwdlTxResult out{};assert(!radio.awdlTxSession()&&!radio.awdlTakeTxResult(out)&&!radio.awdlInterfaceReady());radio.com=saved;
   auto savedLock=com.sc_awdl_lock;com.sc_awdl_lock=nullptr;assert(!radio.awdlTxSession()&&!radio.awdlTakeTxResult(out)&&!radio.awdlInterfaceReady());com.sc_awdl_lock=savedLock;
   for(bool *flag:{&com.sc_awdl_stopping,&com.sc_resetting,&com.sc_detaching,&com.sc_ic.ic_wcl_mac_reconfig}){*flag=true;assert(!radio.awdlInterfaceReady());*flag=false;}
-  com.sc_ic.ic_if.if_flags=0;assert(!radio.awdlInterfaceReady());com.sc_ic.ic_if.if_flags=IFF_RUNNING;
+  unsigned savedFlags=com.sc_ic.ic_if.if_flags;
+  com.sc_ic.ic_if.if_flags=0;assert(!radio.awdlInterfaceReady());
+  com.sc_ic.ic_if.if_flags=IFF_RUNNING;assert(radio.awdlInterfaceReady());
+  MtkMwx::AwdlSyncSnapshot snapshot{};assert(radio.awdlSyncSnapshot(snapshot));
+  assert(!snapshot.wantedUp&&!snapshot.ready&&!snapshot.session);
+  com.sc_ic.ic_if.if_flags=savedFlags;
   auto result=[&](uint64_t session,bool failed){MtkMwx::AwdlTxResult r{};r.address[0]=2;r.address[5]=7;r.failed=failed;r.reason=failed?9:0;r.session=session;return r;};
   com.sc_awdl_native_tx.injected.push_back(result(d.txSession,true));
   d.controller.onMessage=[&](unsigned id){assert(id==0x45&&!heldHalLocks);assert(radio.awdlTxSession()==d.txSession);};
@@ -1187,7 +1203,8 @@ def generate(ex: Extractor) -> str:
     text = PREAMBLE
     text += ex.structure(VAR, "apple80211_channel")
     text += "\n".join(ex.structure(IOCTL, name) for name in STRUCT_NAMES)
-    text += HAL_SUPPORT + abi + ex.structure(HAL_HEADER, "AwdlRocTiming") + HAL_AFTER_ABI
+    text += HAL_SUPPORT + abi + ex.structure(HAL_HEADER, "AwdlRocTiming")
+    text += ex.structure(HAL_HEADER, "AwdlSyncSnapshot") + ex.structure(HAL_HEADER, "AwdlSyncGuard") + HAL_AFTER_ABI
     text += RESOURCES + ex.structure(NATIVE_ETH, "RegistrationInfo") + NATIVE_AFTER_REGISTRATION
     text += "\n".join(pure) + "\n};\n" + OWNER_SUPPORT + owner_decl + "\n};\n"
     text += "class AirportMtkAwdlInterface:public IO80211AWDLProtocol {\n OSDeclareDefaultStructors(AirportMtkAwdlInterface)\npublic:\n"
@@ -1198,7 +1215,10 @@ def generate(ex: Extractor) -> str:
     text += ex.span(HAL, module_start, module_end, "module-lifetime native history/session declarations")
     text += ex.function(HAL, "mwx_awdl_native_history_init") + ex.function(HAL, "mwx_awdl_native_new_session")
     text += ex.function(INTERFACE, "awdlNow") + ex.function(HAL, "mwx_awdl_now")
-    for name in ["awdlSetReceiver", "awdlTxSession", "awdlTakeTxResult", "awdlInterfaceReady", "awdlRocTimingSnapshot"]:
+    text += "\nusing mwx_softc=MtkMwx::Com; using ieee80211com=MtkMwx::IC;\n"
+    for name in ["mwx_awdl_infra_joining", "mwx_awdl_sync_live", "mwx_awdl_sync_status_locked", "mwx_awdl_sync_status"]:
+        text += ex.function(HAL, name)
+    for name in ["awdlSetReceiver", "awdlTxSession", "awdlTakeTxResult", "awdlInterfaceReady", "awdlSyncSnapshot", "awdlRocTimingSnapshot"]:
         text += ex.function(HAL, "MtkMwx::" + name)
     text += POST_TYPES
     for helper in ["awdlTickUS", "awdlScheduleService", "peerScheduleKnown", "awdlAmsduEnabled",
