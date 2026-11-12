@@ -607,7 +607,7 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     bzero(queue,sizeof(queue));
     bzero(trafficPeer,sizeof(trafficPeer)); trafficActive=false;
     bzero(installedTrafficPeer,sizeof(installedTrafficPeer)); trafficPeerInstalled=false;
-    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending));
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); bzero(txBa,sizeof(txBa));
     state.init((const uint8_t *)mac,awdlNow());
     state.nativeElectionManaged=true;
     XYLog("AWDL native interface init\n");
@@ -720,7 +720,7 @@ void AirportMtkAwdlInterface::shutdownInGate()
         hal->awdlEnable(NULL,false);
     }
     enabled=false;
-    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); bzero(txBa,sizeof(txBa)); trafficActive=false;
     trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
     while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
     if(timerAdded) { owner->getWorkLoop()->removeEventSource(timer); timerAdded=false; }
@@ -780,7 +780,7 @@ IOReturn AirportMtkAwdlInterface::setMacAddressInGate(ether_addr &mac)
     state.nativeElectionManaged=true;
     awTimeline.reset(); resetForwardAdmission();
     bzero(nativePeerSamples,sizeof(nativePeerSamples));
-    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+    resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); bzero(txBa,sizeof(txBa)); trafficActive=false;
     state.sequence=state.ownSequence=sequence;
     memcpy(syncState.master,&mac,6);
     if(bsd) ifnet_set_lladdr(bsd,state.mac,6);
@@ -1136,7 +1136,7 @@ IOReturn AirportMtkAwdlInterface::setSyncInGate(bool value)
         if(!stopping && generation==syncRequestGeneration) {
             state.discardControls(); state.holdClock(0);
             awTimeline.reset(); resetForwardAdmission(); txSession=0;
-            resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending));
+            resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); bzero(txBa,sizeof(txBa));
             trafficActive=trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
             timer->cancelTimeout(); requestedChannel=grantedChannel=0; requestDeadline=0;
             while(queueCount) { mbuf_freem(queue[queueHead]); queueHead=(queueHead+1)%kDataQueueSize; --queueCount; }
@@ -1185,9 +1185,15 @@ static bool awdlAmsduEnabled()
     // Enable for an experiment with -amtk_awdl_amsdu=1.
     // 1.0.20: enable by default again, but only after the multi-segment and
     // allocation guards above. Disable with -amtk_awdl_amsdu=0.
-    int value=1;
-    if(!PE_parse_boot_argn("amtk_awdl_amsdu",&value,sizeof(value))) value=1;
-    return value!=0;
+    // 1.0.20 local (2026-11-12): off again by default. With it on, a
+    // Mac->iPhone AirDrop stalled at 1.3 MB; with the 2560-byte cap only small
+    // frames (TCP ACKs) ever aggregate. amtk_awdl_amsdu=1 turns it on.
+    // 1.0.22 local (2026-11-12): on by default again. With 1.0.21 and
+    // amtk_awdl_amsdu=1 the AirDrop slowdown no longer reproduced on hardware.
+    // amtk_awdl_amsdu=0 turns it off.
+    static int value=-1;
+    if(value<0 && !PE_parse_boot_argn("amtk_awdl_amsdu",&value,sizeof(value))) value=1;
+    return value>0;
 }
 
 // 1.0.49: the native submission callback and output() only enqueue, then
@@ -1423,19 +1429,136 @@ mbuf_t AirportMtkAwdlInterface::buildAmsdu(mbuf_t first,uint8_t channel,
     subframes=count;
     return aggregate;
 }
+static int awdlQosMode()
+{
+    static int value=-1;
+    if(value<0 && !PE_parse_boot_argn("amtk_awdl_qos",&value,sizeof(value))) value=2;
+    return value<0 ? 0 : value;
+}
+static bool awdlTxBaEnabled()
+{
+    static int value=-1;
+    if(value<0 && !PE_parse_boot_argn("amtk_awdl_txba",&value,sizeof(value))) value=1;
+    return value>0 && awdlQosMode()>0;
+}
+int AirportMtkAwdlInterface::txBaSlot(const uint8_t *mac,uint64_t now,bool create)
+{
+    int freeSlot=-1, oldest=-1;
+    for(unsigned i=0;i<4;++i) {
+        if(txBa[i].mac[0]|txBa[i].mac[1]|txBa[i].mac[2]|txBa[i].mac[3]|txBa[i].mac[4]|txBa[i].mac[5]) {
+            if(!memcmp(txBa[i].mac,mac,6)) return int(i);
+            if(txBa[i].state!=txBaActive && (oldest<0 || txBa[i].lastData<txBa[oldest].lastData)) oldest=int(i);
+        } else if(freeSlot<0) freeSlot=int(i);
+    }
+    if(!create) return -1;
+    int slot=freeSlot>=0 ? freeSlot : oldest;
+    if(slot<0) return -1;
+    bzero(&txBa[slot],sizeof(txBa[slot]));
+    memcpy(txBa[slot].mac,mac,6); txBa[slot].lastData=now;
+    return slot;
+}
+// Rewrites an encodeData() frame (24-byte header, AWDL SNAP at 24) as QoS
+// data, TID 0, with this destination's own sequence number: under a Block
+// Ack session the recipient reorders per TID, and gaps from other
+// destinations' frames would stall its reorder buffer. Mode 2 adds the
+// 8-byte envelope iOS 27 itself puts before the AWDL SNAP in non-aggregated
+// QoS frames (aa aa 03 00 00 00 + BE16 length of the rest).
+size_t AirportMtkAwdlInterface::convertQos(uint8_t *frame,size_t size,size_t capacity,uint64_t now)
+{
+    int mode=awdlQosMode();
+    if(!mode || size<40 || frame[0]!=8 || (frame[4]&1)) return size;
+    size_t extra=2+(mode>=2 ? 8 : 0);
+    if(size+extra>capacity || size-24>0xffff) return size;
+    int slot=txBaSlot(frame+4,now,true);
+    if(slot<0) return size;
+    auto &p=txBa[slot];
+    memmove(frame+24+extra,frame+24,size-24);
+    frame[0]=0x88; frame[24]=0; frame[25]=0;
+    if(mode>=2) {
+        static const uint8_t envelope[6]={0xaa,0xaa,3,0,0,0};
+        memcpy(frame+26,envelope,6);
+        frame[32]=uint8_t((size-24)>>8); frame[33]=uint8_t(size-24);
+    }
+    uint16_t sc=uint16_t((p.seq&0xfff)<<4);
+    frame[22]=uint8_t(sc); frame[23]=uint8_t(sc>>8);
+    p.seq=(p.seq+1)&0xfff; p.lastData=now; ++qosDataFrames;
+    return size+extra;
+}
+// ADDBA Request (TID 0, immediate, 64 MSDUs, no A-MSDU, no timeout) to each
+// destination with recent QoS traffic, through the per-peer queue; retries
+// after 1 s (no response) or 10 s (declined / repeated failures).
+void AirportMtkAwdlInterface::serviceTxBlockAck(uint64_t now)
+{
+    if(!awdlTxBaEnabled()) return;
+    for(auto &p:txBa) {
+        if(!(p.mac[0]|p.mac[1]|p.mac[2]|p.mac[3]|p.mac[4]|p.mac[5])) continue;
+        bool member=dataPeers.find(p.mac,now)>=0 && state.find(p.mac)>=0;
+        if(p.state==txBaActive) {
+            // Station replaced/removed (or its session torn) under us: renegotiate.
+            if(!member || !hal->awdlTxBlockAckActive(p.mac,0)) { p.state=txBaIdle; ++txBaLost; p.retryAt=now+1000000; }
+            continue;
+        }
+        if(p.state==txBaRequested) {
+            if(now-p.requestAt<1000000) continue;
+            p.state=txBaIdle; ++txBaTimeouts; ++p.failures;
+            p.retryAt=now+(p.failures>=3 ? 10000000 : 1000000);
+        }
+        if(!member || now<p.retryAt || now-p.lastData>2000000 || queueCount>=kDataQueueSize) continue;
+        uint8_t f[24+9]; bzero(f,sizeof(f));
+        f[0]=0xd0; memcpy(f+4,p.mac,6); memcpy(f+10,state.mac,6); memcpy(f+16,mtkawdl::bssid,6);
+        uint16_t sc=uint16_t(state.frameCounter++<<4);
+        f[22]=uint8_t(sc); f[23]=uint8_t(sc>>8);
+        f[24]=mtkawdl::blockAckCategory; f[25]=mtkawdl::addbaRequest; f[26]=++p.token;
+        uint16_t params=uint16_t(2 | (0<<2) | (64<<6));
+        f[27]=uint8_t(params); f[28]=uint8_t(params>>8);
+        // timeout 0 at 29..30; SSN = next QoS sequence to this peer.
+        p.ssn=p.seq; uint16_t ssn=uint16_t(p.ssn<<4);
+        f[31]=uint8_t(ssn); f[32]=uint8_t(ssn>>8);
+        mbuf_t m=makeFrame(f,sizeof(f));
+        if(!m) continue;
+        unsigned tail=(queueHead+queueCount)%kDataQueueSize;
+        queue[tail]=m; queueTime[tail]=now;
+        queueDeadline[tail]=now+mtkawdl::dataQueueLifetimeUs(state,p.mac); ++queueCount;
+        p.state=txBaRequested; p.requestAt=now; ++txBaRequests;
+    }
+}
+// ADDBA Response to our request, or DELBA from the peer as recipient.
+void AirportMtkAwdlInterface::handleTxBlockAckFrame(const uint8_t *f,uint64_t now)
+{
+    int slot=txBaSlot(f+10,now,false);
+    if(slot<0) return;
+    auto &p=txBa[slot];
+    if(f[25]==mtkawdl::addbaResponse) {
+        uint16_t status=uint16_t(f[27]|f[28]<<8), params=uint16_t(f[29]|f[30]<<8);
+        if(p.state!=txBaRequested || f[26]!=p.token || ((params>>2)&15)!=0) return;
+        if(status) { p.state=txBaIdle; ++txBaRejected; p.failures=3; p.retryAt=now+10000000; return; }
+        uint16_t window=uint16_t(params>>6);
+        if(!window || window>64) window=64;
+        IOReturn ba=hal->awdlTxBlockAck(p.mac,0,p.ssn,window,true);
+        if(ba==kIOReturnSuccess) { p.state=txBaActive; p.failures=0; ++txBaAccepted; }
+        else { p.state=txBaIdle; ++txBaInstallFailed; ++p.failures; p.retryAt=now+10000000; }
+        return;
+    }
+    // DELBA: initiator bit clear means the peer ends the session we started.
+    uint16_t params=uint16_t(f[26]|f[27]<<8);
+    if(f[25]!=mtkawdl::delba || (params&0x0800) || (params>>12)!=0) return;
+    if(p.state==txBaActive) hal->awdlTxBlockAck(p.mac,0,0,0,false);
+    p.state=txBaIdle; ++txBaTorn; p.retryAt=now+10000000;
+}
 UInt32 AirportMtkAwdlInterface::output(mbuf_t m)
 {
     if(!m) return kIOReturnOutputDropped;
     if(!enabled || stopping || queueCount==kDataQueueSize || !(mbuf_flags(m)&MBUF_PKTHDR)) {
         mbuf_freem(m); return kIOReturnOutputDropped;
     }
-    size_t n=mbuf_pkthdr_len(m); uint8_t eth[1514],frame[1542];
+    size_t n=mbuf_pkthdr_len(m); uint8_t eth[1514],frame[1552];
     if(n<14 || n>sizeof(eth) || mbuf_copydata(m,0,n,eth)) { mbuf_freem(m); return kIOReturnOutputDropped; }
     // The AWDL interface has its own locally administered address.
     memcpy(eth+6,state.mac,6);
     size_t size=mtkawdl::encodeData(frame,sizeof(frame),eth,n,state.dataCounter++);
     mbuf_freem(m);
     if(!size) return kIOReturnOutputDropped;
+    size=convertQos(frame,size,sizeof(frame),awdlNow());
     m=makeFrame(frame,size);
     if(!m) return kIOReturnOutputDropped;
     unsigned pos=(queueHead+queueCount)%kDataQueueSize;
@@ -1658,6 +1781,14 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLADDBAExpired",addbaExpired,64);
     setProperty("MTKAWDLADDBADeferred",addbaDeferred,64);
     setProperty("MTKAWDLADDBADropped",addbaDropped,64);
+    setProperty("MTKAWDLTxBARequests",txBaRequests,64);
+    setProperty("MTKAWDLTxBAAccepted",txBaAccepted,64);
+    setProperty("MTKAWDLTxBARejected",txBaRejected,64);
+    setProperty("MTKAWDLTxBATimeouts",txBaTimeouts,64);
+    setProperty("MTKAWDLTxBATorn",txBaTorn,64);
+    setProperty("MTKAWDLTxBAInstallFailed",txBaInstallFailed,64);
+    setProperty("MTKAWDLTxBALost",txBaLost,64);
+    setProperty("MTKAWDLTxQoSFrames",qosDataFrames,64);
     setProperty("MTKAWDLDELBAReceived",delbaReceived,64);
     setProperty("MTKAWDLDELBADropped",delbaDropped,64);
     setProperty("MTKAWDLDataTxStatus",static_cast<uint64_t>(dataTxStatus),32);
@@ -1761,6 +1892,8 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLHostChannel",static_cast<uint64_t>(state.channel(now)),32);
     setProperty("MTKAWDLHostCounter",static_cast<uint64_t>(state.counter(now)),32);
     setProperty("MTKAWDLHostChannelSequence",state.sequence.channels,state.sequence.count);
+    setProperty("MTKAWDLInfraSlotRemaps",infraSlotRemaps,64);
+    setProperty("MTKAWDLInfraSlotChannel",static_cast<uint64_t>(sequenceInfra),8);
     setProperty("MTKAWDLHostPresence",static_cast<uint64_t>(state.presence),32);
     setProperty("MTKAWDLTrafficActive",trafficActive);
     setProperty("MTKAWDLDensePresence",densePresence);
@@ -1785,7 +1918,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         invalidateDataRxAdmission();
         state.holdClock(0);
         state.discardControls();
-        enabled=false; resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); trafficActive=false;
+        enabled=false; resetDataPeers(); bzero(discoveryTxPeers,sizeof(discoveryTxPeers)); bzero(addbaPending,sizeof(addbaPending)); bzero(txBa,sizeof(txBa)); trafficActive=false;
         hal->awdlInfraWakeIfIdle();
         trafficPeerInstalled=false; bzero(installedTrafficPeer,sizeof(installedTrafficPeer));
         setProperty("MTKAWDLSyncEnabled",false);
@@ -1870,6 +2003,13 @@ void AirportMtkAwdlInterface::serviceInGate()
         memcpy(request,pending.request,sizeof(request));
         const uint8_t *peer=request+10;
         uint8_t tid=0; uint16_t ssn=0, window=0;
+        if(request[25]==mtkawdl::addbaResponse ||
+           (request[25]==mtkawdl::delba && !(request[27]&0x08))) {
+            handleTxBlockAckFrame(request,now);
+            if(stopping || !enabled) return;
+            now=awdlNow();
+            continue;
+        }
         if(request[25]==mtkawdl::delba) {
             if(mtkawdl::delbaRxTid(state.mac,request,24+6,&tid)) {
                 hal->awdlRxBlockAck(peer,tid,0,0,false);
@@ -1898,6 +2038,8 @@ void AirportMtkAwdlInterface::serviceInGate()
         queue[tail]=m; queueTime[tail]=now;
         queueDeadline[tail]=now+mtkawdl::dataQueueLifetimeUs(state,peer); ++queueCount; ++addbaQueued;
     }
+    serviceTxBlockAck(now);
+    if(stopping || !enabled) return;
     state.elect(now); publishScheduler(now);
     // Service discovery sends unicast (e.g. resolver replies) before native
     // traffic/cache registration. Install only destinations observed in valid
@@ -2578,6 +2720,13 @@ bool AirportMtkAwdlInterface::receive(void *context,const uint8_t *f,size_t n,ui
                     memcpy(self->addbaPending[slot].request,f,24+9);
                     self->addbaPending[slot].valid=true;
                 }
+            } else if(f[25]==mtkawdl::addbaResponse && n>=24+9) {
+                // Our ADDBA request's answer; the firmware install waits.
+                bool queued=false;
+                for(auto &p:self->addbaPending) if(!p.valid) {
+                    memcpy(p.request,f,24+9); p.valid=true; queued=true; break;
+                }
+                if(!queued) ++self->addbaDropped;
             } else if(f[25]==mtkawdl::delba && n>=24+6) {
                 ++self->delbaReceived;
                 // Do not pad a truncated DELBA into a valid-looking request.
@@ -2967,12 +3116,12 @@ IOReturn AirportMtkAwdlInterface::setAWDL_BSSID(apple80211_awdl_bssid *d) { retu
 IOReturn AirportMtkAwdlInterface::getAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,state.metric}; return kIOReturnSuccess; }
 IOReturn AirportMtkAwdlInterface::setAWDL_ELECTION_METRIC(apple80211_awdl_election_metric *d) { if(!d) return kIOReturnBadArgument; state.metric=d->metric; return kIOReturnSuccess; }
 IOReturn AirportMtkAwdlInterface::getPEER_CACHE_MAXIMUM_SIZE(apple80211_peer_cache_maximum_size *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,hal->awdlPeerCapacity()}; return kIOReturnSuccess; }
-IOReturn AirportMtkAwdlInterface::getAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,state.ownSequence.channels[0]}; return kIOReturnSuccess; }
+IOReturn AirportMtkAwdlInterface::getAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) { if(!d) return kIOReturnBadArgument; *d={APPLE80211_VERSION,channelSequence.seqs[0].channel ? uint8_t(channelSequence.seqs[0].channel) : state.ownSequence.channels[0]}; return kIOReturnSuccess; }
 IOReturn AirportMtkAwdlInterface::setAWDL_MASTER_CHANNEL(apple80211_awdl_master_channel *d) {
     if(!d || d->version>APPLE80211_VERSION || d->master_channel>165 || !hal->awdlChannelAllowed(d->master_channel)) return kIOReturnBadArgument;
     // Native owns the effective sequence; stage social channel updates when
     // a granted AW is still using the previous schedule.
-    state.setSocialChannel(0,d->master_channel,awdlNow());
+    state.setSocialChannel(0,remapInfraSlot(d->master_channel),awdlNow());
     channelSequence.seqs[0].channel=d->master_channel;
     return kIOReturnSuccess;
 }
@@ -3122,11 +3271,39 @@ IOReturn AirportMtkAwdlInterface::setPeerCacheInGate(apple80211_peer_cache_contr
     if(postStatus!=kIOReturnSuccess) __atomic_fetch_add(&cacheDiagnostic.postFailures,1,__ATOMIC_RELAXED);
     return recordCacheControlResult(kIOReturnSuccess,start);
 }
+// MtkWireless (2026-11-12): once the driver reports a real country (PR #7,
+// "VN"), awdld puts a 2.4 GHz AP channel into slot 0 of the sequence (AP on
+// channel 9: 9,-,149,...,6,-,149 instead of 6,-,149,...,6,-,149). The
+// iPhone is never on 9, so only one channel-6 slot per 1 s cycle carried
+// data and bursts came ~1.05 s apart instead of ~0.52 s. Map that slot back
+// to social channel 6 (off-channel behind the PM handshake, as before).
+uint8_t AirportMtkAwdlInterface::remapInfraSlot(uint8_t channel)
+{
+    static int keep=-1;
+    if(keep<0) {
+        int value=0;
+        if(!PE_parse_boot_argn("amtk_awdl_infra_slot",&value,sizeof(value))) value=0;
+        keep=value!=0;
+    }
+    uint8_t infra=hal->awdlInfraChannel();
+    if(keep || !channel || channel!=infra || infra>14 || infra==6 ||
+       hal->awdlOnlyChannel() || !hal->awdlChannelAllowed(6))
+        return channel;
+    return 6;
+}
 void AirportMtkAwdlInterface::applySequence(uint64_t now)
 {
+    sequenceInfra=hal->awdlInfraChannel();
     if(!hostSequenceValid) return;
-    uint8_t channel=mtkawdl::dataChannel(hostSequence);
-    state.setSequence(densePresence ? mtkawdl::denseSequence(hostSequence,channel) : hostSequence,now);
+    mtkawdl::Sequence s=hostSequence;
+    bool remapped=false;
+    for(unsigned i=0;i<s.count && i<16;++i) {
+        uint8_t c=remapInfraSlot(s.channels[i]);
+        if(c!=s.channels[i]) { s.channels[i]=c; remapped=true; }
+    }
+    if(remapped) ++infraSlotRemaps;
+    uint8_t channel=mtkawdl::dataChannel(s);
+    state.setSequence(densePresence ? mtkawdl::denseSequence(s,channel) : s,now);
 }
 // awdld keeps its idle sequence (2 of 16 EAWs on the data channel) during
 // AirDrop; peers send only in EAWs we advertise. While a transfer runs
@@ -3142,7 +3319,11 @@ void AirportMtkAwdlInterface::updatePresence(uint64_t now)
     bool busy=trafficActive || (presenceActiveAt && now-presenceActiveAt<2000000);
     uint8_t channel=hostSequenceValid ? mtkawdl::dataChannel(hostSequence) : 0;
     bool want=busy && channel && hal->awdlDensePresenceAllowed(channel);
-    if(want==densePresence) return;
+    if(want==densePresence) {
+        // The AP channel changed (join, roam, leave): redo the slot mapping.
+        if(hal->awdlInfraChannel()!=sequenceInfra) applySequence(now);
+        return;
+    }
     densePresence=want; ++presenceTransitions;
     applySequence(now);
 }

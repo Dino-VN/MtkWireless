@@ -43,6 +43,9 @@ struct AirportMtkAwdlInterface {
     Hal boundary;Hal *hal=&boundary;
     uint64_t actionReceived=0,addbaRequests=0,addbaDropped=0,delbaReceived=0,delbaDropped=0;
     int8_t lastActionRSSI=0;
+    // Recipient DELBAs and ADDBA responses belong to the TX Block Ack path.
+    unsigned txBaHandled=0;
+    void handleTxBlockAckFrame(const uint8_t *,uint64_t){++txBaHandled;}
 ''' + pending + r'''
     AirportMtkAwdlInterface(){
         const uint8_t own[6]={2,1,2,3,4,5};state.init(own,100);boundary.stopping=&stopping;

@@ -65,8 +65,8 @@ INTERFACE_GROUPS = {
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
     "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame buildAmsdu output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
-    "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
+    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
+    "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
 STRUCT_NAMES = "apple80211_virt_if_create_data apple80211_awdl_sync_params apple80211_awdl_extension_state_machine_parameter apple80211_awdl_election_id apple80211_awdl_presence_mode apple80211_awdl_sync_state apple80211_awdl_election_rssi_thresholds apple80211_awdl_af_tx_mode apple80211_awdl_min_rate apple80211_awdl_sync_channel_sequence apple80211_awdl_sync_frame_template apple80211_awdl_cap apple80211_awdl_master_channel apple80211_awdl_secondary_master_channel apple80211_awdl_election_params apple80211_awdl_peer_traffic_registration apple80211_awdl_sync_enabled".split()
@@ -472,6 +472,8 @@ HAL_AFTER_ABI = r'''
  }
  IOReturn awdlPeer(const uint8_t *,bool add) { gatedBoundary(); if(onPeer)onPeer(add); return add?0:peerDeleteResult; }
  IOReturn awdlRxBlockAck(const uint8_t *,uint8_t,uint16_t,uint16_t,bool value) { gatedBoundary(); return value?kIOReturnUnsupported:0; }
+ IOReturn awdlTxBlockAck(const uint8_t *,uint8_t,uint16_t,uint16_t,bool value) { gatedBoundary(); return value?kIOReturnUnsupported:0; }
+ bool awdlTxBlockAckActive(const uint8_t *,uint8_t) { return false; }
  IOReturn awdlEnable(const uint8_t *,bool,const AwdlSyncGuard *guard=nullptr);
  IOReturn awdlTransmit(mbuf_t m,unsigned) { gatedBoundary(); ++transmits; mbuf_freem(m); return 0; }
  IOReturn awdlTryTransmit(mbuf_t *m,unsigned c) { if(tryStatus)return tryStatus; auto status=awdlTransmit(*m,c); *m=nullptr; return status; }
@@ -1222,7 +1224,8 @@ def generate(ex: Extractor) -> str:
         text += ex.function(HAL, "MtkMwx::" + name)
     text += POST_TYPES
     for helper in ["awdlTickUS", "awdlScheduleService", "peerScheduleKnown", "awdlAmsduEnabled",
-                   "awdlPeerGateMode", "awdlPeerGateSlackUS", "awdlRenewStationOnNoPeer", "amsduZero", "amsduWrite"]:
+                   "awdlPeerGateMode", "awdlPeerGateSlackUS", "awdlRenewStationOnNoPeer", "amsduZero", "amsduWrite",
+                   "awdlQosMode", "awdlTxBaEnabled"]:
         text += ex.function(INTERFACE, helper)
     for name in names:
         text += ex.function(INTERFACE, "AirportMtkAwdlInterface::" + name)

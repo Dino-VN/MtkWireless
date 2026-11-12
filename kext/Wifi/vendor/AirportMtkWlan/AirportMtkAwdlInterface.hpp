@@ -343,10 +343,29 @@ private:
     mtkawdl::Sequence hostSequence = {}; bool hostSequenceValid = false, densePresence = false;
     uint64_t presenceSampleAt = 0, presenceFrames = 0, presenceActiveAt = 0, presenceTransitions = 0;
     void applySequence(uint64_t);
+    // A 2.4 GHz AP channel (not 6) in awdld's sequence is mapped to social
+    // channel 6; amtk_awdl_infra_slot=1 keeps awdld's channel.
+    uint8_t remapInfraSlot(uint8_t channel);
+    uint8_t sequenceInfra = 0; uint64_t infraSlotRemaps = 0;
     void updatePresence(uint64_t);
     struct AddbaDecline { uint8_t request[24+9]; bool valid; } addbaPending[4] = {};
     uint64_t addbaRequests = 0, addbaQueued = 0, addbaSubmitted = 0, addbaFailed = 0, addbaAccepted = 0;
     uint64_t addbaExpired = 0, addbaDeferred = 0, addbaDropped = 0, delbaReceived = 0;
+    // 1.0.20: AWDL TX A-MPDU. Unicast data goes out as QoS TID 0 with a
+    // per-destination sequence (amtk_awdl_qos: 0 non-QoS as before, 1 QoS,
+    // 2 QoS + the iOS 27 envelope, default 2). We then originate a Block Ack
+    // session (amtk_awdl_txba=0 off) so the firmware aggregates.
+    struct TxBaPeer {
+        uint8_t mac[6]; uint16_t seq; uint8_t state; uint8_t token; uint8_t failures;
+        uint16_t ssn; uint64_t requestAt, retryAt, lastData;
+    } txBa[4] = {};
+    enum : uint8_t { txBaIdle=0, txBaRequested=1, txBaActive=2 };
+    uint64_t txBaRequests = 0, txBaAccepted = 0, txBaRejected = 0, txBaTimeouts = 0;
+    uint64_t txBaTorn = 0, txBaInstallFailed = 0, txBaLost = 0, qosDataFrames = 0;
+    int txBaSlot(const uint8_t *mac, uint64_t now, bool create);
+    size_t convertQos(uint8_t *frame, size_t size, size_t capacity, uint64_t now);
+    void serviceTxBlockAck(uint64_t now);
+    void handleTxBlockAckFrame(const uint8_t *f, uint64_t now);
     uint64_t delbaDropped = 0;  // Shared pending queue overflow, not firmware failure.
     uint16_t miCounter = 0; bool miCounterValid = false;
     mtkawdl::Timeline awTimeline;

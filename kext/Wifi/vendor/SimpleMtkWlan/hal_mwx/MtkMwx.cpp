@@ -382,10 +382,13 @@ struct mwx_node {
 	struct ieee80211_node	ni;
 	uint16_t		wcid;
 	uint16_t		flags;
+	/* MtkWireless: AWDL peer has a firmware originator BA session on TID 0. */
+	enum : uint16_t { kAwdlTxBa = 0x8 };
 };
 #define	MWX_NODE_FLAG_HAVE_PAIRWISE_KEY		0x1
 #define	MWX_NODE_FLAG_HAVE_GROUP_KEY		0x2
 #define MWX_NODE_FLAG_KEY_FAILED 0x4
+#define MWX_NODE_FLAG_AWDL_TXBA	mwx_node::kAwdlTxBa
 
 struct mwx_vif {
 	struct mwx_node		vif_mn;
@@ -562,6 +565,7 @@ struct mwx_softc {
     uint64_t sc_awdl_tx_busy, sc_awdl_tx_no_peer, sc_awdl_tx_backpressure;
     uint64_t sc_awdl_tx_copy_failed, sc_awdl_tx_dma_failed;
     uint64_t sc_awdl_rx_ba_started, sc_awdl_rx_ba_stopped, sc_awdl_rx_ba_failed;
+    uint64_t sc_awdl_tx_ba_started, sc_awdl_tx_ba_stopped, sc_awdl_tx_ba_failed, sc_awdl_tx_ba_frames;
     mtkawdl::TxStatusCounters sc_awdl_tx_status;
     // Bounded diagnostic rings and watchdog snapshot, allocated once on attach.
     // Retained through sync-off/reset; no per-packet allocation.
@@ -7484,6 +7488,14 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
         txp->txwi[3] |= htole32(MT_TXD3_BA_DISABLE | MT_TXD3_SN_VALID |
             (((mtkawdl::le16((uint8_t *)wh+22)>>4)<<16)&MT_TXD3_SEQ));
         if (IEEE80211_IS_MULTICAST(wh->i_addr1)) txp->txwi[3] |= htole32(MT_TXD3_NO_ACK);
+        // MtkWireless: QoS TID 0 unicast data to a peer with an originator
+        // BA session may be aggregated (awdlTxBlockAck). Everything else,
+        // including the fixed-rate block above, keeps BA_DISABLE.
+        else if (ieee80211_has_qos(wh) &&
+            (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA &&
+            (ieee80211_get_qos(wh) & IEEE80211_QOS_TID) == 0 &&
+            (((struct mwx_node *)ni)->flags & mwx_node::kAwdlTxBa))
+            txp->txwi[3] &= ~htole32(MT_TXD3_BA_DISABLE);
     }
 }
 
@@ -10742,6 +10754,10 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLRxBAStarted",com->sc_awdl_rx_ba_started,64);
     mwxController()->setProperty("MTKAWDLRxBAStopped",com->sc_awdl_rx_ba_stopped,64);
     mwxController()->setProperty("MTKAWDLRxBAFailed",com->sc_awdl_rx_ba_failed,64);
+    mwxController()->setProperty("MTKAWDLTxBAStarted",com->sc_awdl_tx_ba_started,64);
+    mwxController()->setProperty("MTKAWDLTxBAStopped",com->sc_awdl_tx_ba_stopped,64);
+    mwxController()->setProperty("MTKAWDLTxBAFailed",com->sc_awdl_tx_ba_failed,64);
+    mwxController()->setProperty("MTKAWDLTxBAFrames",com->sc_awdl_tx_ba_frames,64);
     const auto &tx=com->sc_awdl_tx_status;
     mwxController()->setProperty("MTKAWDLTXDataAcked",tx.dataAcked,64);
     mwxController()->setProperty("MTKAWDLTXDataFailed",tx.dataFailed,64);
@@ -10848,6 +10864,7 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
         ++com->sc_awdl_tx_dma_failed; return kIOReturnNoResources;
     }
     ++com->sc_awdl_tx_submitted;
+    if(((mwx_node *)node)->flags & mwx_node::kAwdlTxBa) ++com->sc_awdl_tx_ba_frames;
     mbuf_freem(frame); *packet=NULL; return kIOReturnSuccess;
 }
 
@@ -10859,6 +10876,16 @@ static bool mwx_awdl_rxba_enabled()
     if (!PE_parse_boot_argn("amtk_awdl_rxba", &value, sizeof(value)))
         value = 1;
     return value != 0;
+}
+
+// MtkWireless: boot-arg amtk_awdl_txba=0 never originates an AWDL Block Ack
+// session (every unicast frame waits for its own ACK, as before 1.0.20).
+static bool mwx_awdl_txba_enabled()
+{
+    static int value = -1;
+    if (value < 0 && !PE_parse_boot_argn("amtk_awdl_txba", &value, sizeof(value)))
+        value = 1;
+    return value > 0;
 }
 
 static int mwx_awdl_sta_rec(mwx_softc *sc,uint32_t epoch,mbuf_t m)
@@ -10931,6 +10958,82 @@ IOReturn MtkMwx::awdlRxBlockAck(const uint8_t *address,uint8_t tid,uint16_t ssn,
     return rv ? kIOReturnIOError : kIOReturnSuccess;
 }
 
+// mt7921_mcu_sta_tx_ba() for an AWDL peer station: STA_REC_BA, then
+// WTBL_BA, both as originator on the AWDL BSS.
+static int mwx_awdl_tx_ba(mwx_softc *sc,uint32_t epoch,unsigned index,uint8_t tid,
+    uint16_t ssn,uint16_t winsize,bool enable)
+{
+    static const uint8_t ba_range[]={4,8,12,24,36,48,54,64};
+    uint16_t wcid=MWX_WTBL_STA+index;
+    if(!enable) { ssn=0; winsize=0; }
+    mbuf_t m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return ENOBUFS;
+    uint16_t count=0;
+    auto sba=(sta_rec_ba *)mwx_append_tlv(m,&count,STA_REC_BA,sizeof(sta_rec_ba));
+    sba->tid=tid; sba->ba_type=MT_BA_TYPE_ORIGINATOR; sba->amsdu=0;
+    sba->ba_en=(enable ? 1 : 0)<<tid;
+    sba->ssn=htole16(ssn); sba->winsize=htole16(winsize);
+    m=mwx_fill_sta_req_hdr(m,&sc->sc_awdl_vif,sc->sc_awdl_vif.omac_idx,wcid,count);
+    int rv=mwx_awdl_sta_rec(sc,epoch,m);
+    if(rv) return rv;
+    unsigned idx=nitems(ba_range)-1;
+    while(idx>0 && winsize<ba_range[idx]) --idx;
+    m=mwx_alloc_sta_req_tlv(sizeof(sta_req_hdr));
+    if(!m) return ENOBUFS;
+    count=0; uint16_t wcount=0;
+    auto wtbl=(sta_rec_wtbl *)mwx_append_tlv(m,&count,STA_REC_WTBL,sizeof(sta_rec_wtbl));
+    wtbl->wlan_idx_lo=wcid & 0xff; wtbl->wlan_idx_hi=wcid>>8; wtbl->operation=WTBL_SET;
+    auto wba=(wtbl_ba *)mwx_append_tlv(m,&wcount,WTBL_BA,sizeof(wtbl_ba));
+    wba->tid=tid; wba->ba_type=MT_BA_TYPE_ORIGINATOR;
+    wba->sn=htole16(ssn); wba->ba_en=enable ? 1 : 0;
+    wba->ba_winsize_idx=enable ? idx : 0; wba->ba_winsize=htole16(winsize);
+    wtbl->tlv_num=htole16(wcount);
+    wtbl->len=htole16(le16toh(wtbl->len)+sizeof(*wba));
+    m=mwx_fill_sta_req_hdr(m,&sc->sc_awdl_vif,sc->sc_awdl_vif.omac_idx,wcid,count);
+    return mwx_awdl_sta_rec(sc,epoch,m);
+}
+
+IOReturn MtkMwx::awdlTxBlockAck(const uint8_t *address,uint8_t tid,uint16_t ssn,
+    uint16_t window,bool enable)
+{
+    MwxAwdlCall call(com);
+    if(!call.valid()) return kIOReturnNotReady;
+    if(!com || !com->sc_awdl_enabled || com->sc_resetting || com->sc_detaching)
+        return kIOReturnNotReady;
+    if(!address || !mtkawdl::unicast(address) || tid!=0 ||
+       (enable && (!window || window>64)))
+        return kIOReturnBadArgument;
+    if(enable && !mwx_awdl_txba_enabled()) return kIOReturnUnsupported;
+    uint8_t peer[6]; memcpy(peer,address,6);
+    MwxAwdlOperation operation(com);
+    if(!operation.valid()) return kIOReturnNotReady;
+    int index=-1;
+    for(unsigned i=0;i<3;++i) if(com->sc_awdl_peer_used[i] &&
+        !memcmp(peer,com->sc_awdl_peers[i].ni.ni_macaddr,6)) { index=i; break; }
+    if(index<0) return kIOReturnNotFound;
+    // Stop aggregating before the firmware session goes away.
+    if(!enable) com->sc_awdl_peers[index].flags&=~MWX_NODE_FLAG_AWDL_TXBA;
+    int rv=mwx_awdl_tx_ba(com,operation.epoch,index,tid,ssn & 0xfff,window,enable);
+    if(!operation.valid()) return kIOReturnAborted;
+    if(rv) ++com->sc_awdl_tx_ba_failed;
+    else if(enable) {
+        com->sc_awdl_peers[index].flags|=MWX_NODE_FLAG_AWDL_TXBA;
+        ++com->sc_awdl_tx_ba_started;
+    } else ++com->sc_awdl_tx_ba_stopped;
+    MWX_DEV_LOG(com,"AWDL tx ba %s WCID=%u tid=%u ssn=%u win=%u rv=%d\n",enable ? "start" : "stop",
+        MWX_WTBL_STA+index,tid,ssn,window,rv);
+    return rv ? kIOReturnIOError : kIOReturnSuccess;
+}
+
+bool MtkMwx::awdlTxBlockAckActive(const uint8_t *address,uint8_t tid)
+{
+    if(!com || !address || tid!=0) return false;
+    for(unsigned i=0;i<3;++i) if(com->sc_awdl_peer_used[i] &&
+        !memcmp(address,com->sc_awdl_peers[i].ni.ni_macaddr,6))
+        return (com->sc_awdl_peers[i].flags & MWX_NODE_FLAG_AWDL_TXBA)!=0;
+    return false;
+}
+
 IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
 {
     MwxAwdlCall call(com);
@@ -10984,6 +11087,14 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
         auto trans=(wtbl_hdr_trans *)mwx_append_tlv(m,&wcount,WTBL_HDR_TRANS,sizeof(wtbl_hdr_trans));
         trans->no_rx_trans=1;
         wlen+=sizeof(*generic)+sizeof(*rx)+sizeof(*trans);
+        // MtkWireless: mark the peer HT-capable (64 KB A-MPDU, no MPDU
+        // density) so the MAC may aggregate once a TX BA session exists.
+        // Every iPhone/Mac AWDL peer is HT. amtk_awdl_txba=0 leaves it out.
+        if(mwx_awdl_txba_enabled()) {
+            auto ht=(wtbl_ht *)mwx_append_tlv(m,&wcount,WTBL_HT,sizeof(wtbl_ht));
+            ht->ht=1; ht->af=3; ht->mm=0;
+            wlen+=sizeof(*ht);
+        }
     }
     wtbl->tlv_num=htole16(wcount); wtbl->len=htole16(wlen);
     m=mwx_fill_sta_req_hdr(m,&com->sc_awdl_vif,com->sc_awdl_vif.omac_idx,wcid,count);

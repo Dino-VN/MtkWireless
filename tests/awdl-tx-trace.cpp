@@ -160,7 +160,7 @@ struct mwx_softc {
     unsigned sc_tx_nobufs=0,sc_tx_ring_full=0;
     uint64_t sc_awdl_tx_bad_frame=0,sc_awdl_tx_busy=0,sc_awdl_tx_no_grant=0,
         sc_awdl_tx_no_peer=0,sc_awdl_tx_backpressure=0,sc_awdl_tx_copy_failed=0,
-        sc_awdl_tx_dma_failed=0,sc_awdl_tx_submitted=0;int sc_awdl_tx_errno=0;
+        sc_awdl_tx_dma_failed=0,sc_awdl_tx_submitted=0,sc_awdl_tx_ba_frames=0;int sc_awdl_tx_errno=0;
 };
 struct IOService {
     std::map<std::string,uint64_t> properties;

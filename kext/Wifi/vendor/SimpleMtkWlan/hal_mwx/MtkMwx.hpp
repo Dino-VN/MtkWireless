@@ -136,6 +136,12 @@ public:
     // kIOReturnNotFound: no station; kIOReturnUnsupported: amtk_awdl_rxba=0.
     IOReturn awdlRxBlockAck(const uint8_t *address, uint8_t tid, uint16_t ssn,
                             uint16_t window, bool enable);
+    // TX (originator) Block Ack session to an installed AWDL peer station:
+    // QoS data of `tid` to it may then be aggregated (A-MPDU). Boot-arg
+    // amtk_awdl_txba=0: kIOReturnUnsupported. Only TID 0 is supported.
+    IOReturn awdlTxBlockAck(const uint8_t *address, uint8_t tid, uint16_t ssn,
+                            uint16_t window, bool enable);
+    bool awdlTxBlockAckActive(const uint8_t *address, uint8_t tid);
     unsigned awdlPeerCapacity() const { return 3; }
 
 private:

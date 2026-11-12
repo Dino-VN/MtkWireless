@@ -89,7 +89,7 @@ def generate(ex):
         "IEEE80211_IS_MULTICAST", "IEEE80211_AID", "IEEE80211_ACTION_"))
     macros += "\n" + ex.definitions(NODE, ("IEEE80211_NODE_QOS",))
     wire = "\n".join(ex.structure(REG, name) for name in ("mwx_desc", "mt76_connac_txp_ptr",
-        "mt76_txwi", "sta_req_hdr", "sta_rec_basic", "sta_rec_wtbl", "wtbl_generic", "wtbl_rx", "wtbl_hdr_trans"))
+        "mt76_txwi", "sta_req_hdr", "sta_rec_basic", "sta_rec_wtbl", "wtbl_generic", "wtbl_rx", "wtbl_hdr_trans", "wtbl_ht"))
     frames = "\n".join(ex.structure(IEEE, name) for name in ("ieee80211_frame", "ieee80211_qosframe",
         "ieee80211_qosframe_addr4", "ieee80211_frame_min"))
     helpers = "\n".join(ex.function(IEEE, "static __inline " + typ + "\n" + name + "(")
@@ -116,7 +116,7 @@ def generate(ex):
     tail = "\n".join(ex.function(HAL, signature) for signature in [
         "void\nmt7921_mcu_tx_done_event(", "bool MtkMwx::awdlCanTransmit(", "IOReturn MtkMwx::awdlTryTransmit(",
         "void *\nmwx_append_len(", "void *\nmwx_append_tlv(", "struct mbuf *\nmwx_fill_sta_req_hdr(",
-        "static int mwx_awdl_remove_station(", "IOReturn MtkMwx::awdlPeer(",
+        "static int mwx_awdl_remove_station(", "static bool mwx_awdl_txba_enabled(", "IOReturn MtkMwx::awdlPeer(",
         "static void mwx_awdl_quiesce(mwx_softc *sc,", "void\nmt7921_mcu_add_basic_tlv(",
         "int\nmt7921_mcu_wtbl_generic_tlv("])
     parts = {
