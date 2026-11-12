@@ -79,13 +79,14 @@ struct mbuf_list {std::vector<mbuf_t> packets;};
 void ml_enqueue(mbuf_list*ml,mbuf_t m){ml->packets.push_back(m);}
 void mbuf_freem(mbuf_t m){assert(!m->freed);m->freed=true;}
 int mbuf_dup(mbuf_t m,int,mbuf_t*out){*out=new mbuf(*m);return 0;}
-struct ieee80211_node {bool ni_port_valid=false;};
+struct ieee80211_node {bool ni_port_valid=false;uint8_t ni_11d_cc[2]={};};
 struct Queue {int flushes=0;};
 void ifq_flush(Queue*q){++q->flushes;}
 void mq_purge(Queue*q){++q->flushes;}
 struct Stats {unsigned inputPackets=0,is_tx_noauth=0,is_rx_unauth=0;};
 struct _ifnet {int if_flags=IFF_RUNNING;Stats stat;Stats*netStat=&stat;Queue if_snd;};
 struct ieee80211com {bool ic_wcl_enterprise=false;int ic_state=IEEE80211_S_INIT;
+    uint8_t ic_11d_bss_cc[2]={};
     int ic_flags=IEEE80211_F_RSNON;uintptr_t ic_deauth_reason=0;Stats ic_stats;
     _ifnet ic_if;struct { _ifnet&ac_if; } ac{ic_if};
     Queue ic_mgtq;ieee80211_node bss;ieee80211_node*ic_bss=&bss;
@@ -113,6 +114,7 @@ struct AirportMtkWlan : OSObject,Base {
     AirportMtkSkywalkInterface native;AirportMtkSkywalkInterface*fNetIf=&native;
     Gate gate{this};UInt32 currentStatus=kIONetworkLinkValid;
     bool eapolTransportActive=false;
+    bool countryCodeAnnounceNeeded(){return false;}
     Gate*getCommandGate(){return &gate;}
     void setEAPOLTransport(bool);
     static IOReturn setEAPOLTransportGated(OSObject*,void*,void*,void*,void*);
@@ -134,6 +136,7 @@ bad:
 AirportMtkWlan*current;
 void stateEvent(ieee80211com*ic,int code,void*){
     auto instance=current;bool wclStopping=false;
+    auto deferWCLCountryUpdate=[]{};
     switch(code){
 ''' + state_event + r'''
     }

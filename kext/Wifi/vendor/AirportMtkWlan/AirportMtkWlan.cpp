@@ -7,6 +7,7 @@
 //
 
 #include "AirportMtkWlan.hpp"
+#include "CountryLocale.hpp"
 #include <sys/_netstat.h>
 #include <crypto/sha1.h>
 #include <net80211/ieee80211_priv.h>
@@ -1048,13 +1049,84 @@ getCOUNTRY_CODE(OSObject *object,
     memset(cd, 0, sizeof(*cd));
     cd->version = APPLE80211_VERSION;
     auto info = fHalService ? fHalService->getDriverInfo() : nullptr;
-    // This HAL getter exposes host-configured alpha2, currently 00, not EEPROM
-    // geography or firmware policy readback. The former amtk_cc override and
-    // geolocation hints changed reporting only; do not substitute either for
-    // the domain used by the channel/power commands and both WCL channel lists.
-    if (!info || !mtkCopyCountryCode(info->getFirmwareCountryCode(), cd->cc))
+    if (!info)
         return kIOReturnNotReady;
+    const char *cc_fw = info->getFirmwareCountryCode();
+    // PR #7: reported country only; the channel/power domain stays the
+    // firmware's (00). See CountryLocale.hpp.
+    char user_override_cc[3];
+    memset(user_override_cc, 0, sizeof(user_override_cc));
+    PE_parse_boot_argn("amtk_cc", user_override_cc, 3);
+    /* MtkWireless: user_override_cc > named firmware_cc > geo_location_cc
+     * > 802.11d of the associated AP > 802.11d majority > firmware_cc. The
+     * firmware reports "00" (world), and airportd never sends the
+     * geolocated country here; see CountryLocale.hpp. */
+    ieee80211com *ic = fHalService->get80211Controller();
+    char bss11d[3] = {0, 0, 0}, scan11d[3] = {0, 0, 0};
+    char seenCC[8][2];
+    unsigned seenN[8];
+    if (ic) {
+        bss11d[0] = char(ic->ic_11d_bss_cc[0]);
+        bss11d[1] = char(ic->ic_11d_bss_cc[1]);
+        for (unsigned i = 0; i < 8; ++i) {
+            seenCC[i][0] = char(ic->ic_11d_seen[i].cc[0]);
+            seenCC[i][1] = char(ic->ic_11d_seen[i].cc[1]);
+            seenN[i] = ic->ic_11d_seen[i].n;
+        }
+        mtkcc::majority(seenCC, seenN, 8, scan11d);
+    }
+    mtkcc::Source source = mtkcc::kFirmware;
+    const char *effective = mtkcc::select(user_override_cc, cc_fw, geo_location_cc,
+                                          bss11d, scan11d, &source);
+    memset(cd->cc, 0, sizeof(cd->cc));
+    memcpy(cd->cc, effective, 2);
+    if (memcmp(reported_cc, cd->cc, 2) != 0 || reported_cc_source != source) {
+        memcpy(reported_cc, cd->cc, 2); reported_cc[2] = 0;
+        reported_cc_source = source;
+        setProperty("MTKWiFiCountryCode", reported_cc);
+        setProperty("MTKWiFiCountrySource", mtkcc::sourceName(source));
+        setProperty("MTKWiFiLocale", static_cast<uint64_t>(mtkcc::locale(reported_cc)), 32);
+    }
+    if (ic && (memcmp(reported_11d_bss, bss11d, 2) != 0 ||
+               memcmp(reported_11d_scan, scan11d, 2) != 0 ||
+               reported_11d_elements != ic->ic_11d_elements / 64)) {
+        memcpy(reported_11d_bss, bss11d, 3);
+        memcpy(reported_11d_scan, scan11d, 3);
+        reported_11d_elements = ic->ic_11d_elements / 64;
+        // "IT:7 FR:1": BSSes per announced country (each counted once).
+        char seen[8 * 6 + 1] = {};
+        size_t used = 0;
+        for (unsigned i = 0; i < 8; ++i) {
+            if (!seenN[i] || used + 6 >= sizeof(seen))
+                continue;
+            used += snprintf(seen + used, sizeof(seen) - used, "%s%c%c:%u", used ? " " : "",
+                             seenCC[i][0], seenCC[i][1], seenN[i] > 999 ? 999u : seenN[i]);
+        }
+        setProperty("MTKWiFiCountry11dAP", bss11d);
+        setProperty("MTKWiFiCountry11dSeen", seen);
+        setProperty("MTKWiFiCountry11dElements", uint64_t(ic->ic_11d_elements), 32);
+    }
     return kIOReturnSuccess;
+}
+
+// MtkWireless: true when the effective country became a real country
+// different from the last one announced (APPLE80211_M_COUNTRY_CODE_CHANGED),
+// so IO80211 re-reads it; its AWDL channel plan reads it at every AWDL
+// interface state change (configureValidAWDLChannels).
+bool AirportMtkWlan::countryCodeAnnounceNeeded()
+{
+    apple80211_country_code_data cd = {};
+    if (getCOUNTRY_CODE(static_cast<OSObject *>(nullptr), &cd) != kIOReturnSuccess)
+        return false;
+    if (mtkcc::unknown(reinterpret_cast<const char *>(cd.cc)) ||
+        memcmp(announced_cc, cd.cc, 2) == 0)
+        return false;
+    memcpy(announced_cc, cd.cc, 2);
+    announced_cc[2] = 0;
+    ++countryAnnouncements;
+    setProperty("MTKWiFiCountryAnnounced", announced_cc);
+    setProperty("MTKWiFiCountryAnnouncements", uint64_t(countryAnnouncements), 32);
+    return true;
 }
 
 IOReturn AirportMtkWlan::
@@ -1063,17 +1135,18 @@ setCOUNTRY_CODE(OSObject *object, struct apple80211_country_code_data *data)
     uint8_t requested[APPLE80211_MAX_CC_LEN] = {};
     if (!data || !mtkCopyCountryCode(reinterpret_cast<const char *>(data->cc), requested))
         return kIOReturnBadArgument;
-    apple80211_country_code_data effective = {};
-    IOReturn status = getCOUNTRY_CODE(object, &effective);
-    if (status != kIOReturnSuccess)
-        return status;
-    if (memcmp(requested, effective.cc, sizeof(requested)) == 0)
-        return kIOReturnSuccess; // Already configured; no change to announce.
-    // No HAL country-policy setter exists. This includes requests to reset to
-    // 00/XX/ZZ or select an Apple pseudo-locale: acknowledging a different code
-    // would claim a channel/power policy we did not apply. Leave the deferred,
-    // command-gated WCL notification path for actual effective-domain changes.
-    return kIOReturnUnsupported;
+    // PR #7: keep airportd's geolocated country as a reporting hint (not
+    // applied to the radio). Apple X* pseudo-locales are ignored.
+    if (requested[0] != 'X' &&
+        memcmp(geo_location_cc, requested, sizeof(geo_location_cc)) != 0) {
+        memcpy(geo_location_cc, requested, sizeof(geo_location_cc));
+        char geo[3] = {geo_location_cc[0], geo_location_cc[1], 0};
+        setProperty("MTKWiFiCountryGeo", geo);
+        if (fNetIf)
+            static_cast<AirportMtkSkywalkInterface *>(fNetIf)->handleWCLEvent(
+                IEEE80211_EVT_COUNTRY_CODE_UPDATE, nullptr);
+    }
+    return kIOReturnSuccess;
 }
 
 IOReturn AirportMtkWlan::

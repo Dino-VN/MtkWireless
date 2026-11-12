@@ -95,8 +95,11 @@ void ieee80211_begin_cache_bgscan(_ifnet*p){
 void ieee80211_clean_inactive_nodes(ieee80211com*,int){}
 unsigned starts=0,bssSelections=0;
 int requestScan(ieee80211com*ic,int,int){++starts;ic->ic_wcl_scan_inflight=true;return 0;}
+struct CountryMock {unsigned checks=0;bool countryCodeAnnounceNeeded(){++checks;return false;}};
 struct AirportMtkSkywalkInterface {
     Hal radio; Hal*fHalService=&radio; Timer timer; Timer*scanSource=&timer;
+    CountryMock country; CountryMock*instance=&country; unsigned countryUpdates=0;
+    void deferWCLCountryUpdate(){++countryUpdates;}
     bool scanPending=false,joinPending=false,roamPending=false,scanCompleted=false,scanSkipCompletion=false;
     IOReturn beginWCLScan(apple80211ScanRequest*);
     bool deferScanForAWDL(ieee80211com*){return false;}

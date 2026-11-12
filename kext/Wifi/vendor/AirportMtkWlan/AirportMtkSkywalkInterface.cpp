@@ -6,6 +6,7 @@
 //  Copyright © 2023 钟先耀. All rights reserved.
 //
 #include "AirportMtkWlan.hpp"
+#include "CountryLocale.hpp"
 #include "AirportMtkSkywalkInterface.hpp"
 #include <sys/CTimeout.hpp>
 #include <libkern/c++/OSMetaClass.h>
@@ -807,12 +808,14 @@ getLOCALE(struct apple80211_locale_data *ld)
     if (!ld)
         return kIOReturnError;
     ld->version = APPLE80211_VERSION;
-    // MtkWireless: there is no independently established hardware locale.
-    // Tahoe's native IOC 28 handler calls IO80211InfraInterface::getLOCALE
-    // directly and derives the locale from COUNTRY_CODE (00 -> UNKNOWN).
-    // This legacy method must not invent FCC, nor does changing it bypass that
-    // native mapping. System Information's Location is not a PCI-slot location.
-    ld->locale = APPLE80211_LOCALE_UNKNOWN;
+    // MtkWireless (PR #7): follow the reported country code (ETSI in the EU).
+    // Tahoe's native IOC 28 handler derives the locale from COUNTRY_CODE
+    // itself; this legacy method only matters to older callers.
+    apple80211_country_code_data country = {};
+    int locale = APPLE80211_LOCALE_FCC;
+    if (instance && instance->getCOUNTRY_CODE(static_cast<OSObject *>(this), &country) == kIOReturnSuccess)
+        locale = mtkcc::locale(reinterpret_cast<const char *>(country.cc));
+    ld->locale  = static_cast<decltype(ld->locale)>(locale);
     return kIOReturnSuccess;
 }
 
