@@ -40,7 +40,12 @@ public:
 
     const char *stringFromReturn(IOReturn code);
 
+    /* Overrides HCI_INIT_TIMEOUT for WMT commands (0 = default). */
+    void setCommandTimeout(uint32_t ms) { m_commandTimeout = ms; }
+    uint32_t commandTimeout(uint32_t fallback) const { return m_commandTimeout ? m_commandTimeout : fallback; }
+
 private:
+    uint32_t m_commandTimeout {0};
     IOUSBHostDevice *m_pDevice {nullptr};
     IOService *m_pClient {nullptr};
     IOUSBHostInterface *m_pInterface {nullptr};

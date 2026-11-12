@@ -44,6 +44,8 @@ sequence and every HCI rewrite. C++ keeps USB access, zlib and the Lilu routes.
 | `-mtkbtnolefix` | Disable the LE feature-mask shim only |
 | `-mtkbtrandaddr` | Send a fixed LE random address before scanning |
 | `-mtkbtnomsbc` | Disable the mSBC (wideband microphone) bridge; calls fall back to CVSD |
+| `-mtkbtnoopenwatchdog` | No re-enumeration when bluetoothd has not opened the HCI interface 20 s after a post-boot bring-up |
+| `-mtkbtnoshutdownoff` | Leave the controller on at shutdown/restart (no WMT FUNC_CTRL off) |
 
 ## Wideband microphone (Tahoe)
 

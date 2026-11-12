@@ -431,6 +431,23 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   and 0xFD3C coexistence. 1.0.14 hardware passes BLE readiness, rapportd
   PSM 0x81 and hotspot activation; Wi-Fi still times out (1.0.15 diagnostics);
   see docs/INSTANT-HOTSPOT.md and scripts/test-bt-le-ready.py.
+- After wake (USB power cut, ~22 s cold patch download) bluetoothd ran
+  `[bm3_usb][DeviceFoundCB]` twice at the same instant (full-wake handler
+  + device notification, 2026-11-12 18:42:13): two BTDevices, two device
+  user clients, no `BTDeviceOpen`, no interface user client on
+  `BT_ACL_If@0`. Every HCI command then failed with OI status 1205
+  (`OI_HCIIfc_SendHciCommand failed`), BLE advertising/scanning died and
+  AirDrop saw nobody and was seen by nobody; restarting bluetoothd fixed
+  it. `armOpenWatchdog` (BtLoader): after a bring-up at uptime >= 180 s,
+  if interface 0 is not open 20 s later, `IOUSBHostDevice::reset()` (patch
+  survives, next bring-up is fast); max 2 per 10 min,
+  `-mtkbtnoopenwatchdog` off. Unverified on hardware.
+- The controller keeps USB power across shutdown and restart, and with it
+  its links: devices stayed connected to a powered-off Mac until the next
+  boot's bring-up. `MtkWirelessBTLoader::systemWillShutdown` (power off /
+  restart) reopens the device and sends WMT FUNC_CTRL off with a 1 s
+  timeout, as Linux `btmtk_usb_shutdown` does; busy device or no HCI
+  interface only logs. `-mtkbtnoshutdownoff` off. Unverified on hardware.
 - `A2DP.DisableAACELD` / `FastConnect.Disable*` debug prefs do nothing for
   AirPods. A wedged controller may need a real power cut. Repeated bluetoothd
   crashes make launchd throttle it (640–1200 s).
