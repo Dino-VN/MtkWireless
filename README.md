@@ -128,6 +128,48 @@ fallback EFI:
    join, DHCP, throughput and `mtkctl log`. Then AirDrop both ways;
    `scripts/Collect-AirDrop-AWDL.command` records AWDL if it fails.
 
+## Collect diagnostics
+
+Run this **right after a failure**, without restarting Bluetooth or changing Wi-Fi.
+One command downloads the standalone collector, asks for your Mac password, and
+creates `MtkWireless-Logs-<date>-<random>.zip` on **your Desktop**, even when run
+with `sudo`:
+
+```sh
+script="$(curl -fsSL https://raw.githubusercontent.com/Dino-VN/MtkWireless/main/scripts/collect-logs.sh)" && sudo bash -c "$script"
+```
+
+It collects:
+
+- macOS/build, Wi-Fi and Bluetooth card details, PCI/USB hierarchy, audio and
+  sleep/wake state;
+- loaded kext versions/dependencies, kernel collection metadata and **kext/kernel
+  loading logs since the current boot**, including failures;
+- full IORegistry plus before/after Wi-Fi, AWDL, BT loader, page-patch, mSBC,
+  verifier and LE-readiness counters;
+- network interfaces, routes, DHCP, DNS, AWDL neighbors and relevant daemon state;
+- the on-disk `bluetoothd` binary/signature, recent crash/panic reports, Lilu logs
+  and **existing** HCI traces (last 3 days);
+- Bluetooth, Wi-Fi, AirDrop/Continuity, mDNS, audio and kernel logs (last **1 hour**),
+  plus a native `.logarchive` of that window, capped at **512 MB**;
+- relevant kext bundles and OpenCore Kernel/security/ACPI/driver sections from
+  **already-mounted** EFIs. It does not mount EFI or copy the full `config.plist`.
+
+No Xcode, Python or extra helper is needed. It does **not** restart daemons,
+load/unload kexts, scan, enable HCI/packet tracing, change preferences or upload
+anything. Commands that fail or time out are recorded in `commands.tsv`; other
+collection continues, and the ZIP is tested before success is reported.
+
+For a local copy: `bash scripts/collect-logs.sh`. Options also work after the
+remote command: `sudo bash -c "$script" -- --last 6h --no-logarchive --notes "AirDrop Mac to iPhone stalls"`.
+The uncompressed folder is kept alongside the ZIP.
+
+**Privacy:** the bundle is not anonymized. It can contain SSIDs, MAC/IP addresses,
+serial numbers, device/user names, crash details and private activity from system
+logs. Send it privately to someone you trust, not a public issue. Keychain and
+Bluetooth link-key preferences are not copied. macOS redaction and missing
+historical debug events cannot be undone by the collector.
+
 ## Build
 
 Needs Xcode and rustup.
