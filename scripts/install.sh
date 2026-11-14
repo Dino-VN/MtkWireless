@@ -333,12 +333,29 @@ elif [ $DRY = 1 ]; then info "Dry run: nothing changed"; else
 fi
 
 # ---------------------------------------------------------------- features
+# A minimum is a filter only: the kext still validates native signatures/ABI.
+tahoe_since() {
+    local minimum=$1 train number seed
+    [ ${#BUILD} -le 15 ] || return 1
+    [[ "$BUILD" =~ ^25([A-Z])([0-9]+)([a-z]?)$ ]] || return 1
+    train=${BASH_REMATCH[1]}; number=${BASH_REMATCH[2]}; seed=${BASH_REMATCH[3]}
+    [ ${#number} -le 10 ] || return 1
+    number=$((10#$number))
+    [ "$number" -le 4294967295 ] || return 1
+    [[ "$train" > G ]] || { [ "$train" = G ] && { [ "$number" -gt "$minimum" ] || { [ "$number" -eq "$minimum" ] && [ -z "$seed" ]; }; }; }
+}
 info "What works on this Mac (macOS $PRODUCT $BUILD)"
 case "$BUILD" in
     25G332) BLE=yes HOTSPOT=yes ;;
     25G241) BLE=yes HOTSPOT=no ;;
     *) BLE=unknown HOTSPOT=no ;;
 esac
+DYNAMIC_BT=0
+if ! vlt "$NEWVER" 1.1.1; then
+    DYNAMIC_BT=1
+    if tahoe_since 241 && [ "$BLE" = unknown ]; then BLE=conditional; fi
+    if tahoe_since 332; then HOTSPOT=conditional; fi
+fi
 if [ $INSTALL_WIFI = 1 ]; then
     ok "Wi-Fi: scan, join, WPA2/WPA3, AWDL, 2.4/5 GHz"
     case "$WIFI_ID" in 14c3:7922|14c3:0616|14c3:0608) echo "    6 GHz: off by default, boot-arg amtk_6ghz=1 (OWE/SAE-H2E networks cannot be joined yet)";; esac
@@ -346,17 +363,21 @@ fi
 if [ $INSTALL_BT = 1 ]; then
     ok "Bluetooth: pairing, audio, AirPods (AAC-ELD), BLE scanning"
     case "$BT_ID" in
-        13d3:3610|0489:e0cd) [ "$BLE" = unknown ] && warn "HFP 16 kHz (mSBC) microphone: untested on $BUILD" || ok "HFP 16 kHz (mSBC) microphone" ;;
+        13d3:3610|0489:e0cd) [ "$BLE" = yes ] && ok "HFP 16 kHz (mSBC) microphone" || warn "HFP 16 kHz (mSBC) microphone: native patches/hardware unverified on $BUILD" ;;
         *) warn "HFP microphone: CVSD 8 kHz only ($BT_ID is not one of the mSBC-tested IDs)" ;;
     esac
 fi
 if [ $INSTALL_BT = 1 ] && [ $INSTALL_WIFI = 1 ]; then
     case "$BLE" in
         yes) ok "AirDrop, Handoff, Universal Clipboard, AirPlay to Mac" ;;
-        *) warn "AirDrop/Handoff: bluetoothd patches exist only for 25G241 and 25G332; on $BUILD BLE advertising likely does not work" ;;
+        conditional) warn "AirDrop/Handoff: 25G241+ signature/layout checks enabled in $NEWVER; verify patch counters on $BUILD (hardware unverified)" ;;
+        *) warn "AirDrop/Handoff: this release/build has no verified advertising compatibility; inspect bluetoothd patch counters on $BUILD" ;;
     esac
-    if [ "$HOTSPOT" = yes ]; then ok "Instant Hotspot"
-    else warn "Instant Hotspot: needs macOS 26.7.2 (25G332); not available on $BUILD"; fi
+    case "$HOTSPOT" in
+        yes) ok "Instant Hotspot" ;;
+        conditional) warn "Instant Hotspot: dynamic RPA preflight required (BluetoothdRpaPlanState=2); new hook/hardware verification pending" ;;
+        *) [ "$DYNAMIC_BT" = 1 ] && warn "Instant Hotspot: needs Darwin 25 build 25G332+ and a complete native RPA plan; not available on $BUILD" || warn "Instant Hotspot: this release needs macOS 26.7.2 (25G332); not available on $BUILD" ;;
+    esac
 else
     warn "AirDrop, Handoff and Instant Hotspot need both the Wi-Fi card and the Bluetooth controller"
 fi

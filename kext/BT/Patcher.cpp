@@ -10,12 +10,16 @@
 #include "Patcher.hpp"
 
 #include <Headers/kern_api.hpp>
+#include <Headers/kern_file.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLocks.h>
 #include <kern/thread_call.h>
 #include <sys/syslimits.h>
 #include <sys/sysctl.h>
 #include <sys/vnode.h>
+#include <sys/vnode_if.h>
+#include <sys/uio.h>
+#include <sys/errno.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
 #include <IOKit/usb/IOUSBHostInterface.h>
 #include <IOKit/usb/IOUSBHostPipe.h>
@@ -26,6 +30,9 @@
 #include "msbc/UsbMsbcScope.hpp"
 
 #define DRV_NAME "mtkbt"
+
+// Opaque: the pre-exec route never reads a kernel image_params layout.
+struct image_params;
 
 namespace {
 
@@ -49,11 +56,28 @@ volatile SInt32 readClockRewritten, aclPbRewritten;
 volatile SInt32 leCommands, leCompletions, leErrors;
 bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 bool rpaPatchEnabled, rpaHelpersReady;
-// -mtkbtanybuild: ScopeKnownBuild sites also on builds not verified offline.
+mach_vm_address_t orgMacVnodeCheckExec;
+bool rpaExecRouted;
+enum RpaPlanState : SInt32 {
+    RpaPlanUnread = 0, RpaPlanPreparing = 1, RpaPlanReady = 2, RpaPlanDisabled = 3,
+    RpaPlanReadFailed = 4, RpaPlanInvalid = 5, RpaPlanLate = 6, RpaPlanNoVerify = 7,
+    RpaPlanNoRoom = 8, RpaPlanNoVnode = 9
+};
+volatile SInt32 rpaPlanState, rpaPlanRejected, bluetoothdForeignPagesRolledBack;
+volatile uint32_t bluetoothdCommonAbi;
+mtk_bt_rpa_plan *rpaPlan;
+vnode_t bluetoothdImageVnode; // Referenced for this boot; never reuse a plan for another vnode.
+uint32_t bluetoothdImageVid;
+bool rpaValidationStarted;
+static_assert(sizeof(mtk_bt_rpa_edit) == 608 && offsetof(mtk_bt_rpa_plan, edits) == 72 &&
+              sizeof(mtk_bt_rpa_plan) == 4328, "RPA Rust/C layout");
+// -mtkbtanybuild: ScopeMinimumBuild sites also below the minimum/other ABI families.
 bool anyBuildPatches;
 // kern.osversion, written by launchd after the kext starts (BluetoothdBuild).
 // Pattern scopes key on it; read at bluetoothd's first page, then cached.
-enum BluetoothdBuild : SInt32 { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3 };
+enum BluetoothdBuild : SInt32 {
+    BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3, Build25G342 = 4, BuildLater = 5
+};
 volatile SInt32 bluetoothdBuild;
 char bluetoothdBuildName[16];
 volatile SInt32 bluetoothdSitesAmbiguous;
@@ -172,14 +196,30 @@ void publishCounters()
             v->release();
         }
     }
-    d->setObject("BluetoothdBuildKnown", build == Build25G241 || build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdBuildKnown", build == Build25G241 || build == Build25G332 || build == Build25G342 ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdBuildSupported", build >= Build25G241 ? kOSBooleanTrue : kOSBooleanFalse);
     d->setObject("BluetoothdAnyBuild", anyBuildPatches ? kOSBooleanTrue : kOSBooleanFalse);
     // 2 bits per feature (adv, mSBC, RPA): 0 undecided, 1 on, 2 off.
     number("BluetoothdPatchFeatures", (uint32_t)(featureLatch[0] | featureLatch[1] << 2 | featureLatch[2] << 4));
     number("BluetoothdSitesAmbiguous", (uint32_t)bluetoothdSitesAmbiguous);
     number("BluetoothdPagesUnpatched", (uint32_t)bluetoothdPagesUnpatched);
+    const SInt32 rpaState = __atomic_load_n(&rpaPlanState, __ATOMIC_ACQUIRE);
     d->setObject("BluetoothdRpaEnabled",
-                 rpaPatchEnabled && verifyFixRouted && build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
+                 rpaPatchEnabled && verifyFixRouted && rpaState == RpaPlanReady ? kOSBooleanTrue : kOSBooleanFalse);
+    d->setObject("BluetoothdRpaExecRouted", rpaExecRouted ? kOSBooleanTrue : kOSBooleanFalse);
+    number("BluetoothdRpaPlanState", (uint32_t)rpaState);
+    number("BluetoothdRpaPlanRejected", (uint32_t)rpaPlanRejected);
+    number("BluetoothdCommonAbiVerified", __atomic_load_n(&bluetoothdCommonAbi, __ATOMIC_ACQUIRE));
+    number("BluetoothdForeignPagesRolledBack", (uint32_t)bluetoothdForeignPagesRolledBack);
+    if (rpaState == RpaPlanReady && rpaPlan) {
+        number("BluetoothdRpaPlanEdits", rpaPlan->count);
+        number64("BluetoothdRpaHelperAddress", rpaPlan->helper_address);
+        number64("BluetoothdRpaSliceOffset", rpaPlan->slice_offset);
+        if (OSData *uuid = OSData::withBytes(rpaPlan->uuid, sizeof(rpaPlan->uuid))) {
+            d->setObject("BluetoothdRpaImageUUID", uuid);
+            uuid->release();
+        }
+    }
     d->setObject("BluetoothdRpaHelpersReady",
         __atomic_load_n(&rpaHelpersReady, __ATOMIC_ACQUIRE) ? kOSBooleanTrue : kOSBooleanFalse);
     number("BluetoothdRpaHelpersPatched", (uint32_t)bluetoothdRpaHelpersPatched);
@@ -829,8 +869,8 @@ static_assert(sizeof(extAdvFind) == sizeof(extAdvReplace), "patch size");
  * 25G332 x86_64 at 0x100511239 (25G241: 0x100510e99), inside one page. Both
  * call displacements are wildcards (they are all that differs between the
  * two builds). The NOPed call's target cannot be checked from this page, so
- * this site is limited to builds whose setter/gate
- * scripts/test-bt-page-patches.py verified (ScopeKnownBuild).
+ * ScopeMinimumBuild preserves the offline-verified legacy setter/gate layouts;
+ * later layouts must also pass the full-image pre-exec validator.
  */
 const uint8_t advAddressFind[] {
     0xe8, 0x34, 0x32, 0xe8, 0xff, 0x83, 0xb8, 0x34, 0x03, 0x00, 0x00, 0x03, 0x77, 0x2a,
@@ -862,7 +902,7 @@ static_assert(sizeof(advAddressFind) == sizeof(advAddressReplace) && sizeof(advA
  * 25G332 x86_64 0x1001fa68d (25G241: 0x1001fa20d), 64 bytes inside one page.
  * Wildcards: the gate's RIP-relative offset (+34, overwritten by the guard)
  * and the trailing call displacement (+60, kept). The guard's short branches
- * re-encode the native +26/+39 targets, so those stay exact. ScopeKnownBuild
+ * re-encode the native +26/+39 targets, so those stay exact. ScopeMinimumBuild
  * (with advAddress): natively, a false gate jumps straight to the
  * continuation; the patched guard instead calls a helper that checks the same
  * gate and returns 0 without sending HCI 0xcb or calling the callback, so
@@ -896,7 +936,10 @@ static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace) &&
                   sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplaceMask),
               "address retry patch size");
 
-/* Instant Hotspot / outgoing BLE, x86_64 26.7.2 (25G332).
+/* Historical 1.1.0 Instant Hotspot / outgoing BLE oracle (25G332).
+ * The arrays below are test-only; runtime 1.1.1 resolves native signatures,
+ * VM mappings and every helper/child relocation in mtk_bt::rpa before exec.
+ * This historical description explains the behavior the new payload preserves.
  * The host AH resolver replaces a peer RPA with its identity in scan reports,
  * but chip 0 has no initialized BCM/ACI/SRS privacy backend. Its accept list
  * therefore contains a public identity that cannot match the on-air RPA.
@@ -930,6 +973,10 @@ static_assert(sizeof(advAddressRetryFind) == sizeof(advAddressRetryReplace) &&
  * helper page in, and validation installs the helpers before that call
  * executes. The feature is decided once per vnode (featureOn).
  */
+// Historical byte oracles for offline regression only. Runtime uses the
+// full-image signature/relocation resolver in rust/mtk-bt/src/rpa.rs, not
+// these build-specific displacements or the old helper anchor.
+#ifdef MTK_BT_RPA_LEGACY_TEST_ORACLES
 const uint8_t rpaHelpersFind25G332[] {
     0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1069,6 +1116,7 @@ const uint8_t rpaUpdateReplace25G332[] {
     0x8b, 0x3d, 0x80, 0xbc, 0x44, 0x00, 0x48, 0x8b, 0xb5, 0x78, 0xfd, 0xff, 0xff, 0x31, 0xd2, 0xe8,
     0x2c, 0x1a, 0x3d, 0x00};
 static_assert(sizeof(rpaUpdateFind25G332) == sizeof(rpaUpdateReplace25G332), "RPA patch size");
+#endif // MTK_BT_RPA_LEGACY_TEST_ORACLES
 
 /* HFP wideband gate: bluetoothd enables mSBC only for known chip IDs; a
  * THIRD_PARTY_DONGLE (chip 0) is outside the range. Accept chip 0, only while
@@ -1257,8 +1305,12 @@ void recordPatchRange(uint64_t fileOffset, const uint8_t *original, const uint8_
     uint32_t count = __atomic_load_n(&patchRangeCount, __ATOMIC_RELAXED);
     for (uint32_t i = 0; i < count; i++) {
         const PatchRange &r = patchRanges[i];
-        if (r.fileOffset == fileOffset && r.length == length && memcmp(r.patched, patched, length) == 0)
-            return;
+        if (fileOffset >= r.fileOffset && fileOffset - r.fileOffset <= r.length &&
+            length <= r.length - (uint32_t)(fileOffset - r.fileOffset)) {
+            const size_t within = (size_t)(fileOffset - r.fileOffset);
+            if (memcmp(r.original + within, original, length) == 0 && memcmp(r.patched + within, patched, length) == 0)
+                return; // A pre-reserved RPA range also covers its smaller page diff.
+        }
     }
     if (count == kPatchRanges) {
         OSIncrementAtomic(&patchRangeOverflow);
@@ -1353,6 +1405,10 @@ template <typename Verify>
 errno_t verifyBluetoothdBlock(vnode_t vp, off_t offset, uint8_t *buf, size_t size, uint32_t flags, Verify &&verify)
 {
     if (LIKELY(!buf) || !size || !pageLock || flags != 0 || offset < 0)
+        return verify(buf);
+    if ((__atomic_load_n(&rpaPlanState, __ATOMIC_ACQUIRE) == RpaPlanReady ||
+         __atomic_load_n(&bluetoothdCommonAbi, __ATOMIC_ACQUIRE) != 0) &&
+        (vp != bluetoothdImageVnode || vnode_vid(vp) != bluetoothdImageVid))
         return verify(buf);
     // csValidatePage publishes the vnode under pageLock before it changes a
     // byte. Until then, any bluetoothd vnode waits for the lock.
@@ -1461,6 +1517,172 @@ void installVerifyOp(vnode_t vp)
 }
 
 bool patchBluetoothdPage(void *data);
+SInt32 readBluetoothdBuild();
+
+// The exec loader already owns the vnode lock (its following vn_rdwr uses
+// IO_NODELOCKED). Use the same contract and verify an exact read; do not
+// reacquire that lock or leak the temporary UIO on any error path.
+int readRpaImage(void *buffer, size_t size, vnode_t vp, vfs_context_t context)
+{
+    uio_t io = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
+    if (!io)
+        return ENOMEM;
+    int result = uio_addiov(io, reinterpret_cast<user_addr_t>(buffer), size);
+    if (!result)
+        result = VNOP_READ(vp, io, IO_NODELOCKED, context);
+    if (!result && uio_resid(io) != 0)
+        result = EIO;
+    uio_free(io);
+    return result;
+}
+
+// Resolve before exec, never from a VM page-validation callback. The original
+// MAC decision is preserved and image_params remains opaque. A complete owned
+// image is read from the same referenced vnode, without pageLock held.
+uint32_t validateCommonImage(const uint8_t *image, size_t size)
+{
+    const mtk_bt_page_site sites[] {
+        {extAdvFind, nullptr, extAdvReplace, nullptr, sizeof(extAdvFind)},
+        {advAddressFind, advAddressFindMask, advAddressReplace, advAddressReplaceMask, sizeof(advAddressFind)},
+        {advAddressRetryFind, advAddressRetryFindMask, advAddressRetryReplace, advAddressRetryReplaceMask, sizeof(advAddressRetryFind)},
+        {wbsFind, wbsFindMask, wbsReplace, wbsReplaceMask, sizeof(wbsFind)},
+        {hfpFillFind, hfpFillFindMask, hfpFillReplace, hfpFillReplaceMask, sizeof(hfpFillFind)}
+    };
+    return mtk_bt_common_validate(image, size, sites);
+}
+
+int macVnodeCheckExec(vfs_context_t context, vnode_t vp, struct image_params *imageParams)
+{
+    const int result = FunctionCast(macVnodeCheckExec, orgMacVnodeCheckExec)(context, vp, imageParams);
+    if (result || (!extAdvPatchEnabled && !msbcPatchEnabled) || !rpaExecRouted || !pageLock || !rpaPlan || !isBluetoothd(vp))
+        return result;
+    if (readBluetoothdBuild() == BuildUnread)
+        return result;
+    IOLockLock(pageLock);
+    if (rpaPlanState != RpaPlanUnread) {
+        IOLockUnlock(pageLock);
+        return result;
+    }
+    SInt32 state = RpaPlanPreparing;
+    if (!mtk_bt_tahoe_build_since(reinterpret_cast<const uint8_t *>(bluetoothdBuildName), strlen(bluetoothdBuildName), 241) && !anyBuildPatches)
+        state = RpaPlanDisabled;
+    else if (rpaValidationStarted)
+        state = RpaPlanLate;
+    else if (vnode_ref(vp) != 0)
+        state = RpaPlanNoVnode;
+    if (state == RpaPlanPreparing) {
+        bluetoothdImageVnode = vp;
+        bluetoothdImageVid = vnode_vid(vp);
+    }
+    __atomic_store_n(&rpaPlanState, state, __ATOMIC_RELEASE);
+    IOLockUnlock(pageLock);
+    if (state != RpaPlanPreparing) {
+        publishLater();
+        return result;
+    }
+    const size_t size = FileIO::readFileSize(vp, context);
+    auto *image = size && size <= MTK_BT_RPA_MAX_IMAGE ? static_cast<uint8_t *>(IOMalloc(size)) : nullptr;
+    uint32_t common = 0;
+    const bool wantRpa = rpaPatchEnabled &&
+        mtk_bt_tahoe_build_since(reinterpret_cast<const uint8_t *>(bluetoothdBuildName), strlen(bluetoothdBuildName), 332);
+    if (image) {
+        memset(image, 0, size);
+        if (readRpaImage(image, size, vp, context) == 0 && FileIO::readFileSize(vp, context) == size) {
+            // A prior wrapper may be visible through the file cache. Restore
+            // only recorded exact patched bytes, in this owned copy.
+            IOLockLock(pageLock);
+            for (uint32_t i = 0; i < patchRangeCount; ++i) {
+                const PatchRange &range = patchRanges[i];
+                if (range.fileOffset <= size && range.length <= size - range.fileOffset &&
+                    memcmp(image + range.fileOffset, range.patched, range.length) == 0)
+                    memcpy(image + range.fileOffset, range.original, range.length);
+            }
+            IOLockUnlock(pageLock);
+            common = validateCommonImage(image, size);
+            if (wantRpa)
+                state = (common & MTK_BT_COMMON_ADVERTISING) && mtk_bt_rpa_resolve(image, size, rpaPlan) == 0 ? RpaPlanReady : RpaPlanInvalid;
+            else
+                state = RpaPlanDisabled; // Common ABI verification is still retained.
+        } else
+            state = RpaPlanReadFailed;
+        IOFree(image, size);
+    } else
+        state = RpaPlanReadFailed;
+    IOLockLock(pageLock);
+    // Never activate after *any* observed native executable validation. This
+    // also catches unexpected validation recursively triggered by acquisition.
+    if (rpaValidationStarted) {
+        state = RpaPlanLate;
+        common = 0;
+    }
+    if ((common || state == RpaPlanReady) && vnode_vid(vp) != bluetoothdImageVid) {
+        state = RpaPlanNoVnode;
+        common = 0;
+    }
+    if ((common || state == RpaPlanReady) && !verifyOpState)
+        installVerifyOp(vp);
+    if ((common || state == RpaPlanReady) && !verifyFixRouted) {
+        state = RpaPlanNoVerify;
+        common = 0;
+    }
+    if (common)
+        __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+    uint32_t needed = 0;
+    if (state == RpaPlanReady) {
+        for (const auto &edit : rpaPlan->edits)
+            for (uint32_t at = 0; at < edit.len; at += kPatchRangeMax) {
+                const uint32_t n = edit.len - at < kPatchRangeMax ? edit.len - at : kPatchRangeMax;
+                needed += memcmp(edit.original + at, edit.replacement + at, n) != 0;
+            }
+        if (patchRangeCount > kPatchRanges || needed > kPatchRanges - patchRangeCount)
+            state = RpaPlanNoRoom;
+    }
+    if (state == RpaPlanReady) {
+        __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+        // Reserve every changed range BEFORE a single helper/child can run.
+        // Later per-page headroom exhaustion must never skip part of this plan.
+        for (const auto &edit : rpaPlan->edits)
+            for (uint32_t at = 0; at < edit.len; at += kPatchRangeMax) {
+                const uint32_t n = edit.len - at < kPatchRangeMax ? edit.len - at : kPatchRangeMax;
+                if (memcmp(edit.original + at, edit.replacement + at, n) != 0)
+                    recordPatchRange(edit.file_offset + at, edit.original + at, edit.replacement + at, n);
+            }
+    }
+    __atomic_store_n(&bluetoothdCommonAbi, common, __ATOMIC_RELEASE);
+    __atomic_store_n(&rpaPlanState, state, __ATOMIC_RELEASE);
+    IOLockUnlock(pageLock);
+    SYSLOG(DRV_NAME, "bluetoothd ABI bits 0x%x, dynamic RPA plan state %d", common, (int)state);
+    publishLater();
+    return result;
+}
+
+// Called only for a ready, matching vnode. The Rust applier checks *all*
+// destinations on this page before writing. A mismatch rejects executable
+// validation rather than silently executing a half-patched helper group.
+int32_t applyRpaPage(vnode_t vp, uint64_t pageOffset, void *data, int *validated, int *tainted, int *nx)
+{
+    if (__atomic_load_n(&rpaPlanState, __ATOMIC_ACQUIRE) != RpaPlanReady || vp != bluetoothdImageVnode || vnode_vid(vp) != bluetoothdImageVid)
+        return 0;
+    const int32_t edits = verifyFixRouted ? mtk_bt_rpa_apply_page(rpaPlan, pageOffset, static_cast<uint8_t *>(data), PAGE_SIZE) : -1;
+    if (edits < 0) {
+        if (validated) *validated = 0;
+        if (tainted) *tainted = 1;
+        if (nx) *nx = 1;
+        OSIncrementAtomic(&rpaPlanRejected);
+        SYSLOG(DRV_NAME, "bluetoothd RPA destination rejected at 0x%llx", pageOffset);
+        publishLater();
+        return edits;
+    }
+    volatile SInt32 *const counters[] {&bluetoothdRpaHelpersPatched, &bluetoothdRpaLegacyPatched,
+        &bluetoothdRpaScanPatched, &bluetoothdRpaDecodePatched, &bluetoothdRpaDevicePatched,
+        &bluetoothdRpaConnectPatched, &bluetoothdRpaUpdatePatched};
+    for (size_t i = 0; i < MTK_BT_RPA_EDITS; ++i)
+        if (edits & (1 << i))
+            OSIncrementAtomic(counters[i]);
+    if (edits & 1)
+        __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
+    return edits;
+}
 
 // Lilu's user patcher is off on Big Sur and later (kern_start.cpp), so
 // onProcLoad never fires there. Patch bluetoothd's pages as the kernel
@@ -1471,7 +1693,35 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     auto org = FunctionCast(csValidatePage, orgCsValidatePage);
     if (!data || !isBluetoothd(vp))
         return org(vp, pager, pageOffset, data, validated, tainted, nx);
-    // Page-in path: count only; the next publishCounters() reports it.
+    // The referenced plan/restore ledger belongs to one vnode for this boot.
+    // Another executable image stays native; never reuse its predecessor's
+    // offsets or overwrite its original bytes with a stale restore range.
+    if ((__atomic_load_n(&rpaPlanState, __ATOMIC_ACQUIRE) == RpaPlanReady ||
+         __atomic_load_n(&bluetoothdCommonAbi, __ATOMIC_ACQUIRE) != 0) &&
+        (vp != bluetoothdImageVnode || vnode_vid(vp) != bluetoothdImageVid)) {
+        // org also contains downstream patchers (e.g. BlueToolFixup). Calling
+        // it alone would leave B dirty without B's restoration ledger. Undo
+        // those writes before return so the excluded vnode really stays native.
+        IOLockLock(pageLock);
+        memcpy(pageSnapshot, data, PAGE_SIZE);
+        org(vp, pager, pageOffset, data, validated, tainted, nx);
+        if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0) {
+            memcpy(const_cast<void *>(data), pageSnapshot, PAGE_SIZE);
+            OSIncrementAtomic(&bluetoothdForeignPagesRolledBack);
+        }
+        IOLockUnlock(pageLock);
+        OSIncrementAtomic(&bluetoothdPagesUnpatched);
+        publishLater();
+        return;
+    }
+    // A pre-exec plan must precede executable validation; remember early or
+    // recursive validation permanently rather than trying to activate late.
+    if (pageLock) {
+        IOLockLock(pageLock);
+        if (rpaPlanState != RpaPlanReady)
+            rpaValidationStarted = true;
+        IOLockUnlock(pageLock);
+    }
     OSIncrementAtomic(&bluetoothdPages);
     if (verifyFixEnabled && pageLock && pageSnapshot && UNLIKELY(!__atomic_load_n(&verifyOpState, __ATOMIC_ACQUIRE))) {
         IOLockLock(pageLock);
@@ -1490,6 +1740,7 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
             IOLockUnlock(pageLock);
         }
         org(vp, pager, pageOffset, data, validated, tainted, nx);
+        applyRpaPage(vp, pageOffset, const_cast<void *>(data), validated, tainted, nx);
         OSIncrementAtomic(&bluetoothdPagesUnpatched);
         return;
     }
@@ -1497,14 +1748,16 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
     if (__atomic_load_n(&bluetoothdVnode, __ATOMIC_RELAXED) != vp)
         memset(featureLatch, 0, sizeof(featureLatch));
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
+    featureLatch[2] = rpaPlanState == RpaPlanReady && vp == bluetoothdImageVnode ? 1 : 2;
     // The page may already hold our patch from an earlier fault; hand the
     // signature check the original bytes so the page never validates dirty.
     restorePatchedPageLocked(pageOffset, data);
     memcpy(pageSnapshot, data, PAGE_SIZE);
     org(vp, pager, pageOffset, data, validated, tainted, nx);
-    bool patched = false;
-    if (__atomic_load_n(&patchRangeCount, __ATOMIC_RELAXED) + kPageRangeHeadroom <= kPatchRanges)
-        patched = patchBluetoothdPage(const_cast<void *>(data));
+    const int32_t rpaEdits = applyRpaPage(vp, pageOffset, const_cast<void *>(data), validated, tainted, nx);
+    bool patched = rpaEdits > 0;
+    if (rpaEdits >= 0 && __atomic_load_n(&patchRangeCount, __ATOMIC_RELAXED) + kPageRangeHeadroom <= kPatchRanges)
+        patched = patchBluetoothdPage(const_cast<void *>(data)) || patched;
     else
         OSIncrementAtomic(&bluetoothdPagesUnpatched);
     if (memcmp(pageSnapshot, data, PAGE_SIZE) != 0)
@@ -1525,27 +1778,27 @@ SInt32 readBluetoothdBuild()
     size_t size = sizeof(build) - 1;
     if (sysctlbyname("kern.osversion", build, &size, nullptr, 0) != 0 || build[0] == 0)
         return BuildUnread;
-    state = strcmp(build, "25G332") == 0 ? Build25G332 : strcmp(build, "25G241") == 0 ? Build25G241 : BuildOther;
+    state = strcmp(build, "25G332") == 0 ? Build25G332 : strcmp(build, "25G241") == 0 ? Build25G241 :
+            strcmp(build, "25G342") == 0 ? Build25G342 :
+            mtk_bt_tahoe_build_since(reinterpret_cast<const uint8_t *>(build), strlen(build), 241) ? BuildLater : BuildOther;
     memcpy(bluetoothdBuildName, build, sizeof(build));
     __atomic_store_n(&bluetoothdBuild, state, __ATOMIC_RELEASE);
     return state;
 }
 
 /*
- * Every bluetoothd page patch, in the order they are searched. Per macOS build
- * (kern.osversion):
- *  - ScopeAnyBuild: the pattern alone identifies a site that is safe to patch
- *    on any Tahoe build; no match means no patch. extAdv only.
- *  - ScopeKnownBuild: masked against displacement-only changes, but part of
- *    its correctness is outside the page (advAddress's setter, the mSBC pair),
- *    so only builds checked with scripts/test-bt-page-patches.py are listed in
- *    readBluetoothdBuild. -mtkbtanybuild also allows unlisted builds.
- *  - ScopeRpaBuild: injected code with fixed rel32s into native code, 25G332.
+ * Common patches only, searched in this order. Scopes use kern.osversion:
+ *  - ScopeAnyBuild: exact build-independent extAdv function signature;
+ *    unlisted layouts additionally require complete pre-exec validation.
+ *  - ScopeMinimumBuild: Darwin 25 from 25G241; preserve the offline-verified
+ *    legacy layouts, require full-image setter/gate/ABI checks on later ones.
+ *    -mtkbtanybuild remains an explicit below-minimum debug override.
  * A site must match exactly once in the page (ambiguous: left native).
+ * RPA is a complete vnode-bound relocation plan, never an independent site.
  */
 enum PatchFeature : uint8_t { FeatureAdv, FeatureMsbc, FeatureRpa, FeatureCount };
 static_assert(FeatureCount == sizeof(featureLatch), "one latch per feature");
-enum SiteScope : uint8_t { ScopeAnyBuild, ScopeKnownBuild, ScopeRpaBuild };
+enum SiteScope : uint8_t { ScopeAnyBuild, ScopeMinimumBuild };
 enum FeatureLatch : uint8_t { LatchUndecided = 0, LatchOn = 1, LatchOff = 2 };
 
 struct BluetoothdSite {
@@ -1558,27 +1811,18 @@ struct BluetoothdSite {
 
 #define BLUETOOTHD_SITE(name, feature, scope, find, findMask, replace, replaceMask, counter) \
     {name, feature, scope, {find, findMask, replace, replaceMask, sizeof(find)}, &counter}
-#define BLUETOOTHD_RPA_SITE(name, prefix, counter)                                                         \
-    BLUETOOTHD_SITE(name, FeatureRpa, ScopeRpaBuild, prefix##Find25G332, nullptr, prefix##Replace25G332, \
-                    nullptr, counter)
-
+// RPA is deliberately absent: its entire relocation plan is prepared before
+// exec, not independently guessed/applied as each child page faults in.
 const BluetoothdSite bluetoothdSites[] {
-    BLUETOOTHD_RPA_SITE("RPA helpers", rpaHelpers, bluetoothdRpaHelpersPatched),
-    BLUETOOTHD_RPA_SITE("RPA legacy", rpaLegacy, bluetoothdRpaLegacyPatched),
-    BLUETOOTHD_RPA_SITE("RPA scan", rpaScan, bluetoothdRpaScanPatched),
-    BLUETOOTHD_RPA_SITE("RPA decode", rpaDecode, bluetoothdRpaDecodePatched),
-    BLUETOOTHD_RPA_SITE("RPA device", rpaDevice, bluetoothdRpaDevicePatched),
-    BLUETOOTHD_RPA_SITE("RPA connect", rpaConnect, bluetoothdRpaConnectPatched),
-    BLUETOOTHD_RPA_SITE("RPA update", rpaUpdate, bluetoothdRpaUpdatePatched),
-    BLUETOOTHD_SITE("HFP wideband gate", FeatureMsbc, ScopeKnownBuild, wbsFind, wbsFindMask, wbsReplace,
+    BLUETOOTHD_SITE("HFP wideband gate", FeatureMsbc, ScopeMinimumBuild, wbsFind, wbsFindMask, wbsReplace,
                     wbsReplaceMask, bluetoothdWbsPatched),
-    BLUETOOTHD_SITE("HFP complete PCM chunks", FeatureMsbc, ScopeKnownBuild, hfpFillFind, hfpFillFindMask,
+    BLUETOOTHD_SITE("HFP complete PCM chunks", FeatureMsbc, ScopeMinimumBuild, hfpFillFind, hfpFillFindMask,
                     hfpFillReplace, hfpFillReplaceMask, bluetoothdHfpFillPatched),
     BLUETOOTHD_SITE("extended-advertising check", FeatureAdv, ScopeAnyBuild, extAdvFind, nullptr, extAdvReplace,
                     nullptr, bluetoothdPatched),
-    BLUETOOTHD_SITE("per-set advertising address gate", FeatureAdv, ScopeKnownBuild, advAddressFind,
+    BLUETOOTHD_SITE("per-set advertising address gate", FeatureAdv, ScopeMinimumBuild, advAddressFind,
                     advAddressFindMask, advAddressReplace, advAddressReplaceMask, bluetoothdAddressPatched),
-    BLUETOOTHD_SITE("random address before enable", FeatureAdv, ScopeKnownBuild, advAddressRetryFind,
+    BLUETOOTHD_SITE("random address before enable", FeatureAdv, ScopeMinimumBuild, advAddressRetryFind,
                     advAddressRetryFindMask, advAddressRetryReplace, advAddressRetryReplaceMask,
                     bluetoothdAddressRetryPatched),
 };
@@ -1588,21 +1832,32 @@ bool siteScopeAllows(SiteScope scope, SInt32 build)
     switch (scope) {
     case ScopeAnyBuild:
         return true;
-    case ScopeKnownBuild:
-        return build == Build25G241 || build == Build25G332 || (build == BuildOther && anyBuildPatches);
-    case ScopeRpaBuild:
-        return build == Build25G332;
+    case ScopeMinimumBuild:
+        return build >= Build25G241 || (build == BuildOther && anyBuildPatches);
     }
     return false;
+}
+
+bool commonFeatureAllowed(uint32_t mask)
+{
+    if (__atomic_load_n(&bluetoothdCommonAbi, __ATOMIC_ACQUIRE) & mask)
+        return true;
+    // Preserve already offline-verified legacy page-only behavior when an
+    // older kernel cannot route pre-exec. Unlisted layouts require their own
+    // feature's full-image ABI validation, never another feature's activation.
+    const SInt32 build = __atomic_load_n(&bluetoothdBuild, __ATOMIC_ACQUIRE);
+    return build == Build25G241 || build == Build25G332 || build == Build25G342 ||
+           (build == BuildOther && anyBuildPatches);
 }
 
 bool featureWanted(PatchFeature feature)
 {
     switch (feature) {
     case FeatureAdv:
-        return extAdvPatchEnabled;
+        return extAdvPatchEnabled && commonFeatureAllowed(MTK_BT_COMMON_ADVERTISING);
     case FeatureMsbc:
-        return msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband();
+        return msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband() &&
+               commonFeatureAllowed(MTK_BT_COMMON_MSBC);
     case FeatureRpa:
         return rpaPatchEnabled;
     case FeatureCount:
@@ -1647,8 +1902,6 @@ bool patchBluetoothdPage(void *data)
         }
         if (!featureOn(s.feature) || !mtk_bt_page_apply(page, PAGE_SIZE, (size_t)at, &s.site))
             continue;
-        if (s.counter == &bluetoothdRpaHelpersPatched)
-            __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
         OSIncrementAtomic(s.counter);
         SYSLOG(DRV_NAME, "patched bluetoothd %s (page offset 0x%x)", s.name, (unsigned)at);
         patched = true;
@@ -1674,6 +1927,13 @@ void processPatcher(void *, KernelPatcher &patcher)
     if (!extAdvPatchRouted)
         patcher.clearError();
     SYSLOG(DRV_NAME, "bluetoothd page patches %s", extAdvPatchRouted ? "routed" : "failed to route");
+    if ((extAdvPatchEnabled || msbcPatchEnabled) && rpaPlan && pageLock) {
+        KernelPatcher::RouteRequest execRoute {"_mac_vnode_check_exec", macVnodeCheckExec, orgMacVnodeCheckExec};
+        rpaExecRouted = patcher.routeMultipleLong(KernelPatcher::KernelID, &execRoute, 1);
+        if (!rpaExecRouted)
+            patcher.clearError();
+        SYSLOG(DRV_NAME, "bluetoothd dynamic RPA pre-exec %s", rpaExecRouted ? "routed" : "unavailable");
+    }
     publishCounters();
 }
 
@@ -1695,9 +1955,9 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         leReadyMaskEnabled = getKernelVersion() == KernelVersion::Tahoe &&
                              !checkKernelArgument("-mtkbtnolereadymask");
         extAdvPatchEnabled = !checkKernelArgument("-mtkbtnoextadv");
-        // Child sites call into the helper page; some of their signatures also
-        // match 25G241, which has no helpers, so RPA sites also require the
-        // exact build (ScopeRpaBuild; kern.osversion is still empty here).
+        // RPA is resolved as one complete relocatable plan before exec. Its
+        // minimum build and native ABI guards are checked there, not here
+        // (kern.osversion is still empty at kext initialization).
         rpaPatchEnabled = extAdvPatchEnabled && getKernelVersion() == KernelVersion::Tahoe &&
                           !checkKernelArgument("-mtkbtnorpa");
         msbcPatchEnabled = getKernelVersion() == KernelVersion::Tahoe && !checkKernelArgument("-mtkbtnomsbc");
@@ -1707,6 +1967,11 @@ void Patcher::init(uint32_t rustSelfTestFailed)
         if (verifyFixEnabled) {
             pageLock = IOLockAlloc();
             pageSnapshot = static_cast<uint8_t *>(IOMalloc(PAGE_SIZE));
+            if ((extAdvPatchEnabled || msbcPatchEnabled) && pageLock && pageSnapshot) {
+                rpaPlan = static_cast<mtk_bt_rpa_plan *>(IOMalloc(sizeof(*rpaPlan)));
+                if (rpaPlan)
+                    memset(rpaPlan, 0, sizeof(*rpaPlan));
+            }
             verifyCopyLock = IOLockAlloc();
             verifyCopy = verifyCopyLock ? static_cast<uint8_t *>(IOMalloc(kVerifyCopySize)) : nullptr;
             publishCall = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { publishCounters(); },

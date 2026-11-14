@@ -102,18 +102,24 @@ python3 scripts/test-bt-msbc-page-patches.py
 
 ## Page patches across macOS builds
 
-Every bluetoothd page patch is one entry in `bluetoothdSites`
-(`kext/BT/Patcher.cpp`), searched with a masked matcher in Rust
-(`mtk_bt::page_patch`): rel32/RIP displacements that move between builds are
-wildcards, and a site must match exactly once in its page or it is left
-native. Each site has a scope, keyed on `kern.osversion` (ioreg
-`BluetoothdBuild`):
+The five common sites stay in `bluetoothdSites` (`kext/BT/Patcher.cpp`),
+matched by `mtk_bt::page_patch`. Only relocation operands are wildcards;
+changed opcodes, register/frame offsets and ambiguous matches are refused.
+Both advertising-address sites share the same minimum and feature latch.
 
-| Scope | Sites | Builds |
+| Scope | Sites | Requirements |
 |---|---|---|
-| any build | extended-advertising check, random address before enable | any Tahoe build where the pattern matches |
-| known build | per-set address gate, HFP wideband gate, HFP sender | 25G241, 25G332; others with boot-arg `-mtkbtanybuild` |
-| RPA | Instant Hotspot helpers and their 6 call sites | 25G332 only |
+| common | extended-advertising check | exact function signature; unlisted layouts also need advertising ABI preflight |
+| minimum build | both address fixes, HFP wideband gate/sender | Darwin 25, 25G241 onward; native signatures and verified layout |
+| dynamic RPA | helper plus six children | Darwin 25, 25G332 onward; complete full-image relocation plan |
+
+25G241/25G332 behavior is retained; the five common signatures and the full
+RPA plan validate on the supplied 25G342 binary. Unlisted layouts require
+independent full-image advertising and HFP ABI validation. Only RPA requires
+its seven-edit plan: `-mtkbtnorpa`, a missing RPA signature or exhausted helper
+padding never veto an otherwise valid common feature. `-mtkbtnoextadv` does
+not disable HFP. The build threshold never admits Darwin 26 or an arbitrary
+changed ABI. The explicit `-mtkbtanybuild` override does not bypass RPA preflight.
 
 A feature (advertising, mSBC, RPA) is decided at its first matching site and
 kept for the bluetoothd vnode, so a gate that flips later (mSBC bridge
@@ -126,19 +132,42 @@ Page patches now fail closed: without the verifier restore (hook state not
 1, or `-mtkbtnoverifyfix`) no page is patched (`BluetoothdPagesUnpatched`),
 since a resident patched page breaks its neighbours' page-ins.
 
-To add a new macOS build to the known list, check an unpatched copy of its
-bluetoothd (the live one may show patched cache pages):
+Check an unpatched copy after a macOS update (the live file cache can expose
+patches). Neither command executes or changes the supplied binary:
 
 ```sh
-python3 scripts/test-bt-page-patches.py --binary /path/to/bluetoothd
+python3 -I scripts/test-bt-page-patches.py --binary /path/to/bluetoothd
+python3 -I scripts/test-bt-rpa-resolver.py --binary /path/to/bluetoothd
 ```
 
-It checks every masked site for exactly one same-page match, that the masked
-sites turn the historical 25G241 signatures into their old patches, and that
-the NOPed address call still targets the default-true gate setter. If it
-passes, add the build to `readBluetoothdBuild`. RPA still needs its own arrays
-per build. `-mtkbtanybuild` lets a user try the known-build sites before
-that; RPA is never enabled by it.
+The dynamic resolver (`mtk_bt::rpa`) parses bounded x86_64 Mach-O/FAT metadata,
+finds unique code signatures, decodes native call/RIP operands and checks the
+setter/default-true address gate, caller frames, native mutex and address-getter
+ABI. It finds zero, file-backed executable padding **after all __TEXT sections**,
+excludes load-command pages and recomputes every external helper/child rel32.
+No per-build image addresses or replacement arrays are used at runtime.
+
+`macVnodeCheckExec` preserves the original MAC decision and prepares an owned,
+bounded image from that same referenced vnode **before executable validation**.
+It uses `IO_NODELOCKED`, checks exact UIO completion and frees the UIO/image.
+No vnode reads/resolution happen inside `csValidatePage`. If validation started
+before preparation, the plan remains off rather than activating late. All RPA
+restoration ranges are reserved upfront. Children may fault before the helper;
+after activation, a changed destination rejects executable validation rather
+than silently running a partial group. Another vnode is never given stale edits.
+Downstream patcher writes on it are snapshot/rolled back under the page lock,
+so the excluded vnode really stays native rather than accumulating untracked
+BlueToolFixup changes and failing a later APFS block hash.
+
+Diagnostics: `BluetoothdRpaExecRouted`, `BluetoothdRpaPlanState` (2 ready;
+3 disabled; 4 read failure; 5 signature/ABI failure; 6 too late; 7 no verifier;
+8 no restoration room; 9 vnode failure), `BluetoothdRpaPlanRejected`,
+`BluetoothdCommonAbiVerified` (bit 0 advertising, bit 1 HFP, independent of
+RPA/config enablement), `BluetoothdForeignPagesRolledBack`,
+`BluetoothdRpaHelperAddress`, `BluetoothdRpaSliceOffset`, `BluetoothdRpaImageUUID`.
+A ready plan is static/runtime-integration readiness, not proof of on-air BLE.
+The new hook remains **hardware-unverified**; test discovery, real connection
+and hotspot activation on the target machine.
 
 ## Page patches and the sealed volume
 

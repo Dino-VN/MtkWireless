@@ -9,5 +9,6 @@ pub mod hci;
 pub mod le_features;
 pub mod le_ready;
 pub mod page_patch;
+pub mod rpa;
 pub mod setup;
 pub mod wmt;

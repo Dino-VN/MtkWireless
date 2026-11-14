@@ -359,15 +359,30 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   published from a thread call so they update while bluetoothd crashes.
   Test: `scripts/test-bt-msbc-page-patches.py` (decodes this host's kernel).
   Unverified on hardware.
-- bluetoothd page patches are one table (`bluetoothdSites`, Patcher.cpp)
-  matched by `mtk_bt::page_patch` (masked: displacements are wildcards; one
-  match per page or none). Scopes by `kern.osversion` (`readBluetoothdBuild`):
-  extAdv + advAddressRetry on any build; advAddress, wbs, hfpFill only on
-  listed builds (25G241, 25G332) or with `-mtkbtanybuild`; RPA 25G332 only.
-  Features latch per bluetoothd vnode (`featureLatch`). No verifier restore
-  means no page patch at all (fail closed, `BluetoothdPagesUnpatched`). New
-  build: run `scripts/test-bt-page-patches.py --binary` on an unpatched copy,
-  then list it. Canonical arrays are 25G332's; 25G241's live in the tests.
+- 1.1.1 common bluetoothd patches remain in `bluetoothdSites`, matched by
+  `mtk_bt::page_patch`: displacements only are wildcards; one match per page.
+  Both advertising-address fixes and HFP share the Darwin-25 minimum 25G241,
+  not an exact-build whitelist. Legacy 25G241/25G332/25G342 layouts were
+  checked offline; an unlisted layout needs independent pre-exec advertising
+  and HFP ABI validation (`BluetoothdCommonAbiVerified` bits 1/2), never RPA
+  activation as their gate. RPA opt-out/missing signatures cannot veto common
+  patches; advertising opt-out cannot veto HFP. RPA from 25G332 is resolved by
+  `mtk_bt::rpa`: unique native signatures, decoded call/RIP targets, exact
+  frame/object constraints and safe file-backed __TEXT tail padding after
+  ALL sections. No fixed image RVAs or per-build replacements at runtime;
+  old `*25G332` arrays are compiled out and kept only as test oracles.
+  `macVnodeCheckExec` preserves the original MAC result and reads an owned,
+  bounded image from that same referenced vnode before executable validation.
+  Read with IO_NODELOCKED; check residual bytes and free UIO/image. Never
+  read a vnode or resolve from csValidatePage. Never activate late, keep a
+  callback data pointer, or reuse a plan/restore ledger for another vnode.
+  For an excluded vnode, snapshot/rollback downstream patcher writes so it
+  actually stays native; org alone can leave untracked BlueToolFixup patches.
+  Reserve ALL RPA restoration ranges before readiness; later headroom limits
+  cannot skip a helper or child. A destination mismatch rejects executable
+  validation, never silently executes half a group. Tests:
+  `scripts/test-bt-rpa-resolver.py --binary` and
+  `scripts/test-bt-msbc-page-patches.py`; hardware verification pending.
 - HFP wideband (Tahoe, on unless `-mtkbtnomsbc`; USB `13d3:3610` and
   `0489:e0cd` only, `UsbMsbcScope.hpp`; `kext/BT/msbc`):
   bluetoothd keeps a 33-byte PCM SCO view; `UsbMsbcBridge` maps interface 1
@@ -389,12 +404,12 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   (event read from the interrupt pipe); unanswered, it resets the subsystem
   and downloads once more (Linux `BTMTK_FIRMWARE_DL_RETRY`). Still silent is
   only logged (`MtkBtLog`). Unverified on hardware.
-- Advertising address patches (`advAddress*`) are exact bytes per build:
-  `*25G332` variants for macOS 26.7.2. On 25G332 without them
+- Advertising address patches (`advAddress*`) preserve native displacement
+  bytes with masked signatures. Both have the same minimum/latch. On 25G332 without them
   (`BluetoothdAdvAddress*Patched=0`) bluetoothd looped on `multipleAdvStartCb`
   STATUS 718 and Instant Hotspot failed with `BLE client connect timeout`
   (2026-10-31). After a macOS update run `scripts/test-bt-page-patches.py`.
-- Instant Hotspot outgoing BLE (25G332): chip 0 has no initialized controller
+- Historical Instant Hotspot outgoing BLE diagnosis (25G332): chip 0 has no initialized controller
   privacy backend, while the host AH resolver overwrites the on-air RPA with
   its identity. The accept list then cannot match the phone. `rpa*25G332`
   retains verified legacy ADV_IND RPAs, keeps identity/UUID/security intact,

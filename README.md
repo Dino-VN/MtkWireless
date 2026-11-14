@@ -17,19 +17,29 @@ MT7921 PCIe Wi-Fi `14c3:7961` and its USB Bluetooth `0489:e0cd`, iPhone
 
 ### Supported macOS builds
 
-The Wi-Fi kext needs macOS 26 Tahoe. Several Bluetooth fixes patch
-bluetoothd's code byte for byte, so they only work on the exact macOS builds
-listed here. On any other build they are skipped (ioreg
-`Bluetoothd*Patched = 0`), and the features in the table stop working.
+The Wi-Fi kext needs macOS 26 Tahoe. Starting with **1.1.1**, Bluetooth uses
+masked signatures and a dynamic RPA relocation plan rather than fixed image
+addresses. The minimums are **25G241** for advertising/HFP and **25G332** for
+RPA/Instant Hotspot, within Darwin 25 only. A minimum build is not an ABI
+promise: every native signature, caller/frame constraint and relocation must
+still validate. Unlisted layouts get independent advertising/HFP ABI checks
+before exec; only RPA needs the complete relocation plan. Disabling RPA does
+not disable advertising/HFP, and disabling advertising does not disable HFP.
+Missing or ambiguous signatures leave the affected compatibility path native.
 
 | macOS | Wi-Fi, BT pairing/audio | BLE advertising (AirDrop, Handoff) | HFP mSBC mic | Instant Hotspot |
 |---|---|---|---|---|
 | 26.7.2 (25G332) | ✅ | ✅ | ✅ | ✅ 1.0.7+ |
 | 26.7.1 (25G241) | ✅ | ✅ | ✅ | ❌ no RPA patch for this build: the iPhone is never found over BLE, so the hotspot is not turned on. Update to 26.7.2 |
-| other 26.x | ✅ | ⚠️ untested, patches may not match | ⚠️ untested | ❌ |
+| 26.7.3 (25G342) | ⚠️ | ⚠️ 1.1.1+, binary/native tests pass | ⚠️ tested USB IDs only | ⚠️ 1.1.1+, dynamic plan validates; hardware pending |
+| other 26.x | ⚠️ | ⚠️ minimum + signature/layout checks | ⚠️ minimum + tested USB IDs | ⚠️ complete dynamic preflight required |
 
-Check your build with `sw_vers -buildVersion`. After a macOS update, wait
-for a MtkWireless release that adds the new build.
+Check your build with `sw_vers -buildVersion`. The supplied 25G342 binary
+passed all five common-site checks and all seven dynamic RPA edits. Native
+helper and mocked kernel-hook regressions pass, including exact historical
+25G332 replacement bytes. **The new pre-exec path and 25G342 AirDrop/Hotspot
+are not yet verified on hardware.** After an update, check the patch counters
+and `BluetoothdRpaPlanState = 2` rather than assuming the version alone works.
 
 ### Wi-Fi (`MtkWirelessWifi.kext`)
 
@@ -55,7 +65,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | Firmware load, pairing | ✅ | `Chipset: THIRD_PARTY_DONGLE`, needs the NVRAM keys in [docs/BLUETOOTH.md](docs/BLUETOOTH.md) |
 | Audio (A2DP), AirPods AAC-ELD | ✅ | Read Clock and non-flushable ACL fixes |
 | BLE scanning | ✅ | Mac sees the iPhone |
-| BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs the bluetoothd page patch (macOS 26.7.1 25G241 and 26.7.2 25G332 only), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
+| BLE advertising | ✅ | 0.1.9+: the iPhone sees the Mac. Needs matching bluetoothd page patches (1.1.1+: 25G241 minimum, signature/layout guards), see [docs/BLE-ADVERTISING.md](docs/BLE-ADVERTISING.md) |
 | Mac connecting to an iPhone over BLE | - | |
 | HFP microphone | ✅ | 1.0.2+: 16 kHz mSBC on MT7921 `0489:e0cd` and MT7922 `13d3:3610`, on by default (`-mtkbtnomsbc` off); CVSD on other IDs, see [wideband audio](docs/BLUETOOTH.md#wideband-microphone-tahoe) |
 
@@ -66,7 +76,7 @@ Supported PCI IDs and boot arguments: [docs/WIFI.md](docs/WIFI.md).
 | AirDrop iPhone <-> Mac, iOS 16 -> 27 | ✅ | 1.0.3: faster transfers and large files no longer stall (~4 MB/s average iPhone -> Mac, peaks ~7 MB/s). [Details](docs/AIRDROP-PERFORMANCE.md) |
 | Handoff, Universal Clipboard, AirPlay to Mac | ✅ | |
 | iPhone Mirroring with [Mirra](https://github.com/eiyuumiru/Mirra) | ⚠️ | Experimental on Intel: authentication, decoder creation and first video frame observed on 26.7.2 (25G332). Requires a separate jailbroken bridge iPhone; see below. MtkWireless alone does not supply T2/Secure Enclave support. |
-| Instant Hotspot (same iCloud / Family) | ✅ | 1.0.7+, **macOS 26.7.2 (25G332) only**: the BLE RPA patch exists only for that build. The Mac sends Apple's hotspot IEs in the Association Request, so the iPhone starts the WPA2 handshake. See [diagnosis](docs/INSTANT-HOTSPOT.md). |
+| Instant Hotspot (same iCloud / Family) | ✅ | Hardware-verified on 25G332. **1.1.1+** uses dynamic BLE RPA relocation from 25G332 onward when the complete native layout validates; newer builds remain hardware-unverified. The Mac sends Apple's hotspot IEs in the Association Request, so the iPhone starts the WPA2 handshake. See [diagnosis](docs/INSTANT-HOTSPOT.md). |
 | Auto Unlock, Sidecar, Continuity Camera, Continuity Microphone  | — | |
 
 ### iPhone Mirroring with Mirra
