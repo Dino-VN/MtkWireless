@@ -219,18 +219,34 @@ IOReturn USBDeviceController::readWMTEvent(void *buf, uint32_t bufSize, uint32_t
 
 namespace {
 
+/* Heap context shared by the submitter and the USB completion (two
+ * references), so a completion delivered after the timeout, or never
+ * (device gone during the abort), cannot touch a dead stack frame or a
+ * released buffer. */
 struct EventRead {
+    volatile SInt32 refs;
     volatile UInt32 done;
     IOReturn status;
     uint32_t length;
+    IOBufferMemoryDescriptor *md;
 };
+
+void eventReadRelease(EventRead *read)
+{
+    if (OSDecrementAtomic(&read->refs) != 1)
+        return;
+    read->md->complete(kIODirectionIn);
+    read->md->release();
+    IOFree(read, sizeof(*read));
+}
 
 void eventReadComplete(void *, void *parameter, IOReturn status, uint32_t bytesTransferred)
 {
     auto *read = static_cast<EventRead *>(parameter);
     read->status = status;
     read->length = bytesTransferred;
-    OSCompareAndSwap(0, 1, &read->done);
+    __atomic_store_n(&read->done, 1, __ATOMIC_RELEASE);
+    eventReadRelease(read);
 }
 
 } // namespace
@@ -249,36 +265,42 @@ IOReturn USBDeviceController::readHCIEvent(void *buf, uint32_t bufSize, uint32_t
         md->release();
         return ret;
     }
-    // Interrupt pipes take no completion timeout: wait here, then abort
-    // synchronously so the completion has run before `read` goes away.
-    EventRead read {};
+    auto *read = static_cast<EventRead *>(IOMalloc(sizeof(EventRead)));
+    if (!read) {
+        md->complete(kIODirectionIn);
+        md->release();
+        return kIOReturnNoMemory;
+    }
+    *read = EventRead { 2, 0, kIOReturnSuccess, 0, md };
+    // Interrupt pipes take no completion timeout: wait here, then abort.
     IOUSBHostCompletion completion = {
         .owner = this,
         .action = eventReadComplete,
-        .parameter = &read,
+        .parameter = read,
     };
     ret = m_pInterruptReadPipe->io(md, capacity, &completion, 0);
-    if (ret == kIOReturnSuccess) {
+    if (ret != kIOReturnSuccess) {
+        eventReadRelease(read); // the completion's reference: it will not run
+    } else {
         uint64_t deadline = 0, now = 0;
         clock_interval_to_deadline(timeout, kMillisecondScale, &deadline);
-        while (!read.done) {
+        while (!__atomic_load_n(&read->done, __ATOMIC_ACQUIRE)) {
             clock_get_uptime(&now);
             if (now >= deadline)
                 break;
             IOSleep(5);
         }
-        if (!read.done)
+        if (!__atomic_load_n(&read->done, __ATOMIC_ACQUIRE))
             m_pInterruptReadPipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnTimeout);
-        ret = read.done ? read.status : kIOReturnTimeout;
+        ret = __atomic_load_n(&read->done, __ATOMIC_ACQUIRE) ? read->status : kIOReturnTimeout;
     }
     if (ret == kIOReturnSuccess) {
-        uint32_t n = min(min(read.length, bufSize), capacity);
+        uint32_t n = min(min(read->length, bufSize), capacity);
         md->readBytes(0, buf, n);
         if (size)
             *size = n;
     }
-    md->complete(kIODirectionIn);
-    md->release();
+    eventReadRelease(read);
     return ret;
 }
 

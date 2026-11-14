@@ -45,7 +45,7 @@ bool randomAddressHack;
 bool leShimEnabled;
 bool leReadyMaskEnabled;
 IOLock *leLock;
-volatile SInt32 readClockRewritten, aclPbRewritten;
+volatile SInt32 readClockRewritten, aclPbRewritten, aclPipesBound;
 volatile SInt32 leCommands, leCompletions, leErrors;
 bool extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 bool rpaPatchEnabled, rpaHelpersReady;
@@ -57,6 +57,8 @@ enum BluetoothdBuild : SInt32 { BuildUnread = 0, BuildOther = 1, Build25G241 = 2
 volatile SInt32 bluetoothdBuild;
 char bluetoothdBuildName[16];
 volatile SInt32 bluetoothdSitesAmbiguous;
+// mSBC latched Off before any MediaTek controller was probed (boot order).
+volatile SInt32 msbcOffBeforeProbe;
 // bluetoothd pages left native: no verifier restore, or no patch-range room.
 volatile SInt32 bluetoothdPagesUnpatched;
 // Per-feature decision for the current bluetoothd vnode (FeatureLatch), under pageLock.
@@ -98,6 +100,7 @@ void publishCounters()
     number("RustSelfTestFailed", rustFailed);
     number("ReadClockRewritten", (uint32_t)readClockRewritten);
     number("AclPbRewritten", (uint32_t)aclPbRewritten);
+    number("AclPipesBound", (uint32_t)aclPipesBound);
     d->setObject("LeFeaturesShimEnabled", leShimEnabled ? kOSBooleanTrue : kOSBooleanFalse);
     number("LeFeaturesCommands", (uint32_t)leCommands);
     number("LeFeaturesCompletions", (uint32_t)leCompletions);
@@ -177,6 +180,7 @@ void publishCounters()
     // 2 bits per feature (adv, mSBC, RPA): 0 undecided, 1 on, 2 off.
     number("BluetoothdPatchFeatures", (uint32_t)(featureLatch[0] | featureLatch[1] << 2 | featureLatch[2] << 4));
     number("BluetoothdSitesAmbiguous", (uint32_t)bluetoothdSitesAmbiguous);
+    number("BluetoothdMsbcOffBeforeProbe", (uint32_t)msbcOffBeforeProbe);
     number("BluetoothdPagesUnpatched", (uint32_t)bluetoothdPagesUnpatched);
     d->setObject("BluetoothdRpaEnabled",
                  rpaPatchEnabled && verifyFixRouted && build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
@@ -241,9 +245,12 @@ bool readRequestBytes(void *data, IOMemoryDescriptor *descriptor, uint8_t *out, 
 
 #pragma mark - HCI Read Clock
 
-void fixReadClock(StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor)
+/* Only HCI commands (class, host to device) to the loaded MediaTek
+ * controller; other devices' 6-byte EP0 requests are left untouched. */
+void fixReadClock(IOUSBHostDevice *device, StandardUSB::DeviceRequest &request, void *data,
+                  IOMemoryDescriptor *descriptor)
 {
-    if (request.wLength != 6)
+    if (request.wLength != 6 || (request.bmRequestType & 0xE0) != 0x20 || !isLoadedMediaTek(device))
         return;
     if (data) {
         if (mtk_bt_fix_read_clock(request.bmRequestType, static_cast<uint8_t *>(data), 6)) {
@@ -266,10 +273,48 @@ void fixReadClock(StandardUSB::DeviceRequest &request, void *data, IOMemoryDescr
 
 #pragma mark - Non-flushable ACL
 
+/* HCI ACL bulk OUT pipes of loaded MediaTek controllers. Pipes are only
+ * created by IOUSBHostInterface::copyPipe, whose route binds them here, so
+ * the ACL rewrite never touches another device's bulk data (a USB-MIDI pitch
+ * bend has the same 4-byte shape). Addresses are lookup keys only; a reused
+ * address is unbound when copyPipe hands it out again. */
+constexpr size_t kAclPipeSlots = 4;
+IOUSBHostPipe *aclPipes[kAclPipeSlots];
+volatile SInt32 aclPipeNext;
+
+bool isMediaTekAclPipe(IOUSBHostPipe *pipe)
+{
+    for (auto &slot : aclPipes)
+        if (__atomic_load_n(&slot, __ATOMIC_ACQUIRE) == pipe)
+            return true;
+    return false;
+}
+
+void bindAclPipe(IOUSBHostPipe *pipe, bool mediatek)
+{
+    for (auto &slot : aclPipes) {
+        IOUSBHostPipe *expected = pipe;
+        __atomic_compare_exchange_n(&slot, &expected, nullptr, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    }
+    if (!mediatek)
+        return;
+    OSIncrementAtomic(&aclPipesBound);
+    for (auto &slot : aclPipes) {
+        IOUSBHostPipe *expected = nullptr;
+        if (__atomic_compare_exchange_n(&slot, &expected, pipe, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+    }
+    // Full: earlier controllers re-enumerated (wake with USB power cut).
+    const UInt32 n = (UInt32)OSIncrementAtomic(&aclPipeNext);
+    __atomic_store_n(&aclPipes[n % kAclPipeSlots], pipe, __ATOMIC_RELEASE);
+}
+
 void fixAclFlush(IOUSBHostPipe *pipe, IOMemoryDescriptor *buffer, uint32_t length)
 {
+    if (!buffer || !isMediaTekAclPipe(pipe))
+        return;
     const StandardUSB::EndpointDescriptor *ep = pipe->getEndpointDescriptor();
-    if (!buffer || !ep || !mtk_bt_acl_candidate(ep->bmAttributes, ep->bEndpointAddress, length) ||
+    if (!ep || !mtk_bt_acl_candidate(ep->bmAttributes, ep->bEndpointAddress, length) ||
         buffer->prepare(kIODirectionInOut) != kIOReturnSuccess)
         return;
     uint8_t hdr[4], byte1;
@@ -502,11 +547,11 @@ IOReturn deviceRequest(void *that, IOService *provider, StandardUSB::DeviceReque
                        IOMemoryDescriptor *descriptor, unsigned int &length, IOUSBHostCompletion *completion,
                        unsigned int timeout)
 {
-    fixReadClock(request, data, descriptor);
+    auto *device = static_cast<IOUSBHostDevice *>(that);
+    fixReadClock(device, request, data, descriptor);
     if (randomAddressHack)
         randomAddress(that, provider, request, data, descriptor, timeout);
 
-    auto *device = static_cast<IOUSBHostDevice *>(that);
     const uint32_t readyCommand = leReadyCommand(device, request, data, descriptor);
     const uint64_t token = (!completion || completion->action) ? leArm(device, request, data, descriptor) : 0;
     LeCompletion *context = nullptr;
@@ -652,29 +697,37 @@ IOReturn getPipeProperties(IOService *client, uint8_t pipeRef, uint64_t *directi
     return result;
 }
 
-/* Remember which interrupt IN pipe carries HCI events of a loaded MediaTek
- * controller, and let the mSBC bridge see the SCO pipes (0x03/0x83). Pipe
- * addresses are lookup keys only. */
+/* Remember which interrupt IN pipe carries HCI events and which bulk OUT pipe
+ * carries ACL data of a loaded MediaTek controller, and let the mSBC bridge
+ * see the SCO pipes (0x03/0x83). Pipe addresses are lookup keys only: every
+ * pipe handed out first unbinds stale mappings of its address. */
 IOUSBHostPipe *copyPipe(IOUSBHostInterface *interface, uint8_t address)
 {
     IOUSBHostPipe *pipe = FunctionCast(copyPipe, orgCopyPipe)(interface, address);
     if ((address == 0x03 || address == 0x83) && isMsbcReady() && msbcBridge &&
         msbcBridge->observePipe(interface, pipe))
         msbcBridge->publishStatus();
-    if (!leShimEnabled || !pipe)
+    if (!pipe)
         return pipe;
     const auto *ep = pipe->getEndpointDescriptor();
-    const auto *desc = interface->getInterfaceDescriptor();
-    if (!ep || (ep->bmAttributes & 3) != 3 || !(ep->bEndpointAddress & 0x80) || !desc ||
-        desc->bInterfaceClass != 0xE0 || desc->bInterfaceSubClass != 1 || desc->bInterfaceProtocol != 1)
-        return pipe;
+    const auto *desc = interface ? interface->getInterfaceDescriptor() : nullptr;
+    const bool hci = ep && desc && desc->bInterfaceClass == 0xE0 && desc->bInterfaceSubClass == 1 &&
+                     desc->bInterfaceProtocol == 1;
+    const bool eventPipe = hci && (ep->bmAttributes & 3) == 3 && (ep->bEndpointAddress & 0x80);
+    const bool aclPipe = hci && (ep->bmAttributes & 3) == 2 && !(ep->bEndpointAddress & 0x80);
     IOUSBHostDevice *device = nullptr;
-    for (IOService *p = interface->getProvider(); p && !device; p = p->getProvider())
-        device = OSDynamicCast(IOUSBHostDevice, p);
-    const uint64_t id = device ? device->getRegistryEntryID() : 0;
-    IOLockLock(leLock);
-    mtk_bt_le_bind_event_pipe(pipe, id, isLoadedMediaTek(device));
-    IOLockUnlock(leLock);
+    if (eventPipe || aclPipe)
+        for (IOService *p = interface->getProvider(); p && !device; p = p->getProvider())
+            device = OSDynamicCast(IOUSBHostDevice, p);
+    const bool mediatek = isLoadedMediaTek(device);
+    bindAclPipe(pipe, aclPipe && mediatek);
+    if (leShimEnabled) {
+        // Any other pipe (id 0, false) only drops a stale mapping of this address.
+        IOLockLock(leLock);
+        mtk_bt_le_bind_event_pipe(pipe, eventPipe && device ? device->getRegistryEntryID() : 0,
+                                  eventPipe && mediatek);
+        IOLockUnlock(leLock);
+    }
     return pipe;
 }
 
@@ -1448,9 +1501,12 @@ void installVerifyOp(vnode_t vp)
                 // vfs_fsadd allocates the vectors on the heap; lift write
                 // protection anyway in case a kernel keeps them read-only.
                 const bool writable = MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock) == KERN_SUCCESS;
-                if (writable)
+                // A failed enable already undid itself; disabling again would
+                // unlock kernelWriteLock twice.
+                if (writable) {
                     __atomic_store_n(slot, &verifyOp, __ATOMIC_RELEASE);
-                MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                    MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+                }
                 state = writable ? VerifyOpInstalled : VerifyOpNoWrite;
             }
         }
@@ -1620,8 +1676,13 @@ bool featureWanted(PatchFeature feature)
  */
 bool featureOn(PatchFeature feature)
 {
-    if (featureLatch[feature] == LatchUndecided)
+    if (featureLatch[feature] == LatchUndecided) {
         featureLatch[feature] = featureWanted(feature) ? LatchOn : LatchOff;
+        // Kept Off (a half-patched pair is worse), but say why WBS fell back to CVSD.
+        if (feature == FeatureMsbc && featureLatch[feature] == LatchOff && msbcPatchEnabled &&
+            !msbcControllerScope.observed())
+            msbcOffBeforeProbe = 1;
+    }
     return featureLatch[feature] == LatchOn;
 }
 
