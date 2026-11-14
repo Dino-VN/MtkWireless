@@ -148,20 +148,46 @@ It collects:
 - full IORegistry plus before/after Wi-Fi, AWDL, BT loader, page-patch, mSBC,
   verifier and LE-readiness counters;
 - network interfaces, routes, DHCP, DNS, AWDL neighbors and relevant daemon state;
-- the on-disk `bluetoothd` binary/signature, recent crash/panic reports, Lilu logs
-  and **existing** HCI traces (last 3 days);
-- Bluetooth, Wi-Fi, AirDrop/Continuity, mDNS, audio and kernel logs (last **1 hour**),
-  plus a native `.logarchive` of that window, capped at **512 MB**;
-- relevant kext bundles and OpenCore Kernel/security/ACPI/driver sections from
+- the on-disk `bluetoothd` binary/signature, recent crash/panic reports and Lilu
+  logs (last 3 days); existing HCI traces are **listed**, not copied by default;
+- focused Bluetooth, Wi-Fi, AirDrop/Continuity/mDNS and driver log samples from
+  the last **5 minutes**, at default/error/fault levels;
+- relevant kext **metadata** and OpenCore Kernel/security/ACPI/driver sections from
   **already-mounted** EFIs. It does not mount EFI or copy the full `config.plist`.
+
+**Bounded by default:** each text sample keeps at most **1 MiB output**, reads at
+most **16 MiB input**, and gets **30 seconds**. The recent-log group has a
+**90-second total budget**. Only the first three copies of each repeated message
+are kept, with counts and timestamp ranges in the summary. Kernel/kext loading
+samples come **before** slower daemon queries, so they survive an interrupted run.
+Full kernel dumps, info/debug output, native archives, raw HCI traces and kext
+bundle copies are not included by default.
+
+Copied crash/Lilu files are sorted newest first: up to 10 per list, 4 MiB per
+file and 16 MiB combined. Larger files are skipped, not truncated into invalid
+reports/traces; their paths/sizes and reasons remain in the metadata and
+`skipped.tsv`. The on-disk `bluetoothd` binary and structured hardware/IORegistry
+snapshots are kept for build-specific diagnosis.
 
 No Xcode, Python or extra helper is needed. It does **not** restart daemons,
 load/unload kexts, scan, enable HCI/packet tracing, change preferences or upload
-anything. Commands that fail or time out are recorded in `commands.tsv`; other
-collection continues, and the ZIP is tested before success is reported.
+anything. `commands.tsv` distinguishes failures/time-budget exhaustion (**124**)
+from intentionally limited samples (**125**); each sample has `.stats.txt` and,
+when limited, `.limit` metadata. Collection continues and the ZIP is tested before
+success is reported.
 
 For a local copy: `bash scripts/collect-logs.sh`. Options also work after the
-remote command: `sudo bash -c "$script" -- --last 6h --no-logarchive --notes "AirDrop Mac to iPhone stalls"`.
+remote command, for example:
+
+```sh
+sudo bash -c "$script" -- --last 15m --verbose --notes "AirDrop Mac to iPhone stalls"
+```
+
+`--logarchive` opts into a native archive with a **64 MB log-data budget**;
+macOS symbol metadata can make the archive larger. `--include-hci` and
+`--include-kexts` opt into existing HCI traces (within the copy budget) and kext
+bundle copies. These can make the ZIP larger; `--verbose` still obeys text-sample
+limits. `--no-logarchive` is accepted for compatibility and is now the default.
 The uncompressed folder is kept alongside the ZIP.
 
 **Privacy:** the bundle is not anonymized. It can contain SSIDs, MAC/IP addresses,

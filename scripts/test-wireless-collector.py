@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import plistlib
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -63,7 +64,11 @@ if name == "id":
 elif name == "dscl":
     print("NFSHomeDirectory: " + os.environ["MOCK_HOME"])
 elif name == "stat":
-    print("tester")
+    if args[1] == "%m %z":
+        metadata = Path(args[-1]).stat()
+        print(int(metadata.st_mtime), metadata.st_size)
+    else:
+        print("tester")
 elif name == "chown":
     pass  # Fixtures already belong to the real unprivileged test runner.
 elif name == "sudo":
@@ -96,7 +101,15 @@ elif name == "log":
     if os.environ.get("MOCK_DENIED"):
         print("simulated log permission denial", file=sys.stderr)
         sys.exit(77)
+    if args[0] == "show" and os.environ.get("MOCK_FLOOD") and args[-1] == 'process == "bluetoothd" OR process == "BlueTool"':
+        try:
+            for i in range(100000):
+                print(f"2026-11-14 10:00:00.000 E bluetoothd[123:456] unique error {i}: " + "x" * 120)
+        except BrokenPipeError:
+            os._exit(0)
+        sys.exit(0)
     if args[0] == "collect":
+        assert args[args.index("--size") + 1] == "64m", args
         archive = Path(args[args.index("--output") + 1])
         archive.mkdir(mode=0o700)
         (archive / "Info.plist").write_bytes(plistlib.dumps({"fixture": True}))
@@ -239,10 +252,10 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
                 assert zipped.read(prefix + "bluetooth/bluetoothd") == (base / "bluetoothd-fixture").read_bytes()
                 assert plistlib.loads(zipped.read(prefix + "ioreg/AirportMtkWlan-before.plist"))
                 assert plistlib.loads(zipped.read(prefix + "ioreg/resources-after.plist"))
-                assert any(name.endswith("trace with spaces.pklg") for name in names)
+                assert any(name.endswith("trace with spaces.pklg") for name in names) == ("--include-hci" in options)
                 assert any(name.endswith("bluetoothd-test report.ips") for name in names)
                 assert any(name.endswith("Lilu_test.txt") for name in names)
-                assert any(name.endswith("MtkWirelessWifi.kext/Contents/Info.plist") for name in names)
+                assert any(name.endswith("MtkWirelessWifi.kext/Contents/Info.plist") for name in names) == ("--include-kexts" in options)
                 assert any(name.endswith("efi-1-Kernel.plist") for name in names)
                 assert not any(name.endswith("config.plist") for name in names)
                 for name in names:
@@ -250,9 +263,21 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
                         data = zipped.read(name)
                         assert b"DO_NOT_EXPORT_CONFIG_ID" not in data and b"DO_NOT_EXPORT_NVRAM_SECRET" not in data, name
                 has_archive = any("system.logarchive/" in name for name in names)
-                assert has_archive == ("--no-logarchive" not in options and not env.get("MOCK_DENIED"))
-            boot_calls = [call for call in calls if call["tool"] == "log" and "boot" in call["args"]]
-            assert boot_calls and "KernelManagement" in boot_calls[0]["args"][-1]
+                assert has_archive == ("--logarchive" in options and not env.get("MOCK_DENIED"))
+                assert (prefix + "logs/kernel.log" in names) == ("--verbose" in options)
+                for name in names:
+                    if name + ".stats.txt" in names:
+                        assert len(zipped.read(name)) <= 1048576, name
+            log_calls = [call for call in calls if call["tool"] == "log" and call["args"][0] == "show"]
+            assert log_calls and "boot" in log_calls[0]["args"] and "KernelManagement" in log_calls[0]["args"][-1]
+            for call in log_calls:
+                assert ("--info" in call["args"]) == ("--verbose" in options), call
+                assert ("--debug" in call["args"]) == ("--verbose" in options), call
+                if "--last" not in options and "boot" not in call["args"]:
+                    assert call["args"][call["args"].index("--last") + 1] == "5m", call
+            if env.get("MOCK_FLOOD"):
+                assert statuses["logs/bluetoothd.log"] == 125
+                assert (folder / "logs/bluetoothd.log.limit").read_text().strip() == "output"
             assert any(call["tool"] == "networksetup" and call["args"] == ["-getairportpower", "en1"] for call in calls)
             assert not any(call["tool"] == "networksetup" and call["args"] == ["-getairportpower", "en0"] for call in calls)
             if env.get("MOCK_DENIED"):
@@ -274,12 +299,190 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
         print("PASS:", label)
 
 
+def copy_tests():
+    helpers = SOURCE[SOURCE.index("info() {"):SOURCE.index('info "Output: $OUT"')]
+    copy_helpers = SOURCE[SOURCE.index("copy_index=0\n"):SOURCE.index("\ncrash_index=0\n")]
+    with tempfile.TemporaryDirectory(prefix="mtk-copy-test-") as temporary:
+        base = Path(temporary)
+        data = base / "sources"
+        data.mkdir()
+        out = base / "output"
+        for category in ("crashes", "count"):
+            (out / category).mkdir(parents=True)
+        (out / "commands.tsv").write_text("started\tseconds\texit_status\toutput\tcommand\n")
+        candidates = []
+        newest = data / "newest space\nand\ttab report.ips"
+        newest.write_bytes(b"MOCK newest report")
+        os.utime(newest, (2000000000, 2000000000))
+        candidates.append(newest)
+        oversized = data / "MOCK oversized.ips"
+        with oversized.open("wb") as handle:
+            handle.truncate(4194305)
+        os.utime(oversized, (1999999999, 1999999999))
+        candidates.append(oversized)
+        for index in range(6):
+            candidate = data / f"MOCK budget-{index}.ips"
+            with candidate.open("wb") as handle:
+                handle.write(f"MOCK report {index}".encode())
+                handle.truncate(3 * 1024 * 1024)
+            os.utime(candidate, (1999999900 - index, 1999999900 - index))
+            candidates.append(candidate)
+        (out / "crashes/list.nul").write_bytes(b"".join(os.fsencode(path) + b"\0" for path in candidates))
+        small = []
+        for index in range(12):
+            candidate = data / f"MOCK count-{index:02d}.ips"
+            candidate.write_bytes(b"MOCK small report")
+            os.utime(candidate, (1999999800 + index, 1999999800 + index))
+            small.append(candidate)
+        (out / "count/list.nul").write_bytes(b"".join(os.fsencode(path) + b"\0" for path in small))
+        header = f'''set -uo pipefail
+export LC_ALL=C
+OUT={shlex.quote(str(out))}
+ZIP_FILE="$OUT.zip"
+OWNER_UID={os.getuid()}
+OWNER_GID={os.getgid()}
+ROOT_OK=0
+ACTIVE_PID=""
+VERBOSE=0
+LOG_END=0
+MAX_LOG_BYTES=1048576
+MAX_LOG_INPUT=16777216
+MAX_COPY_FILE=4194304
+MAX_COPY_TOTAL=16777216
+COPIED_BYTES=0
+'''
+        body = header + helpers + copy_helpers + '''
+copy_list crashes/list.nul crashes
+COPIED_BYTES=0
+copy_list count/list.nul count
+'''
+        result = subprocess.run(["/bin/bash", "-c", body], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (result.stdout, result.stderr)
+        reports = list((out / "crashes").glob("*.ips"))
+        assert len(reports) == 6, reports
+        assert sum(path.stat().st_size for path in reports) <= 16777216
+        assert any(path.read_bytes() == b"MOCK newest report" for path in reports)
+        skipped = (out / "crashes/skipped.tsv").read_text()
+        assert "file_over_4_MiB" in skipped and "total_over_16_MiB" in skipped, skipped
+        count_reports = list((out / "count").glob("*.ips"))
+        assert len(count_reports) == 10
+        assert any(path.name.endswith("count-11.ips") for path in count_reports)
+        assert not any(path.name.endswith("count-00.ips") for path in count_reports)
+        assert (out / "count/skipped.tsv").read_text().count("count_limit") == 2
+    print("PASS: newest-first copies, NUL filenames, oversized-file skips, aggregate byte budget and count limit")
+
+
+def stream_tests():
+    """Exercise the production head/awk filter, not a Python reimplementation."""
+    helpers = SOURCE[SOURCE.index("info() {"):SOURCE.index('info "Output: $OUT"')]
+    with tempfile.TemporaryDirectory(prefix="mtk-stream-test-") as temporary:
+        base = Path(temporary)
+        producer = base / "producer.py"
+        producer.write_text(f"#!{sys.executable} -I\n" + '''import os
+from pathlib import Path
+import signal
+import sys
+import time
+Path(sys.argv[2]).write_text(str(os.getpid()))
+mode = sys.argv[1]
+if mode == "normal":
+    for i in range(20):
+        print(f"2026-11-14 10:00:{i:02d}.000 E bluetoothd[123:{i}] repeated error")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    if mode == "unique":
+        for i in range(10000):
+            print(f"2026-11-14 10:00:00.000 E bluetoothd[123:456] error {i}: " + "x" * 150)
+    elif mode == "input":
+        sys.stdout.write("2026-11-14 10:" + "x" * 131072)
+    elif mode == "timestamp":
+        print("2026-11-14 10:" + "x" * 20000 + " E malformed timestamp")
+    sys.stdout.flush()
+    if mode == "timestamp":
+        sys.exit(0)
+except BrokenPipeError:
+    pass
+# Deliberately ignore pipe closure and TERM. The collector must kill/reap us.
+while True:
+    time.sleep(0.01)
+''')
+        producer.chmod(0o700)
+        for mode, expected in (("normal", 0), ("unique", 125), ("input", 125), ("timestamp", 125), ("expired", 124)):
+            out = base / mode
+            (out / "logs").mkdir(parents=True, mode=0o700)
+            (out / "commands.tsv").write_text("started\tseconds\texit_status\toutput\tcommand\n")
+            pid_file = base / (mode + ".pid")
+            script = base / (mode + ".sh")
+            header = f'''#!/bin/bash
+set -uo pipefail
+export LC_ALL=C
+OUT={shlex.quote(str(out))}
+ZIP_FILE="$OUT.zip"
+OWNER_UID={os.getuid()}
+OWNER_GID={os.getgid()}
+ROOT_OK=0
+ACTIVE_PID=""
+VERBOSE=0
+LOG_END=0
+MAX_LOG_BYTES=8192
+MAX_LOG_INPUT=65536
+'''
+            if mode == "expired":
+                action = f'''SECONDS=3
+LOG_END=1
+log_show logs/sample.log 5m 'process == "bluetoothd"'
+'''
+            else:
+                action = f'''capture logs/sample.log 5 stream_log "$OUT/logs/sample.log.limit" "$OUT/logs/sample.log.stats.txt" {shlex.quote(str(producer))} {mode} {shlex.quote(str(pid_file))}
+'''
+            script.write_text(header + helpers + action + 'capture after.txt 5 /usr/bin/printf "still running\\n"\n')
+            process = subprocess.Popen(["/bin/bash", str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, start_new_session=True)
+            try:
+                stdout, stderr = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                stdout, stderr = process.communicate()
+                raise AssertionError((mode, "stream timeout", stdout, stderr))
+            assert process.returncode == 0, (mode, stdout, stderr)
+            rows = (out / "commands.tsv").read_text().splitlines()
+            sample_errors = (out / "logs/sample.log.stderr.txt").read_text() if mode != "expired" else ""
+            assert int(rows[1].split("\t")[2]) == expected, (mode, rows, sample_errors, stderr)
+            assert (out / "logs/sample.log").stat().st_size <= 8192, mode
+            assert (out / "after.txt").read_text() == "still running\n"
+            if mode == "normal":
+                content = (out / "logs/sample.log").read_text()
+                assert sum(line.startswith("2026-11-14") and line.endswith("repeated error") for line in content.splitlines()) == 3, content
+                assert "suppressed 17 repeats" in content
+            elif mode != "expired":
+                assert (out / "logs/sample.log.limit").read_text().strip() == ("input" if mode == "input" else "output")
+            else:
+                assert not pid_file.exists()
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                until = time.monotonic() + 2
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    assert time.monotonic() < until, (mode, "producer leaked", pid)
+                    time.sleep(0.01)
+    print("PASS: native repeat summaries, output/input caps, enormous lines, producer reaping and exhausted-budget skips")
+
+
 if __name__ == "__main__":
     cases = [
         ("full", "sudo/bash -c, invoking user's Desktop, full bundle, native ZIP, private mode and EFI filtering",
          {"options": ("--notes", "AirDrop Mac to iPhone stalls"), "via_command": True}),
         ("reduced", "declined sudo, custom time window, no-logarchive and valid reduced bundle",
          {"options": ("--last", "7d", "--no-logarchive"), "switches": {"MOCK_EUID": "1000", "MOCK_DENIED": "1"}}),
+        ("attachments", "archives, HCI traces, debug levels and kext copies are explicitly opt-in",
+         {"options": ("--verbose", "--logarchive", "--include-hci", "--include-kexts")}),
+        ("flood", "a flooded Bluetooth log is capped and the ZIP still completes", {"switches": {"MOCK_FLOOD": "1"}}),
+        ("stream", "native stream limits", {}),
+        ("copies", "native file-copy limits", {}),
         ("failure", "tool failure is reported without losing the other diagnostics", {"switches": {"MOCK_FAIL": "wdutil"}}),
         ("timeout", "timeout kills the tool tree and records partial output",
          {"switches": {"MOCK_HANG": "system_profiler"}, "timeout_tool": True}),
@@ -290,6 +493,11 @@ if __name__ == "__main__":
     assert not selected - {case[0] for case in cases}, selected
     for key, label, arguments in cases:
         if not selected or key in selected:
-            run_case(label, **arguments)
+            if key == "stream":
+                stream_tests()
+            elif key == "copies":
+                copy_tests()
+            else:
+                run_case(label, **arguments)
     print("PASS: shell syntax, help, rejected options and read-only command contracts")
     print("Not exercised: real sudo/TCC, actual hardware/log availability, live macOS logarchive or EFI discovery.")

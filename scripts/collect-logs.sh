@@ -7,8 +7,17 @@ umask 077
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export LC_ALL=C
 
-LAST=1h
-ARCHIVE=1
+LAST=5m
+ARCHIVE=0
+VERBOSE=0
+INCLUDE_HCI=0
+INCLUDE_KEXTS=0
+MAX_LOG_BYTES=1048576
+MAX_LOG_INPUT=16777216
+MAX_COPY_FILE=4194304
+MAX_COPY_TOTAL=16777216
+COPIED_BYTES=0
+LOG_END=0
 OUTPUT_BASE=""
 NOTES=""
 OUT=""
@@ -21,13 +30,18 @@ STARTED=$(/bin/date '+%Y-%m-%d %H:%M:%S%z')
 
 usage() {
     printf '%s\n' \
-        'Usage: collect-logs.sh [--last 1h] [--no-logarchive] [--output DIR] [--notes TEXT]' \
-        '  --last WINDOW      Recent daemon/kernel logs: 1m through 7d (default 1h).' \
-        '  --no-logarchive    Skip the native .logarchive (otherwise capped at 512 MB).' \
+        'Usage: collect-logs.sh [--last 5m] [--verbose] [--logarchive] [--output DIR] [--notes TEXT]' \
+        '  --last WINDOW      Recent logs: 1m through 7d (default 5m).' \
+        '  --verbose          Include info/debug messages and extra log categories.' \
+        '  --logarchive       Native archive: 64 MB log-data budget; symbols can add size.' \
+        '  --no-logarchive    Skip the archive (the default; kept for compatibility).' \
+        '  --include-hci      Copy existing HCI traces that fit the file-copy budget.' \
+        '  --include-kexts    Copy relevant kext bundles (metadata is always collected).' \
         '  --output DIR       Create a new bundle in DIR (default: your Desktop).' \
         '  --notes TEXT       Describe the failure, time, devices and transfer direction.' \
-        'Kernel/kext loading logs cover the current boot; crash/HCI/Lilu files cover 3 days.' \
-        'No uploads, no mtkctl, no Xcode/Python dependencies, no system-setting changes.'
+        'Each text-log sample: 1 MiB output, 16 MiB input, 30 seconds, repeats summarized.' \
+        'Kernel/kext loading evidence comes first; recent crash/Lilu/HCI files cover 3 days.' \
+        'No uploads, no extra tools, no Xcode/Python dependencies, no system-setting changes.'
 }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -39,7 +53,11 @@ while [ $# -gt 0 ]; do
                 --notes) NOTES=$2 ;;
             esac
             shift 2 ;;
+        --verbose) VERBOSE=1; shift ;;
+        --logarchive) ARCHIVE=1; shift ;;
         --no-logarchive) ARCHIVE=0; shift ;;
+        --include-hci) INCLUDE_HCI=1; shift ;;
+        --include-kexts) INCLUDE_KEXTS=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -141,7 +159,8 @@ trap interrupted INT TERM HUP
 # Keep stderr separate so .plist/.spx and binary files remain parseable.
 capture() {
     local relative=$1 budget=$2; shift 2
-    local began=$SECONDS timestamp result timed_out=0 quoted
+    local began=$SECONDS timestamp result raw_result timed_out=0 quoted limit_file=""
+    [ "${1:-}" != stream_log ] || limit_file=$2
     timestamp=$(/bin/date '+%Y-%m-%dT%H:%M:%S%z')
     printf -v quoted '%q ' "$@"
     /bin/mkdir -p "$(/usr/bin/dirname "$OUT/$relative")"
@@ -149,6 +168,12 @@ capture() {
     "$@" > "$OUT/$relative" 2> "$OUT/$relative.stderr.txt" &
     ACTIVE_PID=$!
     while kill -0 "$ACTIVE_PID" 2>/dev/null; do
+        if [ -n "$limit_file" ] && [ -s "$limit_file" ]; then
+            # Stop a producer that ignores SIGPIPE instead of waiting for its
+            # entire datastore scan after the sampler already has enough data.
+            stop_active
+            break
+        fi
         if [ "$((SECONDS - began))" -ge "$budget" ]; then
             timed_out=1
             stop_active
@@ -156,21 +181,103 @@ capture() {
         fi
         /bin/sleep 0.2
     done
-    wait "$ACTIVE_PID"; result=$?
+    wait "$ACTIVE_PID"; result=$?; raw_result=$result
     ACTIVE_PID=""
     if [ "$timed_out" -eq 1 ]; then
         result=124
         printf '\n[collector] Timed out after %s seconds; output may be partial.\n' "$budget" >> "$OUT/$relative.stderr.txt"
+    elif [ -n "$limit_file" ] && [ -s "$limit_file" ]; then
+        result=125
+        printf '\n[collector] Intentional bounded sample; producer exit was %s.\n' "$raw_result" >> "$OUT/$relative.stderr.txt"
     fi
     printf '%s\t%s\t%s\t%s\t%s\n' "$timestamp" "$((SECONDS - began))" "$result" "$relative" "$quoted" >> "$OUT/commands.tsv"
-    [ "$result" -eq 0 ] || info "    NOTE: exit $result; see $relative.stderr.txt (collection continues)."
+    if [ "$result" -eq 125 ]; then
+        info '    Sample budget reached; remaining messages were not collected (exit 125).'
+    elif [ "$result" -ne 0 ]; then
+        info "    NOTE: exit $result; see $relative.stderr.txt (collection continues)."
+    fi
     return 0
+}
+
+# Bound INPUT as well as OUTPUT: deduplication alone still reads a gigabyte of
+# repeated errors. head bounds even one enormous line; capture reaps the whole
+# pipeline when a budget is reached. Only plain-text logs go through this filter.
+stream_log() {
+    local limit_file=$1 stats_file=$2; shift 2
+    "$@" | /usr/bin/head -c "$MAX_LOG_INPUT" | /usr/bin/awk \
+        -v output_limit="$MAX_LOG_BYTES" -v input_limit="$MAX_LOG_INPUT" \
+        -v marker="$limit_file" -v stats="$stats_file" '
+    function mark(reason) {
+        if (limited == "") {
+            limited = reason
+            print reason > marker
+            close(marker)
+        }
+    }
+    {
+        input_bytes += length($0) + 1
+        if (input_bytes > input_limit) { mark("input"); exit }
+        message = $0
+        if ($1 ~ /^[0-9][0-9][0-9][0-9]-/ && $2 ~ /^[0-9][0-9]:/) {
+            if (first_time == "") first_time = substr($1 " " $2, 1, 64)
+            last_time = substr($1 " " $2, 1, 64)
+            sub(/^[^ ]+ +[^ ]+ +/, "", message)
+            # Preserve daemon PID, normalize thread ID for repeat counting.
+            if (match(message, /\[[0-9]+:[^]]+\]/)) {
+                start = RSTART; size = RLENGTH
+                identity = substr(message, start, size)
+                sub(/:[^]]+\]/, ":*]", identity)
+                message = substr(message, 1, start - 1) identity substr(message, start + size)
+            }
+        }
+        if (++seen[message] > 3) { suppressed++; next }
+        # Reserve space for the bounded summary below.
+        if (output_bytes + length($0) + 1 > output_limit - 4096) { mark("output"); exit }
+        print $0
+        output_bytes += length($0) + 1
+    }
+    END {
+        if (input_bytes >= input_limit) mark("input")
+        printf "\n[collector] Kept at most 3 copies per message; suppressed %d repeats.\n", suppressed
+        if (limited != "") printf "[collector] %s budget reached; this is a partial log sample.\n", limited
+        if (first_time != "") printf "[collector] Scanned timestamps: %s through %s.\n", first_time, last_time
+        summaries = 0
+        for (message in seen) {
+            if (seen[message] > 3 && summaries++ < 10)
+                printf "[collector] %d occurrences: %.180s\n", seen[message], message
+        }
+        printf "input_bytes=%d\noutput_payload_bytes=%d\nsuppressed_repeats=%d\nlimit_reason=%s\n", \
+            (input_bytes > input_limit ? input_limit : input_bytes), output_bytes, suppressed, limited > stats
+        close(stats)
+    }'
+}
+log_show() {
+    local relative=$1 window=$2 predicate=$3 budget=30 remaining
+    if [ "$LOG_END" -gt 0 ]; then
+        remaining=$((LOG_END - SECONDS))
+        if [ "$remaining" -le 0 ]; then
+            info "  $relative: skipped (overall text-log budget exhausted)."
+            printf '[collector] Skipped: the 90-second recent-log budget was exhausted.\n' > "$OUT/$relative"
+            printf '%s\t0\t124\t%s\t%s\n' "$(/bin/date '+%Y-%m-%dT%H:%M:%S%z')" "$relative" 'not started: overall log budget exhausted' >> "$OUT/commands.tsv"
+            return 0
+        fi
+        [ "$remaining" -ge "$budget" ] || budget=$remaining
+    fi
+    if [ "$VERBOSE" -eq 1 ]; then
+        capture "$relative" "$budget" stream_log "$OUT/$relative.limit" "$OUT/$relative.stats.txt" \
+            as_root /usr/bin/log show --last "$window" --style compact --info --debug --predicate "$predicate"
+    else
+        capture "$relative" "$budget" stream_log "$OUT/$relative.limit" "$OUT/$relative.stats.txt" \
+            as_root /usr/bin/log show --last "$window" --style compact --predicate "$predicate"
+    fi
 }
 
 info "Output: $OUT"
 info 'This bundle contains SSIDs, MAC/IP addresses, serial numbers, device names and private logs. Share only with someone you trust.'
 info 'Read-only: no daemon restarts, no Wi-Fi/BT/AWDL changes, no EFI mounts, no uploads.'
 info 'Run this right after a failure. If the problem is still occurring, keep the current state during collection.'
+info "Focused mode: $LAST of recent logs; 1 MiB output / 16 MiB input / 30 seconds per text sample."
+info 'Archive, raw HCI traces, info/debug messages and kext bundle copies are opt-in.'
 if [ "$EUID" -eq 0 ]; then
     ROOT_OK=1
 else
@@ -182,8 +289,8 @@ else
     fi
 fi
 [ "$ROOT_OK" -eq 1 ] || info 'WARNING: No administrator access; some diagnostics will be missing or denied.'
-printf 'started=%s\nrecent_window=%s\nadmin_access=%s\ninvoking_user=%s\nnotes=%s\n' \
-    "$STARTED" "$LAST" "$ROOT_OK" "$OWNER_USER" "$NOTES" > "$OUT/session.txt"
+printf 'started=%s\nrecent_window=%s\nadmin_access=%s\ninvoking_user=%s\nnotes=%s\nverbose=%s\nlogarchive=%s\ninclude_hci=%s\ninclude_kexts=%s\n' \
+    "$STARTED" "$LAST" "$ROOT_OK" "$OWNER_USER" "$NOTES" "$VERBOSE" "$ARCHIVE" "$INCLUDE_HCI" "$INCLUDE_KEXTS" > "$OUT/session.txt"
 
 snapshot() {
     local label=$1 class
@@ -212,7 +319,7 @@ capture system/disks.txt 30 /usr/sbin/diskutil list
 capture system/mounts.txt 20 /sbin/mount
 capture system/power.txt 30 /usr/bin/pmset -g
 capture system/power-assertions.txt 30 /usr/bin/pmset -g assertions
-capture system/sleep-wake.log 60 /usr/bin/pmset -g log
+capture system/sleep-wake.log 30 stream_log "$OUT/system/sleep-wake.log.limit" "$OUT/system/sleep-wake.log.stats.txt" /usr/bin/pmset -g log
 capture hardware/wifi.txt 75 /usr/sbin/system_profiler -detailLevel full -timeout 60 SPAirPortDataType
 capture hardware/bluetooth.txt 75 /usr/sbin/system_profiler -detailLevel full -timeout 60 SPBluetoothDataType
 capture hardware/system-profiler.spx 150 /usr/sbin/system_profiler -xml -detailLevel full -timeout 120 \
@@ -231,8 +338,10 @@ for key in boot-args csr-active-config bluetoothInternalControllerInfo bluetooth
 done
 
 info '[3/8] Loaded kexts, dependencies, kernel collection and OpenCore metadata'
-capture kexts/loaded.txt 45 as_root /usr/bin/kmutil showloaded --show-kernel --arch-info
-capture kexts/loaded-list.txt 45 as_root /usr/bin/kmutil showloaded --list-only
+capture kexts/loaded.txt 30 as_root /usr/bin/kmutil showloaded
+capture kexts/loaded-list.txt 30 as_root /usr/bin/kmutil showloaded --list-only
+# Capture loading failures before slower daemon queries, even if interrupted later.
+log_show logs/kernel-kext-loading-boot.log boot '(process == "kernel" AND (eventMessage CONTAINS[c] "mtk" OR eventMessage CONTAINS[c] "lilu" OR eventMessage CONTAINS[c] "bluetool" OR eventMessage CONTAINS[c] "bluetooth" OR eventMessage CONTAINS[c] "awdl" OR (eventMessage CONTAINS[c] "kext" AND (eventMessage CONTAINS[c] "load" OR eventMessage CONTAINS[c] "fail" OR eventMessage CONTAINS[c] "error")))) OR ((subsystem CONTAINS[c] "KernelManagement" OR process == "kernelmanagerd" OR process == "kextd") AND (eventMessage CONTAINS[c] "mtk" OR eventMessage CONTAINS[c] "lilu" OR eventMessage CONTAINS[c] "bluetool" OR eventMessage CONTAINS[c] "fail" OR eventMessage CONTAINS[c] "error" OR eventMessage CONTAINS[c] "undefined" OR eventMessage CONTAINS[c] "dependency"))'
 capture kexts/kextstat.txt 30 as_root /usr/sbin/kextstat
 capture kexts/kernelmanager-state.txt 45 as_root /usr/bin/kmutil dumpstate
 capture kexts/kernel-collections.txt 90 as_root /usr/bin/kmutil inspect --allow-missing-collections \
@@ -256,11 +365,13 @@ collect_bundles() {
         bundle_index=$((bundle_index + 1))
         printf '%s\t%s\n' "$bundle_index" "$bundle" >> "$OUT/kexts/source-paths.tsv"
         capture "kexts/bundle-$bundle_index/$name-info.plist" 20 as_root /usr/bin/plutil -convert xml1 -o - "$bundle/Contents/Info.plist"
-        case "$name" in
-            MtkWirelessWifi.kext|MtkWirelessBT.kext|Lilu.kext|BlueToolFixup.kext)
-                capture "kexts/bundle-$bundle_index/copy.txt" 60 as_root /usr/bin/ditto \
-                    "$bundle" "$OUT/kexts/bundle-$bundle_index/$name" ;;
-        esac
+        if [ "$INCLUDE_KEXTS" -eq 1 ]; then
+            case "$name" in
+                MtkWirelessWifi.kext|MtkWirelessBT.kext|Lilu.kext|BlueToolFixup.kext)
+                    capture "kexts/bundle-$bundle_index/copy.txt" 60 as_root /usr/bin/ditto \
+                        "$bundle" "$OUT/kexts/bundle-$bundle_index/$name" ;;
+            esac
+        fi
     done
 }
 collect_bundles /Library/Extensions library
@@ -320,14 +431,38 @@ if [ -f /usr/sbin/bluetoothd ]; then
     capture bluetooth/binary-signature.txt 30 /usr/bin/codesign -d --verbose=4 /usr/sbin/bluetoothd
 fi
 copy_index=0
-copy_list() {
-    local list=$1 category=$2 source name
+sorted_files() {
+    local source metadata
     while IFS= read -r -d '' source; do
-        name=${source##*/}
-        copy_index=$((copy_index + 1))
+        metadata=$(as_root /usr/bin/stat -f '%m %z' "$source") || continue
+        # NUL records preserve spaces/newlines; the numeric prefix sorts newest first.
+        printf '%s\t%s\0' "$metadata" "$source"
+    done < "$1" | /usr/bin/sort -z -nr
+}
+copy_list() {
+    local list=$1 category=$2 record metadata source name size copied=0 reason metadata_list
+    metadata_list="${list%.nul}.metadata.nul"
+    capture "$metadata_list" 30 sorted_files "$OUT/$list"
+    while IFS= read -r -d '' record; do
+        metadata=${record%%$'\t'*}; source=${record#*$'\t'}
+        size=${metadata##* }; name=${source##*/}; reason=""
+        [[ "$size" =~ ^[0-9]+$ ]] && [ "${#size}" -le 10 ] || continue
+        size=$((10#$size))
+        if [ "$copied" -ge 10 ]; then reason=count_limit
+        elif [ "$size" -gt "$MAX_COPY_FILE" ]; then reason=file_over_4_MiB
+        elif [ "$((COPIED_BYTES + size))" -gt "$MAX_COPY_TOTAL" ]; then reason=total_over_16_MiB
+        fi
+        if [ -n "$reason" ]; then
+            printf '%s\t%s\t%s\n' "$reason" "$size" "$source" >> "$OUT/$category/skipped.tsv"
+            continue
+        fi
+        copy_index=$((copy_index + 1)); copied=$((copied + 1))
+        COPIED_BYTES=$((COPIED_BYTES + size))
         printf '%s\t%s\n' "$copy_index" "$source" >> "$OUT/$category/source-paths.tsv"
-        capture "$category/copy-$copy_index.txt" 30 as_root /bin/cp "$source" "$OUT/$category/$copy_index-$name"
-    done < "$OUT/$list"
+        # Snapshot only the stated size, so an actively growing trace cannot
+        # turn a small copy into an unbounded file. Do not truncate oversized files.
+        capture "$category/$copy_index-$name" 30 as_root /usr/bin/head -c "$size" "$source"
+    done < "$OUT/$metadata_list"
 }
 crash_index=0
 for directory in /Library/Logs/DiagnosticReports "$OWNER_HOME/Library/Logs/DiagnosticReports"; do
@@ -344,30 +479,36 @@ for directory in /private/var/root/Library/Logs/Bluetooth "$OWNER_HOME/Library/L
     # Root's log directory can be inaccessible before sudo; let find report it.
     hci_index=$((hci_index + 1))
     capture "bluetooth/hci-paths-$hci_index.nul" 30 as_root /usr/bin/find "$directory" -maxdepth 2 -type f -mtime -3 -name '*.pklg' -print0
-    copy_list "bluetooth/hci-paths-$hci_index.nul" bluetooth
+    if [ "$INCLUDE_HCI" -eq 1 ]; then
+        copy_list "bluetooth/hci-paths-$hci_index.nul" bluetooth
+    else
+        capture "bluetooth/hci-metadata-$hci_index.nul" 30 sorted_files "$OUT/bluetooth/hci-paths-$hci_index.nul"
+    fi
 done
-capture logs/file-paths.nul 30 as_root /usr/bin/find /private/var/log -maxdepth 1 -type f -mtime -3 \
-    \( -name 'Lilu_*.txt' -o -iname '*bluetooth*.log' -o -name 'wifi.log' -o -name 'system.log' -o -name 'install.log' -o -name 'kernel.log' \) -print0
+if [ "$VERBOSE" -eq 1 ]; then
+    capture logs/file-paths.nul 30 as_root /usr/bin/find /private/var/log -maxdepth 1 -type f -mtime -3 \
+        \( -name 'Lilu_*.txt' -o -iname '*bluetooth*.log' -o -name 'wifi.log' -o -name 'system.log' -o -name 'install.log' -o -name 'kernel.log' \) -print0
+else
+    capture logs/file-paths.nul 30 as_root /usr/bin/find /private/var/log -maxdepth 1 -type f -mtime -3 \
+        \( -name 'Lilu_*.txt' -o -iname '*bluetooth*.log' -o -name 'wifi.log' \) -print0
+fi
 copy_list logs/file-paths.nul logs
 
-info '[6/8] Unified logs, including kext/kernel loading since boot'
-log_show() {
-    local relative=$1 window=$2 predicate=$3
-    capture "$relative" 180 as_root /usr/bin/log show --last "$window" --style compact --info --debug --predicate "$predicate"
-}
+info '[6/8] Focused, bounded recent-log samples (90-second overall budget)'
+LOG_END=$((SECONDS + 90))
 log_show logs/bluetoothd.log "$LAST" 'process == "bluetoothd" OR process == "BlueTool"'
 log_show logs/wifi.log "$LAST" 'process == "airportd" OR process == "wifid" OR process == "WiFiAgent"'
-log_show logs/airdrop-continuity.log "$LAST" 'process == "sharingd" OR process == "rapportd" OR process == "nearbyd" OR process == "useractivityd" OR process == "AirPlayXPCHelper" OR process == "ContinuityCaptureAgent"'
-log_show logs/mdns.log "$LAST" 'process == "mDNSResponder"'
-log_show logs/bluetooth-audio.log "$LAST" 'process == "coreaudiod" OR process == "audioaccessoryd"'
-log_show logs/kernel.log "$LAST" 'process == "kernel"'
+log_show logs/airdrop-continuity.log "$LAST" 'process == "sharingd" OR process == "rapportd" OR process == "nearbyd" OR process == "useractivityd" OR process == "AirPlayXPCHelper" OR process == "ContinuityCaptureAgent" OR process == "mDNSResponder"'
 log_show logs/driver.log "$LAST" 'process == "kernel" AND (eventMessage CONTAINS[c] "mtk" OR eventMessage CONTAINS[c] "awdl" OR eventMessage CONTAINS[c] "bluetooth" OR eventMessage CONTAINS[c] "lilu" OR eventMessage CONTAINS[c] "bluetool")'
-log_show logs/kernel-kext-loading-boot.log boot 'subsystem CONTAINS[c] "KernelManagement" OR process == "kernelmanagerd" OR process == "kextd" OR (process == "kernel" AND (eventMessage CONTAINS[c] "mtk" OR eventMessage CONTAINS[c] "lilu" OR eventMessage CONTAINS[c] "bluetool" OR eventMessage CONTAINS[c] "kext" OR eventMessage CONTAINS[c] "kernel collection"))'
 log_show logs/daemon-launches.log "$LAST" 'process == "launchd" AND (eventMessage CONTAINS[c] "bluetooth" OR eventMessage CONTAINS[c] "sharingd" OR eventMessage CONTAINS[c] "rapportd" OR eventMessage CONTAINS[c] "airportd" OR eventMessage CONTAINS[c] "wifid")'
-capture logs/kmutil-boot.log 180 as_root /usr/bin/kmutil log show --last boot --style compact --info --debug
+if [ "$VERBOSE" -eq 1 ]; then
+    log_show logs/mdns.log "$LAST" 'process == "mDNSResponder"'
+    log_show logs/bluetooth-audio.log "$LAST" 'process == "coreaudiod" OR process == "audioaccessoryd"'
+    log_show logs/kernel.log "$LAST" 'process == "kernel"'
+fi
 if [ "$ARCHIVE" -eq 1 ]; then
-    info '  Native .logarchive: up to 512 MB, all processes in the recent window.'
-    capture logs/logarchive-collection.txt 300 as_root /usr/bin/log collect --last "$LAST" --size 512m --output "$OUT/logs/system.logarchive"
+    info '  Opt-in native archive: 64 MB log-data budget; symbol metadata may add size.'
+    capture logs/logarchive-collection.txt 90 as_root /usr/bin/log collect --last "$LAST" --size 64m --output "$OUT/logs/system.logarchive"
 fi
 
 info '[7/8] Final counters and bundle summary'
@@ -377,13 +518,19 @@ snapshot after
         "$STARTED" "$(/bin/date '+%Y-%m-%d %H:%M:%S%z')" "$LAST" "$ROOT_OK"
     printf 'Notes: %s\n\nLoaded MtkWireless / related kexts (not a root-cause verdict):\n' "$NOTES"
     /usr/bin/grep -iE 'mtk|lilu|bluetool|itlwm|intelbluetooth|brcm' "$OUT/kexts/loaded-list.txt" || true
-    printf '\nFailed/unsupported/timed-out commands (0 = success, 124 = timeout):\n'
-    /usr/bin/awk -F '\t' 'NR > 1 && $3 != 0 { print $3 "\t" $4 }' "$OUT/commands.tsv"
+    printf '\nFailed/unsupported/budget-exhausted commands (0 = success, 124 = time budget):\n'
+    /usr/bin/awk -F '\t' 'NR > 1 && $3 != 0 && $3 != 125 { print $3 "\t" $4 }' "$OUT/commands.tsv"
+    printf '\nIntentionally limited samples (125 = partial input/output budget):\n'
+    /usr/bin/awk -F '\t' 'NR > 1 && $3 == 125 { print $3 "\t" $4 }' "$OUT/commands.tsv"
     printf '\nStart with hardware/{wifi,bluetooth}.txt, ioreg/*-before.plist,\n'
     printf 'kexts/loaded.txt, logs/kernel-kext-loading-boot.log and the daemon logs.\n'
+    printf 'Text samples are capped at 1 MiB output / 16 MiB input / 30 seconds; the recent-log group gets 90 seconds total.\n'
+    printf 'Only the first 3 copies per message are kept. See each .stats.txt and .limit file for discarded repeats and limits.\n'
+    printf 'Default window is 5 minutes, default/error/fault levels only; --verbose enables info/debug and extra categories.\n'
+    printf 'File copies keep up to 10 newest per list, at most 4 MiB each and 16 MiB combined; skipped files are listed in skipped.tsv.\n'
     printf 'commands.tsv records every command, duration and exit status; stderr is separate.\n'
     printf 'Missing IORegistry services can return an empty array with exit 0; that is NOT proof a driver loaded.\n'
-    printf 'No live HCI trace or packet capture was enabled; only existing .pklg files were copied.\n'
+    printf 'No live HCI trace or packet capture was enabled. Existing HCI traces, native logarchive and kext copies are opt-in.\n'
     printf 'Disk bluetoothd is the OS binary, not a dump of in-memory page patches.\n'
     printf 'macOS may redact data or may not have persisted debug events; collection cannot recover them.\n'
     printf 'EFI data is included only when already mounted. Full config.plist, keychain and Bluetooth link-key preferences were not copied.\n'
