@@ -222,12 +222,13 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
                 assert args[0] in ("show", "collect"), call
         if env.get("MOCK_ZIP_FAIL") or env.get("MOCK_ZIP_CORRUPT"):
             assert result.returncode == 1 and "ERROR: ZIP" in result.stdout, result
-            assert "Done. Gui file" not in result.stdout
+            assert "Done. Send this ZIP" not in result.stdout
             assert folder.is_dir()
             assert statuses["zip-result.txt"] == (9 if env.get("MOCK_ZIP_FAIL") else 0)
             assert statuses["zip-check.txt"] != 0
         else:
             assert result.returncode == 0, (result.stdout, result.stderr)
+            assert "Done. Send this ZIP for debugging:" in result.stdout
             assert statuses["zip-result.txt"] == statuses["zip-check.txt"] == 0
             assert stat.S_IMODE(archive.stat().st_mode) == 0o600
             assert stat.S_IMODE(folder.stat().st_mode) == 0o700

@@ -168,20 +168,20 @@ capture() {
 }
 
 info "Output: $OUT"
-info 'Goi log co SSID, MAC/IP, serial, ten thiet bi va log rieng tu. Chi gui cho nguoi tin cay.'
-info 'Chi doc: khong restart bluetoothd, khong doi Wi-Fi/BT/AWDL, khong mount EFI, khong upload.'
-info 'Hay chay ngay sau khi gap loi; neu dang loi, giu nguyen trang thai trong luc thu thap.'
+info 'This bundle contains SSIDs, MAC/IP addresses, serial numbers, device names and private logs. Share only with someone you trust.'
+info 'Read-only: no daemon restarts, no Wi-Fi/BT/AWDL changes, no EFI mounts, no uploads.'
+info 'Run this right after a failure. If the problem is still occurring, keep the current state during collection.'
 if [ "$EUID" -eq 0 ]; then
     ROOT_OK=1
 else
-    info 'Nhap mat khau Mac de doc day du log kernel, Bluetooth va kernel collections.'
+    info 'Enter your Mac password for full kernel, Bluetooth and kernel collection diagnostics.'
     if [ -t 0 ]; then
         /usr/bin/sudo -v && ROOT_OK=1
     else
         /usr/bin/sudo -n -v && ROOT_OK=1
     fi
 fi
-[ "$ROOT_OK" -eq 1 ] || info 'WARNING: Khong co quyen admin; mot so muc se thieu hoac bi tu choi.'
+[ "$ROOT_OK" -eq 1 ] || info 'WARNING: No administrator access; some diagnostics will be missing or denied.'
 printf 'started=%s\nrecent_window=%s\nadmin_access=%s\ninvoking_user=%s\nnotes=%s\n' \
     "$STARTED" "$LAST" "$ROOT_OK" "$OWNER_USER" "$NOTES" > "$OUT/session.txt"
 
@@ -406,8 +406,8 @@ if [ "$zip_status" != 0 ] || [ "$check_status" != 0 ]; then
 fi
 /bin/chmod 600 "$ZIP_FILE" || exit 1
 permissions
-info "Done. Gui file nay de debug: $ZIP_FILE"
-info 'Thu muc goc duoc giu lai. Khong dang goi log cong khai.'
+info "Done. Send this ZIP for debugging: $ZIP_FILE"
+info 'The uncompressed folder is kept. Do not post the bundle publicly.'
 if [ "$EUID" -ne 0 ] && [ -t 1 ]; then
     /usr/bin/open -R "$ZIP_FILE" 2>/dev/null || true
 fi
