@@ -252,6 +252,8 @@ def generate(ex):
     end = body.index("void mwx_awdl_restore_filter", start)
     actual = ex.span(L.HAL, start, end, "HAL filter ownership constants")
     actual += FW_FUNCTIONS
+    macro_start = body.index('#define mwx_infra_ps')
+    actual += ex.span(L.HAL, macro_start, body.index('\n\n', macro_start), 'atomic infrastructure PM macros') + '\n'
     actual += "static bool mwx_awdl_current(mwx_softc *,uint32_t);\n"
     actual += definition(ex, "MwxAwdlInfraOperation")+definition(ex, "MwxAwdlCall")+definition(ex, "MwxAwdlOperation")
     for name in ["mwx_awdl_current", "mwx_append_len", "mwx_append_tlv", "mwx_fill_sta_req_hdr",

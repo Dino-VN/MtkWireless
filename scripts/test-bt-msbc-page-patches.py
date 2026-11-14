@@ -115,8 +115,9 @@ bool anyBuildPatches;
 enum BluetoothdBuild : int32_t { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3 };
 int32_t bluetoothdBuild;
 char bluetoothdBuildName[16];
-int32_t bluetoothdSitesAmbiguous, bluetoothdPagesUnpatched;
+int32_t bluetoothdSitesAmbiguous, bluetoothdPagesUnpatched, msbcDeferredBeforeProbe;
 uint8_t featureLatch[3];
+bool msbcSenderNative;
 const char *osBuild = "25G332";
 int osversionReads;
 int sysctlbyname(const char *name, void *out, size_t *size, void *, size_t) {
@@ -141,12 +142,17 @@ thread_call_t publishCall;
 thread_call_t thread_call_allocate(void (*)(thread_call_param_t, thread_call_param_t), thread_call_param_t) {
     static int call; return &call;
 }
-// Kernel write protection lifted around the vector store, always restored.
-bool writingFails; int writing, writingRounds;
+// Match Lilu's contract retained by 87caf95: a failed enable has already
+// restored writing/lock state, and must not receive a second disable/unlock.
+bool writingFails; int writing, writingRounds, writingDisables;
 struct MachInfo {
     static int setKernelWriting(bool enable, IOSimpleLock *) {
-        if (enable) { assert(!writing); writing = 1; ++writingRounds; return writingFails ? 1 : KERN_SUCCESS; }
-        assert(writing == 1); writing = 0; return KERN_SUCCESS;
+        if (enable) {
+            assert(!writing); ++writingRounds;
+            if (writingFails) return 1;
+            writing = 1; return KERN_SUCCESS;
+        }
+        assert(writing == 1); writing = 0; ++writingDisables; return KERN_SUCCESS;
     }
 };
 void *leLock;
@@ -197,6 +203,7 @@ void IOFree(void *p, size_t) { free(p); }
 void OSIncrementAtomic(volatile int32_t *value) { ++*value; }
 
 void publishCounters() {}
+void publishDeferred(thread_call_param_t, thread_call_param_t) {}
 int pathError, validations, searches;
 // The real Rust matcher, wrapped: count searches and pause after a write.
 #include "mtk_bt.h"
@@ -347,7 +354,7 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     free(pageSnapshot); pageSnapshot = nullptr; pageLock = nullptr;
     vnopVerifyDesc = 0; vnodeOpsOffset = 0; verifyOpState = verifyFailed = 0; verifyLastFailOffset = 0;
     orgVerifyOp = nullptr; publishCall = nullptr; publishes = 0; verifySymbolsMissing = false;
-    writingFails = false; writingRounds = 0; badFields = false;
+    writingFails = false; writingRounds = writingDisables = 0; badFields = false;
     fakeDesc.vdesc_offset = kVerifyIndex;
     for (auto &op : fakeOps) op = nullptr;
     fakeOps[0] = defaultOp; fakeOps[kVerifyIndex] = apfsVerify;
@@ -356,7 +363,8 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
     noRpa = rpaPatchEnabled = rpaHelpersReady = false; bluetoothdBuild = BuildUnread; bluetoothdBuildName[0] = 0;
     anyBuild = anyBuildPatches = false; bluetoothdSitesAmbiguous = bluetoothdPagesUnpatched = 0;
-    memset(featureLatch, 0, sizeof(featureLatch)); free(verifyCopy); verifyCopy = nullptr; verifyCopyLock = nullptr;
+    memset(featureLatch, 0, sizeof(featureLatch)); msbcSenderNative = false; msbcDeferredBeforeProbe = 0;
+    free(verifyCopy); verifyCopy = nullptr; verifyCopyLock = nullptr;
     copyTries = copyBusy = 0; pageFinds = 0;
     noLeReadyMask = leReadyMaskEnabled = false;
     bluetoothdRpaHelpersPatched = bluetoothdRpaLegacyPatched = bluetoothdRpaScanPatched = 0;
@@ -565,22 +573,80 @@ void buildTests() {
     static char recycled[] = "/usr/sbin/bluetoothd";
     csValidatePage(recycled, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
     assert(bluetoothdPatched == 1 && featureLatch[FeatureAdv] == LatchOn && bluetoothdVnode == recycled);
-    // mSBC: the wideband gate page decided before the bridge was ready keeps
-    // the sender page native too; never one of the pair alone.
+    // Unknown USB scope is deferred, not permanently Off for this vnode.
     reset(25, true, true); Patcher::init(0);
     page = {}; memcpy(page.data() + 10, wbsFind, sizeof(wbsFind)); before = page; apply(page);
-    assert(page == before && featureLatch[FeatureMsbc] == LatchOff && !bluetoothdWbsPatched);
+    assert(page == before && featureLatch[FeatureMsbc] == LatchUndecided && msbcDeferredBeforeProbe);
     msbcReady = true; Patcher::observeMsbcController(true);
-    Page fill {}; memcpy(fill.data() + 110, hfpFillFind, sizeof(hfpFillFind)); before = fill; apply(fill);
-    assert(fill == before && !bluetoothdHfpFillPatched);
-    csValidatePage(recycled, nullptr, 0, fill.data(), nullptr, nullptr, nullptr);
+    Page fill {}; memcpy(fill.data() + 110, hfpFillFind, sizeof(hfpFillFind)); apply(fill);
+    assert(!memcmp(fill.data() + 110, hfpFillReplace, sizeof(hfpFillReplace)));
     assert(bluetoothdHfpFillPatched == 1 && featureLatch[FeatureMsbc] == LatchOn);
-    // Decided on: a later controller veto cannot leave the gate native beside a patched sender.
+    // Decided on: a later controller veto cannot split already patched pages.
     Patcher::observeMsbcController(false);
-    page = {}; memcpy(page.data() + 10, wbsFind, sizeof(wbsFind));
-    csValidatePage(recycled, nullptr, 0, page.data(), nullptr, nullptr, nullptr);
-    assert(bluetoothdWbsPatched == 1);
+    apply(page);
+    assert(bluetoothdWbsPatched == 1 && !memcmp(page.data() + 10, wbsReplace, sizeof(wbsReplace)));
     puts("PASS: masked sites patch 25G241 as before; unlisted builds get only build-independent sites (or all but RPA with -mtkbtanybuild); ambiguous and per-vnode decisions");
+}
+void msbcOrderingTests() {
+    for (bool senderFirst : {false, true}) for (bool bridgeReadyAtPage : {false, true}) {
+        reset(25, true, true); Patcher::init(0); msbcReady = bridgeReadyAtPage;
+        Page gate {}, sender {};
+        memcpy(gate.data() + 10, wbsFind, sizeof(wbsFind));
+        memcpy(sender.data() + 110, hfpFillFind, sizeof(hfpFillFind));
+        const Page nativeGate = gate, nativeSender = sender;
+        apply(senderFirst ? sender : gate);
+        assert(gate == nativeGate && sender == nativeSender && msbcDeferredBeforeProbe);
+        assert(featureLatch[FeatureMsbc] == LatchUndecided && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
+        assert(msbcSenderNative == senderFirst);
+        Patcher::observeMsbcController(true); msbcReady = true;
+        if (senderFirst) {
+            // The sender's early native code can be resident. A later WBS
+            // page must remain native until the sender is revalidated.
+            apply(gate);
+            assert(gate == nativeGate && featureLatch[FeatureMsbc] == LatchUndecided);
+        }
+        apply(sender);
+        assert(!memcmp(sender.data() + 110, hfpFillReplace, sizeof(hfpFillReplace)));
+        assert(!msbcSenderNative && featureLatch[FeatureMsbc] == LatchOn);
+        assert(gate == nativeGate); // no retroactive writes to saved page pointers
+        apply(gate);
+        assert(!memcmp(gate.data() + 10, wbsReplace, sizeof(wbsReplace)));
+        assert(bluetoothdWbsPatched == 1 && bluetoothdHfpFillPatched == 1);
+    }
+    // Preserve the normal post-probe gate-first/cold-sender ordering: its
+    // later code-page fault sees the same On latch, including after a veto.
+    reset(25, true, true); Patcher::init(0); msbcReady = true; Patcher::observeMsbcController(true);
+    Page gate {}, sender {};
+    memcpy(gate.data() + 10, wbsFind, sizeof(wbsFind));
+    memcpy(sender.data() + 110, hfpFillFind, sizeof(hfpFillFind));
+    apply(gate); assert(bluetoothdWbsPatched == 1 && featureLatch[FeatureMsbc] == LatchOn);
+    Patcher::observeMsbcController(false);
+    apply(sender); assert(bluetoothdHfpFillPatched == 1 && !msbcSenderNative);
+    // Unknown -> unsupported/mixed scope is a real Off decision; a later
+    // supported probe cannot undo the USB scope veto.
+    for (bool mixed : {false, true}) {
+        reset(25, true, true); Patcher::init(0); msbcReady = true;
+        Page early = originals(); const Page native = early; apply(early);
+        assert(early == native && featureLatch[FeatureMsbc] == LatchUndecided && msbcSenderNative);
+        if (mixed) Patcher::observeMsbcController(true);
+        Patcher::observeMsbcController(false);
+        apply(early);
+        assert(early == native && featureLatch[FeatureMsbc] == LatchOff);
+        Patcher::observeMsbcController(true); apply(early);
+        assert(early == native && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
+    }
+    // A new vnode resets the early native-sender marker. Do not carry an
+    // unrelated file's boot-order suppression into its gate-first ordering.
+    reset(25, true, true); Patcher::init(0); msbcReady = true;
+    sender = {}; memcpy(sender.data() + 110, hfpFillFind, sizeof(hfpFillFind)); apply(sender);
+    assert(msbcSenderNative && featureLatch[FeatureMsbc] == LatchUndecided);
+    Patcher::observeMsbcController(true);
+    static char otherVnode[] = "/usr/sbin/bluetoothd";
+    gate = {}; memcpy(gate.data() + 10, wbsFind, sizeof(wbsFind)); ::apply(gate, otherVnode);
+    assert(!msbcSenderNative && bluetoothdWbsPatched == 1 && featureLatch[FeatureMsbc] == LatchOn);
+    reset(25, true, true, true); Patcher::init(0);
+    assert(publishCall && !verifyFixEnabled); // USB diagnostics also work with the verifier disabled.
+    puts("PASS: both early page/probe orders defer unknown scope, native cached sender blocks WBS until safe revalidation, normal ordering and unsupported/mixed/vnode rules");
 }
 // One 16 KB verify block: page 1 holds our and a foreign patch site, page 0 none.
 void verifyTests() {
@@ -725,7 +791,7 @@ void verifyOpTests() {
         assert(verifyOpState == (step > VerifyOpNoWrite ? int(VerifyOpNoSymbols) : step) && !verifyFixRouted);
         assert(helpers == unpatched && !rpaHelpersReady && !patchRangeCount && !writing);
         assert(fakeOps[kVerifyIndex] == (step == VerifyOpNoEntry ? nullptr : apfsVerify));
-        assert(writingRounds == (step == VerifyOpNoWrite));
+        assert(writingRounds == (step == VerifyOpNoWrite) && !writingDisables);
         page = originals(); apply(page); assert(!bluetoothdPatched && !patchRangeCount && page == originals());
     }
     puts("PASS: verifyOp replaces vnop_verify in the bluetoothd vnode's operations vector once, at its first page");
@@ -880,6 +946,7 @@ int main() {
     Page blocked = originals(); apply(blocked);
     assert(blocked == originals() && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
     buildTests();
+    msbcOrderingTests();
     verifyTests();
     verifyOpTests();
     rpaTests();

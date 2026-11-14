@@ -200,10 +200,15 @@ IOService* AirportMtkWlan::probe(IOService *provider, SInt32 *score)
         return NULL;
     }
     pciNub = wrapper->pciNub;
-    fHalService = wrapper->fHalService;
-    if (!pciNub || !fHalService) {
+    if (!pciNub || !wrapper->fHalService) {
         XYLog("%s Not a valid MtkPCIEDeviceWrapper instance\n", __FUNCTION__);
         return NULL;
+    }
+    // Own reference: stop()/free() release it, the wrapper keeps its own.
+    if (fHalService != wrapper->fHalService) {
+        OSSafeReleaseNULL(fHalService);
+        fHalService = wrapper->fHalService;
+        fHalService->retain();
     }
     return super::probe(provider, score);
 }

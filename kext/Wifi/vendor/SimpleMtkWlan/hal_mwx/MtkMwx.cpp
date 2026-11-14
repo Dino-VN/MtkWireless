@@ -48,7 +48,6 @@
 #include <FwData.h>
 
 #include "if_mwxreg.h"
-#include <ClientKit/Common.h>
 #include <IOKit/IOLocks.h>
 #include <pexpert/pexpert.h>
 
@@ -60,6 +59,12 @@
  * workloop gate, which the interrupt thread holds while taking this lock.
  */
 static IOLock *mwx_txq_lock;
+
+/* BSD TX observes the workloop's infrastructure PM state without taking
+ * the AWDL mutex. Keep every access atomic; the other PM fields stay gated. */
+#define mwx_infra_ps(sc) __atomic_load_n(&(sc)->sc_awdl_infra_ps, __ATOMIC_RELAXED)
+#define mwx_set_infra_ps(sc, value) \
+    __atomic_store_n(&(sc)->sc_awdl_infra_ps, (value), __ATOMIC_RELAXED)
 
 OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 
@@ -630,6 +635,7 @@ struct mwx_softc {
 	struct task		sc_newstate_task;
 	struct task		sc_bgscan_done_task;
 	struct task		sc_setkey_task;
+	struct task		sc_edca_task;
 	struct task		sc_scan_task;
 	struct task		sc_reset_task;
 	struct task		sc_power_task;
@@ -718,10 +724,14 @@ struct mwx_softc {
 
 	/* mcu */
 	uint32_t		sc_mcu_seq;
+	uint64_t		sc_mcu_cookie;
 	struct {
 		struct mbuf	*mcu_m;
 		uint32_t	 mcu_cmd;
 		uint32_t	 mcu_int;
+		uint64_t	 mcu_cookie;
+		bool		 mcu_busy;
+		bool		 mcu_waiting;
 		volatile int	 mcu_done;
 	}			sc_mcu_wait[16];
 	uint8_t			sc_scan_seq_num;
@@ -755,7 +765,7 @@ struct mwx_softc {
 	uint32_t		sc_tx_ring_full;
 	uint32_t		sc_scan_done_count;
 	uint32_t		sc_scan_last_ieee80211_nodes;
-	/* Bring-up counters, read through IOCTL_80211_DEBUG. */
+	/* Bring-up counters. */
 	uint32_t		sc_intr_count;
 	uint32_t		sc_mcu_events;
 	uint32_t		sc_last_mcu_eid;
@@ -1035,6 +1045,8 @@ void		mwx_end_scan_task(void *);
 void		mwx_scan_timeo(void *);
 void		mwx_dma_timeo(void *);
 void		mwx_fullreset_task(void *);
+void		mwx_edca_task(void *);
+void		mwx_update_edca(struct ieee80211com *);
 void		mwx_dump_dma_state(struct mwx_softc *, const char *);
 void		mt7921_mcu_scan_event(struct mwx_softc *, struct mbuf *);
 int		mt7921_mcu_hw_scan(struct mwx_softc *, int);
@@ -1420,11 +1432,17 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_newstate_task);
 		task_del(sc->sc_nswq, &sc->sc_bgscan_done_task);
 		task_del(sc->sc_nswq, &sc->sc_setkey_task);
+		task_del(sc->sc_nswq, &sc->sc_edca_task);
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 		task_del(sc->sc_nswq, &sc->sc_ba_task);
+		task_del(sc->sc_nswq, &sc->sc_scan_task);
+		task_del(sc->sc_nswq, &sc->sc_fullreset_task);
 	}
 	sc->sc_ba_cur = sc->sc_ba_tail = 0;
-	task_del(systq, &sc->sc_scan_task);
+	/* MtkWireless: queued keys point into this BSS's node and ic_nw_keys;
+	 * never install them for the next join (as iwx does). */
+	memset(sc->sc_setkey_arg, 0, sizeof(sc->sc_setkey_arg));
+	sc->sc_setkey_cur = sc->sc_setkey_tail = 0;
 	timeout_del(&sc->sc_reset_to);
 	timeout_del(&sc->sc_scan_to);
 	timeout_del(&sc->sc_dma_to);
@@ -1644,7 +1662,6 @@ mwx_node_alloc(struct ieee80211com *ic)
 {
 	/* XXX this is just wrong */
 	static uint32_t wcid = 0;
-	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
 	struct mwx_node *mn;
 
 	mn = (struct mwx_node *)malloc(sizeof(struct mwx_node), M_DEVBUF, M_NOWAIT | M_ZERO);
@@ -1652,9 +1669,8 @@ mwx_node_alloc(struct ieee80211com *ic)
 		return NULL;
 	mn->wcid = 1 + wcid++ % (MWX_WTBL_STA - 1);
 
-	/* init WCID table entry */
-	mwx_mac_wtbl_update(sc, mn->wcid);
-
+	/* Scan-cache nodes are software-only. A wrapped WCID must not clear
+	 * the live AP's admission counters, nor poll firmware on every beacon. */
 	return &mn->ni;
 }
 
@@ -1668,7 +1684,8 @@ mwx_newassoc(struct ieee80211com *ic, struct ieee80211_node *ni, int isnew)
 	if (isnew && ni->ni_associd != 0) {
 		/* only interested in true associations */
 		wcid = IEEE80211_AID(ni->ni_associd);
-
+		/* Initialize only a peer that actually joined, not a scan node. */
+		mwx_mac_wtbl_update(sc, mn->wcid);
 	}
 	printf("%s: new assoc isnew=%d addr=%s WCID=%d\n", DEVNAME(sc),
 	    isnew, ether_sprintf(ni->ni_macaddr), mn->wcid);
@@ -1798,8 +1815,12 @@ mwx_newstate_task(void *ptr)
 
 	switch (ostate) {
 	case IEEE80211_S_RUN:
-		if (nstate != ostate)
+		if (nstate != ostate) {
+			task_del(sc->sc_nswq, &sc->sc_setkey_task);
+			memset(sc->sc_setkey_arg, 0, sizeof(sc->sc_setkey_arg));
+			sc->sc_setkey_cur = sc->sc_setkey_tail = 0;
 			mwx_mcu_set_deep_sleep(sc, 1);
+		}
 		break;
 	case IEEE80211_S_SCAN:
 		if (nstate == ostate) {
@@ -1837,8 +1858,12 @@ mwx_newstate_task(void *ptr)
 	 * Leaving the BSS: drop the AP STA_REC (and the Block Ack sessions
 	 * on it) like mac80211 does before the vif goes away.
 	 */
-	if (ostate >= IEEE80211_S_AUTH && nstate < IEEE80211_S_AUTH)
+	if (ostate >= IEEE80211_S_AUTH && nstate < IEEE80211_S_AUTH) {
+		/* WCL already submitted Deauth. This task is outside the interrupt
+		 * gate, so TX-free/RX can progress during the same 10 ms grace. */
+		if (ostate >= IEEE80211_S_ASSOC) IOSleep(10);
 		mt7921_mac_sta_remove(sc);
+	}
 
 	/* Scan, auth and assoc run on the primary 20 MHz channel. */
 	if (nstate != IEEE80211_S_RUN) {
@@ -1879,8 +1904,8 @@ mwx_newstate_task(void *ptr)
 		 */
         ((struct mwx_node *)ic->ic_bss)->flags &= ~MWX_NODE_FLAG_KEY_FAILED;
         if (ic->ic_join_diag.Active)
-            ic->ic_join_diag.InfraPSAtStart = sc->sc_awdl_infra_ps;
-        sc->sc_awdl_infra_ps = false;
+            ic->ic_join_diag.InfraPSAtStart = mwx_infra_ps(sc);
+        mwx_set_infra_ps(sc, false);
 		mwx_apply_phy_knobs(sc);
 		rv = mt7921_set_channel(sc);
 		if (rv)
@@ -1935,6 +1960,10 @@ mwx_newstate_task(void *ptr)
 			rv = mt7921_mcu_set_associated_peer(sc);
 		if (rv)
 			break;
+		/* MtkWireless: program the AP's negotiated EDCA after peer setup,
+		 * not the generic defaults installed before association. */
+		rv = mt7921_mcu_set_tx(sc, &sc->sc_vif);
+		if (rv) break;
 		/* MtkWireless: 20 MHz joins do not switch channel again in RUN.
 		 * Apply the negotiated slot time after firmware BSS/peer setup. */
 		mt7921_mac_set_timing(sc);
@@ -2162,9 +2191,14 @@ mwx_setkey_task(void *arg)
 
 	while (sc->sc_setkey_tail != sc->sc_setkey_cur) {
 		a = &sc->sc_setkey_arg[sc->sc_setkey_tail];
-        int rv = mt7921_mcu_sta_key_update(sc, a->ni, a->k);
-        mwx_join_key_result(&sc->sc_ic, a->k, rv);
-        if (rv && a->ni) ((struct mwx_node *)a->ni)->flags |= MWX_NODE_FLAG_KEY_FAILED;
+        // A key queued for another (possibly freed) BSS node: drop it
+        // without touching a->k. ni NULL = static/WEP keys.
+        if (a->k != NULL && (a->ni == NULL ||
+            (sc->sc_ic.ic_state == IEEE80211_S_RUN && a->ni == sc->sc_ic.ic_bss))) {
+            int rv = mt7921_mcu_sta_key_update(sc, a->ni, a->k);
+            mwx_join_key_result(&sc->sc_ic, a->k, rv);
+            if (rv && a->ni) ((struct mwx_node *)a->ni)->flags |= MWX_NODE_FLAG_KEY_FAILED;
+        }
 		a->ni = NULL;
 		a->k = NULL;
 
@@ -2587,7 +2621,7 @@ mwx_intr(void *arg)
 		mwx_dma_rx_done(sc, &sc->sc_rxq);
 
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
-	if ((intr & mask) == 0 || loops >= 8)
+	if (intr == UINT32_MAX || (intr & mask) == 0 || loops >= 8)
 		break;
 	}
 
@@ -2750,7 +2784,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ifnet *ifp = &ic->ic_if;
 	struct pci_attach_args *pa = (struct pci_attach_args *)aux;
-	pci_intr_handle_t ih;
+	pci_intr_handle_t ih = NULL;
 	pcireg_t memtype;
 	uint32_t hwid, hwrev;
 	int error;
@@ -2952,6 +2986,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	ic->ic_set_key = mwx_set_key;
 	ic->ic_delete_key = mwx_delete_key;
 	ic->ic_updateslot = mwx_update_slot;
+	ic->ic_updateedca = mwx_update_edca;
 	ic->ic_ampdu_rx_start = mwx_ampdu_rx_start;
 	ic->ic_ampdu_rx_stop = mwx_ampdu_rx_stop;
 	ic->ic_ampdu_tx_start = mwx_ampdu_tx_start;
@@ -2970,6 +3005,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_newstate_task, mwx_newstate_task, sc, "mwx_newstate");
 	task_set(&sc->sc_bgscan_done_task, mwx_bgscan_done_task, sc, "mwx_bgscan");
 	task_set(&sc->sc_setkey_task, mwx_setkey_task, sc, "mwx_setkey");
+	task_set(&sc->sc_edca_task, mwx_edca_task, sc, "mwx_edca");
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
 	task_set(&sc->sc_power_task, mwx_power_task, sc, "mwx_power");
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
@@ -2989,6 +3025,16 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	 * so the common variable is the 8000/8 aggregate, not the bandwidth. Put
 	 * 80 MHz back with 2560/4 to test the bandwidth knob alone. NO_HE stays. */
 	sc->sc_knobs = MWX_KNOB_DATA_RA | MWX_KNOB_NO_HE;
+	/* A/B tests: boot-arg amtk_knobs=<MWX_KNOB_* bits> replaces the complete
+	 * default mask. Changes require a reboot, not a runtime user client. */
+	{
+		uint32_t knobs;
+		if (PE_parse_boot_argn("amtk_knobs", &knobs, sizeof(knobs))) {
+			sc->sc_knobs = knobs;
+			if (knobs & MWX_KNOB_NO_TXBA)
+				sc->sc_ic.ic_caps &= ~IEEE80211_C_TX_AMPDU;
+		}
+	}
 	sc->sc_bgscan_dwell = MWX_BGSCAN_DWELL_AUTO;
 	task_set(&sc->sc_fullreset_task, mwx_fullreset_task, sc, "mwx_fullreset");
 	task_set(&sc->sc_ba_task, mwx_ba_task, sc, "mwx_ba");
@@ -3003,7 +3049,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	return true;
 
 fail:
-	/* The HAL caller owns partial-attach cleanup through detach(). */
+	/* A mapped handle not yet established is not owned by sc_ih/detach. */
+	if (ih && !sc->sc_ih) pci_intr_disestablish(pa->pa_pc, ih);
+	/* The HAL caller owns other partial-attach cleanup through detach(). */
 	return false;
 }
 
@@ -3208,9 +3256,11 @@ mwx_txwi_free(struct mwx_softc *sc)
             mwx_awdl_tx_trace_reclaim(sc,mt);
 			bus_dmamap_destroy(sc->sc_dmat, mt->mt_map);
 			m_freem(mt->mt_mbuf);
-			if (i >= MT_PACKET_ID_FIRST)
-				LIST_REMOVE(mt, mt_entry);
 		}
+		/* MtkWireless: no per-entry LIST_REMOVE. Busy entries are not on
+		 * the list, and after a partial mwx_txwi_alloc the tail never was
+		 * (le_prev NULL). The whole array goes away. */
+		LIST_INIT(&q->mt_freelist);
 		free(q->mt_data, M_DEVBUF, q->mt_count * sizeof(*q->mt_data));
 	}
 
@@ -3227,31 +3277,52 @@ mwx_txwi_free(struct mwx_softc *sc)
 	if (q->mt_seg.ds_len != 0)
 		bus_dmamem_unmap(sc->sc_dmat, (caddr_t)q->mt_desc,
 			q->mt_count * sizeof(*q->mt_desc));
-	if (q->mt_map != NULL)
+	if (q->mt_map != NULL) {
 		bus_dmamem_free(sc->sc_dmat, &q->mt_seg, 1);
+		bus_dmamap_destroy(sc->sc_dmat, q->mt_map);
+	}
 
 	memset(q, 0, sizeof(*q));
 }
+
+/*
+ * MtkWireless: the free list is shared by mwx_start (BSD output thread,
+ * taskq threads, workloop) and TX-free on the workloop. mwx_txq_lock
+ * guards it; the order stays TX queue -> AWDL (trace helpers).
+ */
+static void mwx_txwi_put_locked(struct mwx_softc *, struct mwx_txwi *);
 
 struct mwx_txwi *
 mwx_txwi_get(struct mwx_softc *sc)
 {
 	struct mwx_txwi *mt;
 
+	IOLockLock(mwx_txq_lock);
 	mt = LIST_FIRST(&sc->sc_txwi.mt_freelist);
-	if (mt == NULL)
+	if (mt == NULL) {
+		IOLockUnlock(mwx_txq_lock);
 		return NULL;
+	}
 	LIST_REMOVE(mt, mt_entry);
     // Normally already empty; contain a lost diagnostic lifetime on reuse.
     mwx_awdl_tx_trace_reclaim(sc,mt);
 	mt->mt_busy = 1;
 	if (++sc->sc_txwi.mt_inuse > sc->sc_txwi.mt_peak)
 		sc->sc_txwi.mt_peak = sc->sc_txwi.mt_inuse;
+	IOLockUnlock(mwx_txq_lock);
 	return mt;
 }
 
 void
 mwx_txwi_put(struct mwx_softc *sc, struct mwx_txwi *mt)
+{
+	IOLockLock(mwx_txq_lock);
+	mwx_txwi_put_locked(sc, mt);
+	IOLockUnlock(mwx_txq_lock);
+}
+
+static void
+mwx_txwi_put_locked(struct mwx_softc *sc, struct mwx_txwi *mt)
 {
     // A plain put/reset is unobserved reclaim, never a synthesized TX ACK.
     mwx_awdl_tx_trace_reclaim(sc,mt);
@@ -3294,10 +3365,18 @@ mwx_txwi_enqueue(struct mwx_softc *sc, struct mwx_txwi *mt, struct mbuf *m)
 		return EFBIG;
 
 	nsegs = mt->mt_map->dm_nsegs;
-	/* The TXP only has MT_HW_TXP_MAX_BUF_NUM buffer slots. */
-	if (nsegs > MT_HW_TXP_MAX_BUF_NUM) {
+	/* Reject invalid mappings before publishing mbuf ownership or TXP.
+	 * A bounce buffer can exceed the descriptor's 12-bit length. */
+	if (nsegs <= 0 || nsegs > MT_HW_TXP_MAX_BUF_NUM) {
 		bus_dmamap_unload(sc->sc_dmat, mt->mt_map);
 		return EFBIG;
+	}
+	for (i = 0; i < nsegs; i++) {
+		if (mt->mt_map->dm_segs[i].ds_addr > UINT32_MAX ||
+		    mt->mt_map->dm_segs[i].ds_len > MT_TXD_LEN_MASK) {
+			bus_dmamap_unload(sc->sc_dmat, mt->mt_map);
+			return EFBIG;
+		}
 	}
 
 	bus_dmamap_sync(sc->sc_dmat, mt->mt_map, 0, mt->mt_map->dm_mapsize,
@@ -3309,8 +3388,6 @@ mwx_txwi_enqueue(struct mwx_softc *sc, struct mwx_txwi *mt, struct mbuf *m)
 	bus_dmamap_sync(sc->sc_dmat, q->mt_map, 0, q->mt_map->dm_mapsize,
 	    BUS_DMASYNC_PREWRITE);
 	for (i = 0; i < nsegs; i++) {
-		KASSERT(mt->mt_map->dm_segs[i].ds_addr <= UINT32_MAX);
-		KASSERT(mt->mt_map->dm_segs[i].ds_len <= MT_TXD_LEN_MASK);
 		addr = mt->mt_map->dm_segs[i].ds_addr;
 		len = mt->mt_map->dm_segs[i].ds_len;
 
@@ -3429,8 +3506,10 @@ mwx_queue_free(struct mwx_softc *sc, struct mwx_queue *q)
 	if (q->mq_seg.ds_len != 0)
 		bus_dmamem_unmap(sc->sc_dmat, (caddr_t)q->mq_desc,
 			q->mq_count * sizeof(*q->mq_desc));
-	if (q->mq_map != NULL)
+	if (q->mq_map != NULL) {
 		bus_dmamem_free(sc->sc_dmat, &q->mq_seg, 1);
+		bus_dmamap_destroy(sc->sc_dmat, q->mq_map);
+	}
 
 	memset(q, 0, sizeof(*q));
 }
@@ -3509,13 +3588,18 @@ mwx_buf_fill(struct mwx_softc *sc, struct mwx_queue_data *md,
 		return (rv);
 	}
 
+	if (md->md_map->dm_nsegs != 1 ||
+	    md->md_map->dm_segs[0].ds_addr > UINT32_MAX ||
+	    md->md_map->dm_segs[0].ds_len > MT_RX_BUF_SIZE) {
+		bus_dmamap_unload(sc->sc_dmat, md->md_map);
+		m_freem(m);
+		return EFBIG;
+	}
+
 	bus_dmamap_sync(sc->sc_dmat, md->md_map, 0,
 	    md->md_map->dm_mapsize, BUS_DMASYNC_PREREAD);
 
 	md->md_mbuf = m;
-
-	KASSERT(md->md_map->dm_nsegs == 1);
-	KASSERT(md->md_map->dm_segs[0].ds_addr <= UINT32_MAX);
 	buf0 = md->md_map->dm_segs[0].ds_addr;
 	len0 = md->md_map->dm_segs[0].ds_len;
 	ctrl = MT_DMA_CTL_SD_LEN0(len0);
@@ -3533,7 +3617,7 @@ int
 mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 {
 	u_int idx, last;
-	int rv;
+	int rv = 0;
 
 	last = (q->mq_count + q->mq_cons - 1) % q->mq_count;
 	idx = q->mq_prod;
@@ -3546,7 +3630,9 @@ mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 		if (rv != 0) {
 			printf("%s: could not fill data, slot %d err %d\n",
 			    DEVNAME(sc), idx, rv);
-			return rv;
+			/* Commit earlier slots even on failure. Retrying from the old
+			 * producer would overwrite and leak their mbufs. */
+			break;
 		}
 		idx = (idx + 1) % q->mq_count;
 	}
@@ -3557,7 +3643,7 @@ mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 	q->mq_prod = idx;
 	mwx_write(sc, q->mq_regbase + MT_DMA_CPU_IDX, q->mq_prod);
 
-	return 0;
+	return rv;
 }
 
 int
@@ -3598,11 +3684,17 @@ mwx_dma_alloc(struct mwx_softc *sc)
 	return 0;
 }
 
-int
-mwx_dma_reset(struct mwx_softc *sc, int fullreset)
+static IOReturn
+mwx_dma_reset_gated(OSObject *, void *arg, void *reset, void *, void *)
 {
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	int fullreset = (int)(uintptr_t)reset;
 	int rv;
 
+	/* MtkWireless: an already queued RX interrupt must finish before any
+	 * host buffer is reclaimed. No MCU request/wait belongs in this gate. */
+	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
 	DPRINTF("%s: DMA reset\n", DEVNAME(sc));
 
 	if ((rv = mwx_dma_disable(sc, fullreset)) != 0)
@@ -3626,7 +3718,7 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 	 */
 	IOLockLock(mwx_txq_lock);
 	for (u_int i = 0; i < sc->sc_txwi.mt_count; i++)
-		mwx_txwi_put(sc, &sc->sc_txwi.mt_data[i]);
+		mwx_txwi_put_locked(sc, &sc->sc_txwi.mt_data[i]);
 	IOLockUnlock(mwx_txq_lock);
 
 	/* refill RX queues */
@@ -3639,6 +3731,20 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 	mwx_dma_enable(sc);
 
 	return 0;
+}
+
+int
+mwx_dma_reset(struct mwx_softc *sc, int fullreset)
+{
+	pci_intr_handle_t ih = (pci_intr_handle_t)sc->sc_ih;
+
+	if (!ih || !ih->workloop || !sc->sc_txq.mq_map ||
+	    !sc->sc_txmcuq.mq_map || !sc->sc_txfwdlq.mq_map ||
+	    !sc->sc_rxq.mq_map || !sc->sc_rxmcuq.mq_map ||
+	    !sc->sc_rxfwdlq.mq_map)
+		return ENXIO;
+	return ih->workloop->runAction(mwx_dma_reset_gated, ih, sc,
+	    (void *)(uintptr_t)fullreset);
 }
 
 /* Firmware clears NEED_REINIT when deep sleep loses the WFDMA context.
@@ -4194,11 +4300,12 @@ mwx_dma_rx_done(struct mwx_softc *sc, struct mwx_queue *q)
 	struct mbuf_list ml = MBUF_LIST_INITIALIZER();
 
 	mwx_dma_rx_dequeue(sc, q, &ml);
+	/* Refill even when every consumed frame was rejected. The periodic
+	 * DMA watchdog retries partial refills if no further IRQ can arrive. */
+	mwx_queue_fill(sc, q);
 
 	if (ml_empty(&ml))
 		return;
-
-	mwx_queue_fill(sc, q);	/* TODO what if it fails, run timer? */
 
 	mwx_dma_rx_process(sc, &ml);
 }
@@ -4216,6 +4323,9 @@ mwx_mcu_alloc_msg(size_t len)
 	mbuf_setlen(m, len + headspace);
 	mbuf_pkthdr_setlen(m, len + headspace);
 	m_adj(m, headspace);
+	/* MtkWireless: MCU request padding and optional fields must never
+	 * contain stale heap bytes (notably TX-power last_msg). */
+	memset(mtod(m, void *), 0, len);
 
 	return m;
 }
@@ -4230,6 +4340,95 @@ mwx_mcu_set_len(struct mbuf *m, void *end)
 	KASSERT(start <= finish && finish - start <= len);
 	adj = len - (finish - start);
 	m_adj(m, -adj);
+}
+
+/* MtkWireless: reserve sequence IDs across task and workloop senders. The
+ * mutex protects only bookkeeping; no DMA submit, allocation/free or MCU wait
+ * may run under it. Async ACKs and timed-out replies never own a waiter. */
+static uint8_t
+mwx_mcu_claim_seq(struct mwx_softc *sc, uint32_t cmd, bool waiting)
+{
+	struct mbuf *old = NULL;
+	uint8_t seq = 0;
+
+	IOLockLock(mwx_txq_lock);
+	if (sc->sc_mcu_cookie != UINT64_MAX) {
+		for (unsigned i = 1; i < nitems(sc->sc_mcu_wait); i++) {
+			sc->sc_mcu_seq = sc->sc_mcu_seq % 15 + 1;
+			auto *w = &sc->sc_mcu_wait[sc->sc_mcu_seq];
+			if (w->mcu_busy)
+				continue;
+			old = w->mcu_m;
+			memset(w, 0, sizeof(*w));
+			w->mcu_cmd = cmd;
+			w->mcu_cookie = ++sc->sc_mcu_cookie;
+			w->mcu_busy = true;
+			w->mcu_waiting = waiting;
+			seq = sc->sc_mcu_seq;
+			break;
+		}
+	}
+	IOLockUnlock(mwx_txq_lock);
+	if (old) m_freem(old);
+	return seq;
+}
+
+static void
+mwx_mcu_cancel_seq(struct mwx_softc *sc, uint32_t cmd, int seq)
+{
+	struct mbuf *m = NULL;
+	if (seq <= 0 || (unsigned)seq >= nitems(sc->sc_mcu_wait))
+		return;
+	IOLockLock(mwx_txq_lock);
+	auto *w = &sc->sc_mcu_wait[seq];
+	if (w->mcu_cmd == cmd) {
+		m = w->mcu_m;
+		memset(w, 0, sizeof(*w));
+	}
+	IOLockUnlock(mwx_txq_lock);
+	if (m) m_freem(m);
+}
+
+static bool
+mwx_mcu_complete_seq(struct mwx_softc *sc, int seq, uint32_t cmd,
+    uint64_t cookie, struct mbuf *m, uint32_t value)
+{
+	if (seq <= 0 || (unsigned)seq >= nitems(sc->sc_mcu_wait))
+		return false;
+	bool accepted = false;
+	IOLockLock(mwx_txq_lock);
+	auto *w = &sc->sc_mcu_wait[seq];
+	if (w->mcu_busy && w->mcu_waiting && !w->mcu_done &&
+	    w->mcu_cmd == cmd && w->mcu_cookie == cookie) {
+		w->mcu_m = m;
+		w->mcu_int = value;
+		w->mcu_done = 1;
+		accepted = true;
+	}
+	IOLockUnlock(mwx_txq_lock);
+	return accepted;
+}
+
+static int
+mwx_mcu_pop_seq(struct mwx_softc *sc, uint32_t cmd, int seq,
+    uint32_t *value, struct mbuf **out)
+{
+	if (seq <= 0 || (unsigned)seq >= nitems(sc->sc_mcu_wait))
+		return EINVAL;
+	struct mbuf *m;
+	IOLockLock(mwx_txq_lock);
+	auto *w = &sc->sc_mcu_wait[seq];
+	if (!w->mcu_busy || !w->mcu_waiting || !w->mcu_done || w->mcu_cmd != cmd) {
+		IOLockUnlock(mwx_txq_lock);
+		return EINVAL;
+	}
+	m = w->mcu_m;
+	if (value) *value = w->mcu_int;
+	memset(w, 0, sizeof(*w));
+	IOLockUnlock(mwx_txq_lock);
+	if (out) *out = m;
+	else if (m) m_freem(m);
+	return 0;
 }
 
 int
@@ -4249,11 +4448,6 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 		goto enqueue;
 	}
 
-	seq = ++sc->sc_mcu_seq & 0x0f;
-	if (seq == 0)
-		seq = ++sc->sc_mcu_seq & 0x0f;
-
-	KASSERT(seq < nitems(sc->sc_mcu_wait));
 	txd_len = cmd & MCU_CMD_FIELD_UNI ? sizeof(*uni_txd) : sizeof(*mcu_txd);
 	tot_len = txd_len + len;
 	lead = m_leadingspace(m);
@@ -4289,6 +4483,11 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 	}
 	txd = mtod(m, uint32_t *);
 	memset(txd, 0, txd_len);
+	seq = mwx_mcu_claim_seq(sc, cmd, seqp != NULL);
+	if (!seq) {
+		m_freem(m);
+		return EBUSY;
+	}
 
 	val = (tot_len & MT_TXD0_TX_BYTES_MASK) |
 	    MT_TX_TYPE_CMD | MT_TXD0_Q_IDX(MT_TX_MCU_PORT_RX_Q0);
@@ -4331,11 +4530,8 @@ mwx_mcu_send_mbuf(struct mwx_softc *sc, uint32_t cmd, struct mbuf *m, int *seqp)
 		}
 	}
 
-	if (seqp != NULL) {
-		memset(&sc->sc_mcu_wait[seq], 0, sizeof(sc->sc_mcu_wait[0]));
-		sc->sc_mcu_wait[seq].mcu_cmd = cmd;
+	if (seqp != NULL)
 		*seqp = seq;
-	}
 	q = &sc->sc_txmcuq;
 enqueue:
 
@@ -4367,12 +4563,10 @@ enqueue:
 		tsleep_nsec(q, 0, "mwxq", MSEC_TO_NSEC(100));
 	}
 	splx(s);
-	if (rv != 0) {
-		if (seqp != NULL)
-			memset(&sc->sc_mcu_wait[seq], 0,
-			    sizeof(sc->sc_mcu_wait[0]));
+	if (seq && (rv != 0 || seqp == NULL))
+		mwx_mcu_cancel_seq(sc, cmd, seq);
+	if (rv != 0)
 		m_freem(m);
-	}
 	return rv;
 }
 
@@ -4562,7 +4756,17 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 			break;
 		}
 
+		uint64_t cookie;
+		IOLockLock(mwx_txq_lock);
+		if (!sc->sc_mcu_wait[rxd_seq].mcu_busy ||
+		    !sc->sc_mcu_wait[rxd_seq].mcu_waiting ||
+		    sc->sc_mcu_wait[rxd_seq].mcu_done) {
+			IOLockUnlock(mwx_txq_lock);
+			break; // late/async/duplicate response: caller retains no mbuf
+		}
 		cmd = sc->sc_mcu_wait[rxd_seq].mcu_cmd;
+		cookie = sc->sc_mcu_wait[rxd_seq].mcu_cookie;
+		IOLockUnlock(mwx_txq_lock);
 
 		if (cmd == MCU_CMD_PATCH_SEM_CONTROL ||
 		    cmd == MCU_CMD_PATCH_FINISH_REQ) {
@@ -4597,9 +4801,8 @@ mwx_mcu_rx_event(struct mwx_softc *sc, struct mbuf *m)
 			mcu_int = le32toh(event->val);
 		}
 
-		sc->sc_mcu_wait[rxd_seq].mcu_int = mcu_int;
-		sc->sc_mcu_wait[rxd_seq].mcu_m = m;
-		sc->sc_mcu_wait[rxd_seq].mcu_done = 1;
+		if (!mwx_mcu_complete_seq(sc, rxd_seq, cmd, cookie, m, mcu_int))
+			break;
         if(gMwxHal) gMwxHal->mwxWakeup(&sc->sc_mcu_wait[rxd_seq]);
         else wakeup(&sc->sc_mcu_wait[rxd_seq]);
 		return;
@@ -4633,17 +4836,22 @@ mwx_dump_mcu_state(struct mwx_softc *sc, uint32_t cmd, int seq)
 static int
 mwx_mcu_sleep_resp(struct mwx_softc *sc, uint32_t cmd, int seq)
 {
-	int i;
-
-	for (i = 0; i < 300; i++) {
-		if (sc->sc_mcu_wait[seq].mcu_done)
-			return 0;
-		tsleep_nsec(&sc->sc_mcu_wait[seq], 0, "mwxwait",
-		    MSEC_TO_NSEC(10));
+	if (seq <= 0 || (unsigned)seq >= nitems(sc->sc_mcu_wait))
+		return EINVAL;
+	for (unsigned i = 0; i <= 300; i++) {
+		IOLockLock(mwx_txq_lock);
+		auto *w = &sc->sc_mcu_wait[seq];
+		bool owned = w->mcu_busy && w->mcu_waiting && w->mcu_cmd == cmd;
+		bool done = w->mcu_done != 0;
+		IOLockUnlock(mwx_txq_lock);
+		if (!owned) return EINVAL;
+		if (done) return 0;
+		if (i < 300)
+			tsleep_nsec(w, 0, "mwxwait", MSEC_TO_NSEC(10));
 	}
-	if (sc->sc_mcu_wait[seq].mcu_done)
-		return 0;
+	IOLockLock(mwx_txq_lock);
 	sc->sc_mcu_timeouts++;
+	IOLockUnlock(mwx_txq_lock);
 	mwx_dump_mcu_state(sc, cmd, seq);
 	return EWOULDBLOCK;
 }
@@ -4652,49 +4860,38 @@ int
 mwx_mcu_wait_resp_int(struct mwx_softc *sc, uint32_t cmd, int seq,
     uint32_t *val)
 {
-	int rv;
-
-	KASSERT(seq < nitems(sc->sc_mcu_wait));
-
-	rv = mwx_mcu_sleep_resp(sc, cmd, seq);
+	int rv = mwx_mcu_sleep_resp(sc, cmd, seq);
 	if (rv != 0) {
-		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
-		mwx_reset(sc);
+		mwx_mcu_cancel_seq(sc, cmd, seq);
+		if (rv == EWOULDBLOCK) {
+			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			mwx_reset(sc);
+		}
 		return rv;
 	}
-
-	if (sc->sc_mcu_wait[seq].mcu_m != NULL) {
-		m_freem(sc->sc_mcu_wait[seq].mcu_m);
-		sc->sc_mcu_wait[seq].mcu_m = NULL;
-	}
-	if (val != NULL)
-		*val = sc->sc_mcu_wait[seq].mcu_int;
-	return 0;
+	return mwx_mcu_pop_seq(sc, cmd, seq, val, NULL);
 }
 
 int
 mwx_mcu_wait_resp_msg(struct mwx_softc *sc, uint32_t cmd, int seq,
     struct mbuf **mp)
 {
-	int rv;
-
-	KASSERT(seq < nitems(sc->sc_mcu_wait));
-
-	rv = mwx_mcu_sleep_resp(sc, cmd, seq);
+	struct mbuf *m = NULL;
+	if (mp) *mp = NULL;
+	int rv = mwx_mcu_sleep_resp(sc, cmd, seq);
 	if (rv != 0) {
-		printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
-		mwx_reset(sc);
+		mwx_mcu_cancel_seq(sc, cmd, seq);
+		if (rv == EWOULDBLOCK) {
+			printf("%s: command %x timeout\n", DEVNAME(sc), cmd);
+			mwx_reset(sc);
+		}
 		return rv;
 	}
-	if (sc->sc_mcu_wait[seq].mcu_m == NULL) {
-		printf("%s: command response missing\n", DEVNAME(sc));
-		return ENOENT;
-	}
-	if (mp != NULL)
-		*mp = sc->sc_mcu_wait[seq].mcu_m;
-	else
-		m_freem(sc->sc_mcu_wait[seq].mcu_m);
-	sc->sc_mcu_wait[seq].mcu_m = NULL;
+	rv = mwx_mcu_pop_seq(sc, cmd, seq, NULL, &m);
+	if (rv) return rv;
+	if (!m) return ENOENT;
+	if (mp) *mp = m;
+	else m_freem(m);
 	return 0;
 }
 
@@ -4903,7 +5100,7 @@ mwx_reg_addr(struct mwx_softc *sc, uint32_t reg)
 			continue;
 
 		ofs = reg - fixed_map[i].phys;
-		if (ofs > fixed_map[i].size)
+		if (ofs >= fixed_map[i].size)
 			continue;
 
 		return fixed_map[i].mapped + ofs;
@@ -5123,6 +5320,12 @@ mwx_load_firmware(struct mwx_softc *sc)
 	    buflen, fwlen);
 
 	rv = mwx_mcu_patch_sem_ctrl(sc, 1);
+	if (rv == -1) {
+		/* PATCH_IS_DL: no semaphore was acquired. Keep the ROM patch,
+		 * but still download/start the RAM image as mt76 does. */
+		MWX_DEV_LOG(sc, "ROM patch already downloaded; loading WM firmware\n");
+		goto load_ram;
+	}
 	if (rv != 0) {
 		MWX_DEV_LOG(sc, "patch semaphore acquire failed error=%d\n", rv);
 		goto fail;
@@ -5180,6 +5383,7 @@ out:
 	if (rv != 0)
 		goto fail;
 
+load_ram:
 	mtk_wlan_ram_info rinfo;
 	if ((rv = mtk_wlan_ram_parse(fwbuf, fwlen, &rinfo)) != 0) {
 		MWX_DEV_LOG(sc, "invalid WM firmware size=%zu\n", fwlen);
@@ -6024,7 +6228,7 @@ mwx_scan_timeo(void *arg)
 	MWX_DEV_LOG(sc, "scan watchdog: no SCAN_DONE, ending scan (fired=%u)\n",
 	    sc->sc_scan_watchdog_fired);
 	mt7921_mcu_hw_scan_cancel(sc);
-	task_add(systq, &sc->sc_scan_task);
+	task_add(sc->sc_nswq, &sc->sc_scan_task);
 }
 
 void
@@ -6087,6 +6291,12 @@ mwx_dma_timeo(void *arg)
 	    sc->sc_detaching)
 		return;
 
+	/* Timer callbacks share the interrupt workloop gate. Retry RX rings
+	 * under memory pressure even if a drained ring produces no more IRQs. */
+	mwx_queue_fill(sc, &sc->sc_rxq);
+	mwx_queue_fill(sc, &sc->sc_rxmcuq);
+	mwx_queue_fill(sc, &sc->sc_rxfwdlq);
+
 	if ((mwx_read(sc, MT_WFDMA0_GLO_CFG) & MT_WFDMA0_GLO_CFG_TX_DMA_EN) == 0 &&
 	    !sc->sc_dma_stall_logged) {
 		sc->sc_dma_stall_logged = 1;
@@ -6094,7 +6304,7 @@ mwx_dma_timeo(void *arg)
 		mwx_dump_dma_state(sc, "TX DMA disabled");
 		if (sc->sc_knobs & MWX_KNOB_AUTORESET) {
 			sc->sc_resetting = 1;
-			task_add(systq, &sc->sc_fullreset_task);
+			task_add(sc->sc_nswq, &sc->sc_fullreset_task);
 			return;
 		}
 	}
@@ -6117,8 +6327,8 @@ mwx_fullreset_task(void *arg)
 		mwx_stop(ifp);
 	else
 		mwx_awdl_quiesce(sc);
-	rv = mwx_wfsys_reset(sc);
-	MWX_DEV_LOG(sc, "full reset wfsys rv=%d\n", rv);
+	/* mwx_init_hardware performs the WFSYS/ring reset once, under the
+	 * interrupt gate. Do not reset live RX hardware here outside it. */
 	sc->sc_fw_restart = 1;
 	/* Channel/media setup from preinit stays valid; only redo hardware. */
 	rv = mwx_init_hardware(sc);
@@ -6193,7 +6403,7 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 
 	if (mt7921_mcu_hw_scan_cancel(sc) != 0)
 		return;
-	task_add(systq, &sc->sc_scan_task);
+	task_add(sc->sc_nswq, &sc->sc_scan_task);
 }
 
 int
@@ -6480,7 +6690,7 @@ mt7921_mcu_rate_txpower_band(struct mwx_softc *sc, int band,
 	int rv = 0, idx, j;
 
 	for (idx = 0; idx < n_chans; ) {
-		int num_ch = batch_size;
+		int num_ch = MIN(batch_size, n_chans - idx);
 
 		m = mwx_mcu_alloc_msg(len);
 		if (m == NULL)
@@ -6488,14 +6698,9 @@ mt7921_mcu_rate_txpower_band(struct mwx_softc *sc, int band,
 		tx_power_tlv = mtod(m, struct mt76_connac_tx_power_limit_tlv *);
 		tx_power_tlv->n_chan = num_ch;
 		tx_power_tlv->band = band;
+		tx_power_tlv->last_msg = is_last && idx + num_ch == n_chans;
 		memcpy(tx_power_tlv->alpha2, sc->sc_alpha2,
 		    sizeof(sc->sc_alpha2));
-
-		if (n_chans - idx < batch_size) {
-			num_ch = n_chans - idx;
-			if (is_last)
-				tx_power_tlv->last_msg = 1;
-		}
 
 		sku_tlv = (struct mt76_connac_sku_tlv *)(tx_power_tlv + 1);
 
@@ -6901,10 +7106,33 @@ mt7921_mcu_set_bss_pm(struct mwx_softc *sc, int enable)
 	return rv;
 }
 
+void
+mwx_update_edca(struct ieee80211com *ic)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)ic->ic_softc;
+	if (!sc->sc_detaching && sc->sc_nswq && (ic->ic_if.if_flags & IFF_RUNNING))
+		task_add(sc->sc_nswq, &sc->sc_edca_task);
+}
+
+void
+mwx_edca_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	MwxAwdlInfraOperation admission(sc);
+	if (sc->sc_detaching || sc->sc_resetting ||
+	    sc->sc_ic.ic_state != IEEE80211_S_RUN)
+		return;
+	if (mt7921_mcu_set_tx(sc, &sc->sc_vif)) mwx_reset(sc);
+}
+
 #define IEEE80211_NUM_ACS	4
 int
 mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 {
+	struct ieee80211com *ic = &sc->sc_ic;
+	const bool qos = mvif->idx == sc->sc_vif.idx &&
+	    (ic->ic_flags & IEEE80211_F_QOS) && ic->ic_bss &&
+	    (ic->ic_bss->ni_flags & IEEE80211_NODE_QOS);
 	struct edca {
 		uint16_t	cw_min;
 		uint16_t	cw_max;
@@ -6921,7 +7149,7 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 		uint8_t		pad;
 	} __packed req = {
 		.bss_idx = mvif->idx,
-		.qos = /* vif->bss_conf.qos */ 0,
+		.qos = (uint8_t)qos,
 		.wmm_idx = mvif->wmm_idx,
 	};
 #ifdef NOTYET
@@ -6949,29 +7177,21 @@ mt7921_mcu_set_tx(struct mwx_softc *sc, struct mwx_vif *mvif)
 		.wmm_idx = mvif->mt76.wmm_idx,
 	};
 #endif
-	static const int to_aci[] = { 1, 0, 2, 3 };
 	int ac, rv;
 
+	/* net80211 already indexes by ACI (BE/BK/VI/VO). Linux first maps
+	 * mac80211 AC to LMAC with 3-ac, then swaps LMAC's BK/BE here; do not
+	 * apply that second conversion to net80211's already-ordered table. */
 	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
-		//struct ieee80211_tx_queue_params *q = &mvif->queue_params[ac];
-		struct edca *e = &req.edca[to_aci[ac]];
-
-		e->aifs = htole16(/* q->aifs */ 2);
-		e->txop = htole16(/* q->txop */ 0);
-
-#ifdef NOTYET
-		if (q->cw_min)
-			e->cw_min = htole16(q->cw_min);
-		else
-#endif
-			e->cw_min = htole16(5);
-
-#ifdef NOTYET
-		if ( q->cw_max)
-			e->cw_max = htole16(q->cw_max);
-		else
-#endif
-			e->cw_max = htole16(10);
+		struct edca *e = &req.edca[ac];
+		const struct ieee80211_edca_ac_params *q = &ic->ic_edca_ac[ac];
+		unsigned cw_min = qos ? (1u << MIN(q->ac_ecwmin, 15)) - 1 : 0;
+		unsigned cw_max = qos ? (1u << MIN(q->ac_ecwmax, 15)) - 1 : 0;
+		e->aifs = htole16(qos ? q->ac_aifsn : 2);
+		e->txop = htole16(qos ? q->ac_txoplimit : 0);
+		e->cw_min = htole16(cw_min ? cw_min : 5);
+		e->cw_max = htole16(cw_max ? cw_max : 10);
+		e->acm = qos && q->ac_acm;
 	}
 
 	rv = mwx_mcu_send_msg(sc, MCU_CE_CMD_SET_EDCA_PARMS, &req,
@@ -7456,14 +7676,18 @@ mt7921_mac_write_txwi(struct mwx_softc *sc, struct mbuf *m,
 	if (info->flags & IEEE80211_TX_CTL_NO_ACK)
 		val |= MT_TXD3_NO_ACK;
 #endif
-	/*
-	 * MtkWireless: keep the PM bit of the AWDL power-save null frames
-	 * (mwx_awdl_infra_pm); without SW_POWER_MGMT the MAC rewrites it.
-	 */
-	if (!awdl && (wh->i_fc[0] & (IEEE80211_FC0_TYPE_MASK |
-	    IEEE80211_FC0_SUBTYPE_MASK)) ==
-	    (IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_NODATA))
-		val |= MT_TXD3_SW_POWER_MGMT;
+	/* Null/QoS-Null keeps its explicit PM=1/0 announcement, including wake.
+	 * Ordinary uplink data during an off-channel PM handshake must not tell
+	 * the AP we are awake again while the ROC grant is still pending. */
+	if (!awdl && (wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) == IEEE80211_FC0_TYPE_DATA) {
+		if (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_NODATA)
+			val |= MT_TXD3_SW_POWER_MGMT;
+		else if (mwx_infra_ps(sc) &&
+		    (wh->i_fc[1] & IEEE80211_FC1_DIR_MASK) == IEEE80211_FC1_DIR_TODS) {
+			wh->i_fc[1] |= IEEE80211_FC1_PWR_MGT;
+			val |= MT_TXD3_SW_POWER_MGMT;
+		}
+	}
 	txp->txwi[3] = htole32(val);
 	txp->txwi[4] = 0;
 
@@ -8510,6 +8734,8 @@ MtkMwx::detach(IOPCIDevice *device)
         pci_intr_disestablish(pci->pa_pc, com->sc_ih);
         com->sc_ih = NULL;
     }
+    for (unsigned seq=1;seq<nitems(com->sc_mcu_wait);++seq)
+        mwx_mcu_cancel_seq(com,com->sc_mcu_wait[seq].mcu_cmd,seq);
     if (com->sc_memh) {
         mwx_write(com, MT_WFDMA0_HOST_INT_ENA, 0);
         mwx_dma_disable(com, 1);
@@ -8714,160 +8940,6 @@ MtkMwx::clearScanningFlags()
 	if (com) {
 		com->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 		com->sc_ic.ic_wcl_scan_inflight = false;
-	}
-}
-
-void
-MtkMwx::fillDebug(void *out)
-{
-	struct ioctl_debug *d = (struct ioctl_debug *)out;
-	struct mwx_softc *sc = com;
-
-	d->version = IOCTL_VERSION;
-	if (sc == NULL)
-		return;
-	d->ic_state = sc->sc_ic.ic_state;
-	d->sc_flags = sc->sc_flags;
-	d->intr_count = sc->sc_intr_count;
-	d->mcu_events = sc->sc_mcu_events;
-	d->last_mcu_eid = sc->sc_last_mcu_eid;
-	d->mcu_bad_seq = sc->sc_mcu_bad_seq;
-	d->mcu_timeouts = sc->sc_mcu_timeouts;
-	d->scan_requests = sc->sc_scan_requests;
-	d->scan_done_count = sc->sc_scan_done_count;
-	d->scan_watchdog_fired = sc->sc_scan_watchdog_fired;
-	d->rx_pkt_normal = sc->sc_rx_pkt_normal;
-	d->rx_pkt_unknown = sc->sc_rx_pkt_unknown;
-	d->rx_fill_fail = sc->sc_rx_fill_fail;
-	d->lpctl = mwx_read(sc, MT_CONN_ON_LPCTL);
-	d->int_sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
-	d->int_ena = mwx_read(sc, MT_WFDMA0_HOST_INT_ENA);
-#define MWX_DBG_Q(q, p) do { \
-	d->p##_cpu = mwx_read(sc, (q).mq_regbase + MT_DMA_CPU_IDX); \
-	d->p##_dma = mwx_read(sc, (q).mq_regbase + MT_DMA_DMA_IDX); \
-	d->p##_cons = (q).mq_cons; \
-} while (0)
-	MWX_DBG_Q(sc->sc_rxmcuq, rxmcu);
-	MWX_DBG_Q(sc->sc_rxfwdlq, rxfwdl);
-	MWX_DBG_Q(sc->sc_rxq, rxdata);
-	MWX_DBG_Q(sc->sc_txmcuq, txmcu);
-#undef MWX_DBG_Q
-	d->nodes = mwx_count_nodes(&sc->sc_ic);
-	d->intr_index = mtk_compat_intr_index;
-	d->intr_is_msi = mtk_compat_intr_is_msi;
-
-	struct ieee80211_node *ni = sc->sc_ic.ic_bss;
-	if (ni != NULL) {
-		d->port_valid = ni->ni_port_valid;
-		d->node_flags = ((struct mwx_node *)ni)->flags;
-		d->wcid = ((struct mwx_node *)ni)->wcid;
-		d->rsn_supp_state = ni->ni_rsn_supp_state;
-	}
-	d->txdata_cpu = mwx_read(sc, sc->sc_txq.mq_regbase + MT_DMA_CPU_IDX);
-	d->txdata_dma = mwx_read(sc, sc->sc_txq.mq_regbase + MT_DMA_DMA_IDX);
-	d->txdata_cons = sc->sc_txq.mq_cons;
-	d->rx_delivered = sc->sc_rx_delivered;
-	d->rx_normal_mcu = sc->sc_rx_pkt_normal_mcu;
-	d->rx_event = sc->sc_rx_pkt_event;
-	d->rx_notify = sc->sc_rx_pkt_txrx_notify;
-	d->if_ierrors = sc->sc_ic.ic_if.if_ierrors;
-	d->if_oerrors = sc->sc_ic.ic_if.if_oerrors;
-
-	d->aspm_lnkctl_before = mtk_aspm_lnkctl_before;
-	d->aspm_lnkctl_after = mtk_aspm_lnkctl_after;
-	d->aspm_l1ss_before = mtk_aspm_l1ss_before;
-	d->aspm_l1ss_after = mtk_aspm_l1ss_after;
-	d->aspm_parent_l1ss_before = mtk_aspm_parent_l1ss_before;
-	d->glo_cfg = mwx_read(sc, MT_WFDMA0_GLO_CFG);
-	d->dummy_cr = mwx_read(sc, MT_WFDMA_DUMMY_CR);
-	d->mcu_cmd = mwx_read(sc, MT_MCU_CMD);
-	d->knobs = sc->sc_knobs;
-	d->dma_stalls = sc->sc_dma_stalls;
-	d->full_resets = sc->sc_full_resets;
-	d->mcu_cmd_irqs = sc->sc_mcu_cmd_irqs;
-	d->last_mcu_cmd = sc->sc_last_mcu_cmd;
-
-	struct ieee80211_stats *st = &sc->sc_ic.ic_stats;
-	d->rx_ctl = sc->sc_rx_ctl;
-	d->rx_bar = sc->sc_rx_bar;
-	d->rx_dup = st->is_rx_dup;
-	d->ba_agreements = st->is_ht_rx_ba_agreements;
-	d->ba_below_winstart = st->is_ht_rx_frame_below_ba_winstart;
-	d->ba_above_winend = st->is_ht_rx_frame_above_ba_winend;
-	d->ba_window_slide = st->is_ht_rx_ba_window_slide;
-	d->ba_window_jump = st->is_ht_rx_ba_window_jump;
-	d->ba_no_buf = st->is_ht_rx_ba_no_buf;
-	d->ba_frame_lost = st->is_ht_rx_ba_frame_lost;
-	d->ba_gap_timeout = st->is_ht_rx_ba_window_gap_timeout;
-	d->ba_gap_timeout_ms = sc->sc_ic.ic_ba_gap_timeout_ms > 0 ?
-	    sc->sc_ic.ic_ba_gap_timeout_ms : IEEE80211_BA_GAP_TIMEOUT;
-	d->rx_batches = sc->sc_rx_batches;
-	d->tx_stalls = sc->sc_tx_stalls;
-	d->tx_nobufs = sc->sc_tx_nobufs;
-	d->tx_ring_full = sc->sc_tx_ring_full;
-	d->txwi_inuse = sc->sc_txwi.mt_inuse;
-	d->txwi_peak = sc->sc_txwi.mt_peak;
-	d->tx_oactive = ifq_is_oactive(&sc->sc_ic.ic_if.if_snd);
-	d->pci_status = pci_conf_read(sc->sc_pc, sc->sc_tag, 0x04);
-
-	/* The descriptor the TX data DMA engine is stuck on, if any. */
-	uint32_t idx = d->txdata_dma % sc->sc_txq.mq_count;
-	struct mwx_desc *desc = &sc->sc_txq.mq_desc[idx];
-	d->txdata_desc[0] = le32toh(desc->buf0);
-	d->txdata_desc[1] = le32toh(desc->ctrl);
-	d->txdata_desc[2] = le32toh(desc->buf1);
-	d->txdata_desc[3] = le32toh(desc->info);
-	struct mwx_txwi *mt = sc->sc_txq.mq_data[idx].md_txwi;
-	if (mt != NULL && mt->mt_desc != NULL) {
-		struct mt76_connac_txp_ptr *ptr = &mt->mt_desc->ptr[0];
-		d->txdata_txp[0] = le32toh(ptr->buf0);
-		d->txdata_txp[1] = le16toh(ptr->len0) | (le16toh(ptr->len1) << 16);
-		d->txdata_txp[2] = le32toh(ptr->buf1);
-		d->txdata_txp[3] = mt->mt_idx;
-	}
-}
-
-IOReturn
-MtkMwx::debugSet(uint32_t op, uint32_t val)
-{
-	struct mwx_softc *sc = com;
-
-	if (sc == NULL)
-		return kIOReturnNotReady;
-	switch (op) {
-	case IOCTL_DEBUG_OP_KNOBS:
-		MWX_DEV_LOG(sc, "knobs 0x%x -> 0x%x\n", sc->sc_knobs, val);
-		sc->sc_knobs = val;
-		/* net80211 checks this before each ADDBA request. */
-		if (val & MWX_KNOB_NO_TXBA)
-			sc->sc_ic.ic_caps &= ~IEEE80211_C_TX_AMPDU;
-		else
-			sc->sc_ic.ic_caps |= IEEE80211_C_TX_AMPDU;
-		return kIOReturnSuccess;
-	case IOCTL_DEBUG_OP_RESET:
-		if (sc->sc_detaching)
-			return kIOReturnNotReady;
-		task_add(systq, &sc->sc_fullreset_task);
-		return kIOReturnSuccess;
-	case IOCTL_DEBUG_OP_DUMP:
-		mwx_dump_dma_state(sc, "user");
-		return kIOReturnSuccess;
-	case IOCTL_DEBUG_OP_BA_GAP:
-		if (val > 1000)
-			return kIOReturnBadArgument;
-		MWX_DEV_LOG(sc, "ba gap timeout %d -> %u ms\n",
-		    sc->sc_ic.ic_ba_gap_timeout_ms, val);
-		sc->sc_ic.ic_ba_gap_timeout_ms = val;
-		return kIOReturnSuccess;
-	case IOCTL_DEBUG_OP_BGSCAN_DWELL:
-		if (val > 200 && val != MWX_BGSCAN_DWELL_AUTO)
-			return kIOReturnBadArgument;
-		MWX_DEV_LOG(sc, "bgscan dwell %u -> %u ms\n",
-		    sc->sc_bgscan_dwell, val);
-		sc->sc_bgscan_dwell = val;
-		return kIOReturnSuccess;
-	default:
-		return kIOReturnBadArgument;
 	}
 }
 
@@ -9156,8 +9228,8 @@ mt7921_mcu_set_bss_he(struct mwx_softc *sc, struct ieee80211_node *ni,
 
 /*
  * HE (802.11ax) station capabilities, offered unless the amtk_he=0
- * boot-arg clears IEEE80211_F_HEON in ic_userflags (MtkWireless: on by
- * default; MWX_KNOB_NO_HE turns it off at runtime). A conservative profile
+ * boot-arg clears IEEE80211_F_HEON in ic_userflags. The conservative HAL
+ * default also sets MWX_KNOB_NO_HE; amtk_knobs=0x2 clears it. A conservative profile
  * like itlwm's: no TWT, OMI, STBC, beamforming, PPE thresholds or
  * A-MSDU in A-MPDU, and no 160 MHz since VHT does not offer it either.
  * mwx_apply_phy_knobs() sets the channel width bits for each join.
@@ -10088,7 +10160,7 @@ static int mwx_awdl_infra_pm(mwx_softc *sc, bool sleep)
 void MtkMwx::awdlInfraSleep(uint8_t channel)
 {
     MwxAwdlCall call(com);
-    if (!call.valid() || com->sc_resetting || com->sc_awdl_infra_ps)
+    if (!call.valid() || com->sc_resetting || mwx_infra_ps(com))
         return;
     uint8_t infra = awdlInfraChannel();
     if (!infra || channel == infra)
@@ -10102,7 +10174,7 @@ void MtkMwx::awdlInfraSleep(uint8_t channel)
         return;
     }
     if (mwx_awdl_infra_pm(com, true)) { ++com->sc_awdl_infra_ps_failed; return; }
-    com->sc_awdl_infra_ps = true;
+    mwx_set_infra_ps(com, true);
     com->sc_awdl_infra_ps_at = mwx_awdl_now();
     ++com->sc_awdl_infra_ps_sleeps;
     if (com->sc_ic.ic_join_diag.Active) {
@@ -10114,10 +10186,10 @@ void MtkMwx::awdlInfraSleep(uint8_t channel)
 void MtkMwx::awdlInfraWakeIfIdle()
 {
     MwxAwdlCall call(com);
-    if (!call.valid() || com->sc_resetting || !com->sc_awdl_infra_ps)
+    if (!call.valid() || com->sc_resetting || !mwx_infra_ps(com))
         return;
     uint8_t infra = awdlInfraChannel();
-    if (!infra) { com->sc_awdl_infra_ps = false; return; }
+    if (!infra) { mwx_set_infra_ps(com, false); return; }
     uint64_t now = mwx_awdl_now();
     IOLockLock(com->sc_awdl_lock);
     const mtkawdl::Reservation &roc = com->sc_awdl_roc;
@@ -10133,7 +10205,7 @@ void MtkMwx::awdlInfraWakeIfIdle()
     if (away)
         return;
     if (mwx_awdl_infra_pm(com, false)) { ++com->sc_awdl_infra_ps_failed; return; }
-    com->sc_awdl_infra_ps = false;
+    mwx_set_infra_ps(com, false);
     ++com->sc_awdl_infra_ps_wakes;
     if (com->sc_ic.ic_join_diag.Active) ++com->sc_ic.ic_join_diag.InfraPSWakes;
 }
@@ -10287,7 +10359,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable, const AwdlSyncG
             sc->sc_awdl_scan_suspended=false;
             if(running && !sc->sc_detaching && !sc->sc_resetting &&
                (sc->sc_ic.ic_state==IEEE80211_S_SCAN || (sc->sc_ic.ic_flags&IEEE80211_F_BGSCAN)))
-                task_add(systq,&sc->sc_scan_task);
+                task_add(sc->sc_nswq,&sc->sc_scan_task);
         }
         return rv ? kIOReturnIOError : kIOReturnSuccess;
     }
@@ -10452,8 +10524,8 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     uint8_t infra=awdlInfraChannel();
     if(infra && channel!=infra) {
         if(!mwx_awdl_offchan_enabled()) return kIOReturnBadArgument;
-        if(!com->sc_awdl_infra_ps) awdlInfraSleep(channel);
-        if(!com->sc_awdl_infra_ps || mwx_awdl_now()-com->sc_awdl_infra_ps_at<2000) {
+        if(!mwx_infra_ps(com)) awdlInfraSleep(channel);
+        if(!mwx_infra_ps(com) || mwx_awdl_now()-com->sc_awdl_infra_ps_at<2000) {
             ++com->sc_awdl_roc_pm_blocked;
             return kIOReturnNotReady;
         }
@@ -10641,7 +10713,7 @@ void MtkMwx::awdlPublishDiagnostics()
         radio.pending ? (observed<radio.deadline ? "waiting-grant" : "response-expired") :
         radio.granted ? (observed<radio.deadline ? "granted" : "grant-expired") : "idle";
     mwxController()->setProperty("MTKAWDLROCState",state);
-    mwxController()->setProperty("MTKAWDLInfraPowerSave",com->sc_awdl_infra_ps);
+    mwxController()->setProperty("MTKAWDLInfraPowerSave",mwx_infra_ps(com));
     mwxController()->setProperty("MTKAWDLInfraPSSleeps",com->sc_awdl_infra_ps_sleeps,64);
     mwxController()->setProperty("MTKAWDLInfraPSWakes",com->sc_awdl_infra_ps_wakes,64);
     mwxController()->setProperty("MTKAWDLInfraPSFailed",com->sc_awdl_infra_ps_failed,64);

@@ -72,7 +72,8 @@ def fixture():
     reserve_decl = re.search(r'^    IOReturn awdlReserve\([^\n]+;', header, re.M).group()
     reserve = definition(hal, 'IOReturn MtkMwx::awdlReserve(')
     admission = reserve[:reserve.index('    int abortRv=mwx_awdl_abort(com);')]
-    helpers = definition(hal, 'static bool mwx_awdl_current(mwx_softc *sc, uint32_t epoch)\n')
+    helpers = definition(hal, '#define mwx_infra_ps', '\n\n')
+    helpers += definition(hal, 'static bool mwx_awdl_current(mwx_softc *sc, uint32_t epoch)\n')
     for name in ('MwxAwdlCall', 'MwxAwdlOperation'):
         helpers += definition(hal, 'class ' + name + ' {', '\n};\n')
     helpers += definition(hal, 'static bool mwx_awdl_infra_joining(mwx_softc *sc)\n')

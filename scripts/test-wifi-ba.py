@@ -32,7 +32,7 @@ wire = '\n'.join(structure(reg, name) for name in
 # only mbuf allocation, response delivery and transport are mocked.
 a = hal.index('\t\t\tstruct mt7921_mcu_uni_event *event;', hal.index('mwx_mcu_rx_event('))
 decode = hal[a:hal.index('\n\t\t} else if (cmd == MCU_CE_QUERY_REG_READ)', a)]
-a = hal.index('sc->sc_mcu_wait[rxd_seq].mcu_int = mcu_int;')
+a = hal.index('if (!mwx_mcu_complete_seq(sc, rxd_seq, cmd, cookie, m, mcu_int))')
 store = hal[a:hal.index('        if(gMwxHal)', a)]
 helper_signature = 'static int\nmwx_ba_command('
 helper = function(helper_signature) if helper_signature in hal else ''
@@ -44,6 +44,7 @@ code = r'''
 #include <cstdio>
 #include <cstring>
 #include <vector>
+#include <mutex>
 #include <sys/types.h>
 #define __packed __attribute__((packed))
 #define nitems(a) int(sizeof(a)/sizeof((a)[0]))
@@ -102,7 +103,9 @@ struct task {};
 ''' + structure(hal, 'mwx_ba_task_arg') + r'''
 struct mwx_softc {
     ieee80211com sc_ic;mwx_vif sc_vif;
-    struct {uint32_t mcu_int=0;mbuf *mcu_m=nullptr;bool mcu_done=false;} sc_mcu_wait[16];
+    uint32_t sc_mcu_seq=0;uint64_t sc_mcu_cookie=0;
+    struct {mbuf *mcu_m=nullptr;uint32_t mcu_cmd=0,mcu_int=0;uint64_t mcu_cookie=0;
+        bool mcu_busy=false,mcu_waiting=false;volatile int mcu_done=0;} sc_mcu_wait[16];
     mwx_ba_task_arg sc_ba_arg[16]{};unsigned sc_ba_cur=0,sc_ba_tail=0,sc_knobs=0;
     void *sc_nswq=nullptr;task sc_ba_task;
     mwx_softc(){sc_ic.ic_softc=this;}
@@ -128,10 +131,20 @@ void ieee80211_addba_resp_refuse(ieee80211com *,ieee80211_node *ni,uint8_t tid,u
     assert(reason==IEEE80211_STATUS_UNSPECIFIED);
     ni->ni_tx_ba[tid].ba_state=IEEE80211_BA_INIT;++refused;
 }
-''' + function('void *\nmwx_append_len(') + function('void *\nmwx_append_tlv(') + \
+'''
+code += r'''
+std::mutex slotLock;bool slotLocked=false;void *mwx_txq_lock=nullptr;
+void IOLockLock(void *){assert(!slotLocked);slotLock.lock();slotLocked=true;}
+void IOLockUnlock(void *){assert(slotLocked);slotLocked=false;slotLock.unlock();}
+'''
+for signature in ['static uint8_t\nmwx_mcu_claim_seq(', 'static void\nmwx_mcu_cancel_seq(',
+                  'static bool\nmwx_mcu_complete_seq(', 'static int\nmwx_mcu_pop_seq(']:
+    code += function(signature)
+code += function('void *\nmwx_append_len(') + function('void *\nmwx_append_tlv(') + \
     function('struct mbuf *\nmwx_fill_sta_req_hdr(') + r'''
 bool deliverResponse(mwx_softc *sc,int rxd_seq,mbuf *m){
-    uint32_t mcu_int=0;
+    uint32_t mcu_int=0,cmd=sc->sc_mcu_wait[rxd_seq].mcu_cmd;
+    uint64_t cookie=sc->sc_mcu_wait[rxd_seq].mcu_cookie;
     switch(0){case 0:{
 ''' + decode + '\n' + store + r'''
         return true;
@@ -140,8 +153,9 @@ bool deliverResponse(mwx_softc *sc,int rxd_seq,mbuf *m){
 }
 int mwx_mcu_send_mbuf(mwx_softc *sc,uint32_t cmd,mbuf *m,int *seq){
     assert(cmd==MCU_UNI_CMD_STA_REC_UPDATE && commands.size()<2);
-    unsigned index=commands.size();*seq=int(index)+1;
-    sc->sc_mcu_wait[*seq]={};
+    unsigned index=commands.size();if(!index)sc->sc_mcu_seq=0;
+    *seq=mwx_mcu_claim_seq(sc,cmd,true);assert(*seq==int(index)+1);
+    if(replies[index].sendError)mwx_mcu_cancel_seq(sc,cmd,*seq);
     commands.emplace_back(mtod(m,const uint8_t *),mtod(m,const uint8_t *)+mbuf_len(m));
     m_freem(m); // The transport owns submitted mbufs, including its errors.
     return replies[index].sendError;

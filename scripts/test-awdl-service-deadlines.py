@@ -324,7 +324,16 @@ static void lifecycle(const std::string &kind) {
    assert(d.enabled&&d.txSession==replacement&&replacement!=old&&d.awTimeline.open);
    assert(d.awTimeline.token==10&&d.state.controlsHeld&&d.timer->us==43000&&d.timer->calls==calls);
    d.onEnd=nullptr;
-  } else assert(!d.enabled&&!d.timer->pending&&!d.awTimeline.open&&d.awTimeline.ends==1);
+  } else {
+   assert(!d.enabled&&d.timer->pending&&!d.awTimeline.open&&d.awTimeline.ends==1);
+   assert(d.syncEnable.phase==AirportMtkAwdlInterface::SyncEnable::Recovery);
+   const auto generation=d.syncEnable.generation,deadline=d.syncEnable.deadlineUS;
+   clockUS+=100000;gate.enter([&]{d.serviceSyncEnable();return 0;}); // Still resetting: no deadline renewal.
+   assert(!d.enabled&&d.syncEnable.generation==generation&&d.syncEnable.deadlineUS==deadline);
+   d.radio.storage.sc_resetting=false;gate.enter([&]{d.serviceSyncEnable();return 0;});
+   assert(d.enabled&&d.txSession&&d.txSession!=old&&!d.awTimeline.open);
+   assert(d.syncEnable.generation==generation&&d.syncEnable.phase==AirportMtkAwdlInterface::SyncEnable::None);
+  }
  }
  assert(entered&&!modelMbufs);
 }

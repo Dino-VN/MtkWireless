@@ -108,6 +108,14 @@ start(IOService *provider)
     return true;
 }
 
+/* The wrapper owns the HAL it created in probe; the controller retains
+ * its own reference. */
+void MtkPCIEDeviceWrapper::free()
+{
+    OSSafeReleaseNULL(fHalService);
+    super::free();
+}
+
 void MtkPCIEDeviceWrapper::
 stop(IOService *provider)
 {

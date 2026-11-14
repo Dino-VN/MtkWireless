@@ -158,6 +158,7 @@ struct mwx_softc {
     void *sc_dmat=nullptr;mwx_txwi_desc sc_txwi{};mwx_queue sc_txq{};unsigned dma_index=0;
     uint32_t sc_knobs=MWX_KNOB_DATA_RA;timeval sc_txs_last{};
     unsigned sc_tx_nobufs=0,sc_tx_ring_full=0;
+    bool sc_awdl_infra_ps=false;
     uint64_t sc_awdl_tx_bad_frame=0,sc_awdl_tx_busy=0,sc_awdl_tx_no_grant=0,
         sc_awdl_tx_no_peer=0,sc_awdl_tx_backpressure=0,sc_awdl_tx_copy_failed=0,
         sc_awdl_tx_dma_failed=0,sc_awdl_tx_submitted=0,sc_awdl_tx_ba_frames=0;int sc_awdl_tx_errno=0;
@@ -313,7 +314,23 @@ static void descriptorControls(){
     }
     auto m=f.frame();mt76_txwi d{};mt7921_mac_write_txwi(&f.sc,m,&f.infra.ni,&d);
     assert(!(d.txwi[2]&MT_TXD2_FIX_RATE) && !(d.txwi[3]&MT_TXD3_BA_DISABLE));
-    auto p=mtod(m,uint8_t *);p[0]=0x48;p[1]=0x11;mt7921_mac_write_txwi(&f.sc,m,&f.infra.ni,&d);assert(d.txwi[3]&MT_TXD3_SW_POWER_MGMT);m_freem(m);
+    auto p=mtod(m,uint8_t *);
+    for(bool sleeping:{false,true}) {
+        f.sc.sc_awdl_infra_ps=sleeping;p[0]=0x88;p[1]=IEEE80211_FC1_DIR_TODS;
+        mt7921_mac_write_txwi(&f.sc,m,&f.infra.ni,&d);
+        assert(bool(p[1]&IEEE80211_FC1_PWR_MGT)==sleeping);
+        assert(bool(d.txwi[3]&MT_TXD3_SW_POWER_MGMT)==sleeping);
+        // Explicit wake Null/QoS-Null is never rewritten as PM=1.
+        for(uint8_t subtype:{uint8_t(0x48),uint8_t(0xc8)}) {
+            p[0]=subtype;p[1]=IEEE80211_FC1_DIR_TODS;
+            mt7921_mac_write_txwi(&f.sc,m,&f.infra.ni,&d);
+            assert(!(p[1]&IEEE80211_FC1_PWR_MGT)&&(d.txwi[3]&MT_TXD3_SW_POWER_MGMT));
+        }
+        p[0]=0x88;p[1]=0;mt7921_mac_write_txwi(&f.sc,m,&f.sc.sc_awdl_peers[0].ni,&d);
+        assert(!(p[1]&IEEE80211_FC1_PWR_MGT)&&!(d.txwi[3]&MT_TXD3_SW_POWER_MGMT));
+    }
+    f.sc.sc_awdl_infra_ps=false;
+    p[0]=0x48;p[1]=0x11;mt7921_mac_write_txwi(&f.sc,m,&f.infra.ni,&d);assert(d.txwi[3]&MT_TXD3_SW_POWER_MGMT);m_freem(m);
     for(unsigned kind=0;kind<3;++kind){
         m=f.frame(64,0,23,kind==0);auto ring=f.sc.sc_txq.mq_prod;
         if(kind==1){auto raw=mtod(m,uint8_t *);raw[0]=0xd0;raw[24]=127;}
@@ -430,7 +447,7 @@ static void sharedPoolSafety(){
                 mwx_awdl_quiesce(&f.sc,true);f.dmaConsumed();
                 // Production reset's token put loop, without an observed TX-free.
                 IOLockLock(mwx_txq_lock);
-                for(auto &token:f.tokens)mwx_txwi_put(&f.sc,&token);
+                for(auto &token:f.tokens)mwx_txwi_put_locked(&f.sc,&token);
                 IOLockUnlock(mwx_txq_lock);
                 f.reenable();
             }else{

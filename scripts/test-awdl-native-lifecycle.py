@@ -65,11 +65,11 @@ INTERFACE_GROUPS = {
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
     "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
-    "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
+    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
+    "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES getPEER_CACHE_MAXIMUM_SIZE getAWDL_DEVICE_CAPABILITIES setAWDL_OOB_REQUEST oobRequestGated setOobRequestInGate setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
-STRUCT_NAMES = "apple80211_virt_if_create_data apple80211_awdl_sync_params apple80211_awdl_extension_state_machine_parameter apple80211_awdl_election_id apple80211_awdl_presence_mode apple80211_awdl_sync_state apple80211_awdl_election_rssi_thresholds apple80211_awdl_af_tx_mode apple80211_awdl_min_rate apple80211_awdl_sync_channel_sequence apple80211_awdl_sync_frame_template apple80211_awdl_cap apple80211_awdl_master_channel apple80211_awdl_secondary_master_channel apple80211_awdl_election_params apple80211_awdl_peer_traffic_registration apple80211_awdl_sync_enabled".split()
+STRUCT_NAMES = "apple80211_virt_if_create_data apple80211_awdl_sync_params apple80211_awdl_extension_state_machine_parameter apple80211_awdl_election_id apple80211_awdl_presence_mode apple80211_awdl_sync_state apple80211_awdl_election_rssi_thresholds apple80211_awdl_af_tx_mode apple80211_awdl_min_rate apple80211_awdl_sync_channel_sequence apple80211_awdl_sync_frame_template apple80211_awdl_cap apple80211_awdl_master_channel apple80211_awdl_secondary_master_channel apple80211_awdl_election_params apple80211_awdl_peer_traffic_registration apple80211_awdl_sync_enabled apple80211_peer_cache_maximum_size apple80211_awdl_device_capabilities apple80211_awdl_oob_request".split()
 CASES = ["init-start", "datapath", "sync", "origins", "module-poll", "bsd", "packed-sequence", "native-controls", "native-windows"]
 
 
@@ -450,6 +450,7 @@ HAL_AFTER_ABI = r'''
  IC *get80211Controller() { return com ? &com->sc_ic : nullptr; }
  bool awdlChannelAllowed(unsigned c) { return fault.social&&(c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8)||(allow11&&c==11)); }
  uint8_t awdlInfraChannel() { return infraChannel; }
+ unsigned awdlPeerCapacity() const { return 3; }
  uint8_t awdlOnlyChannel() { return infraChannel; }
  bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!infraChannel||infraChannel==c); }
  void awdlInfraSleep(unsigned) { ++sleeps; }
@@ -725,7 +726,10 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *,bool value,const AwdlSyncGuard *guar
  }
  if(!status) {
   IOLockLock(storage.sc_awdl_lock);
-  if(value&&!storage.sc_awdl_enabled)storage.sc_awdl_native_session=mwx_awdl_native_new_session();
+  // A modeled physical outage cannot preserve a stale secondary BSS/ROC.
+  // Real HAL quiesce clears these before a successful context restart.
+  if(value&&!on) { storage.sc_awdl_enabled=false; grant.cancel(); }
+  if(value&&!storage.sc_awdl_enabled) { storage.sc_awdl_native_session=mwx_awdl_native_new_session(); grant.cancel(); }
   if(!value){storage.sc_awdl_native_session=0; grant.cancel();}
   storage.sc_awdl_enabled=value; on=value;
   IOLockUnlock(storage.sc_awdl_lock);

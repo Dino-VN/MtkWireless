@@ -27,7 +27,7 @@ usage() {
         '  --output DIR       Create a new bundle in DIR (default: your Desktop).' \
         '  --notes TEXT       Describe the failure, time, devices and transfer direction.' \
         'Kernel/kext loading logs cover the current boot; crash/HCI/Lilu files cover 3 days.' \
-        'No uploads, no mtkctl, no Xcode/Python dependencies, no system-setting changes.'
+        'No uploads, no Xcode/Python dependencies, no system-setting changes.'
 }
 while [ $# -gt 0 ]; do
     case "$1" in

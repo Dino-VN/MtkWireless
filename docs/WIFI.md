@@ -52,7 +52,8 @@ other unsigned kexts are still loaded afterwards.
 | `-novht` | disable 802.11ac |
 | `-noht40` | disable 40 MHz channels |
 | `amtk_cc=XX` | ignored; the former reporting-only override did not apply a regulatory policy (see below) |
-| `amtk_he=0` | do not offer 802.11ax (offered by default since 1.0.1, 80 MHz; `mtkctl knob 0x1002` does the same at runtime for the next join) |
+| `amtk_he=0` | disable 802.11ax capability; the conservative HAL default also disables HE, even without this argument |
+| `amtk_knobs=MASK` | replace the complete diagnostic PHY/TX mask at boot (default `0x1002`); `0x2` enables HE for testing unless `amtk_he=0` or join compatibility disables it; requires reboot |
 | `amtk_awdl=0` | disable native AWDL (on by default on Tahoe) |
 | `amtk_6ghz=1` | scan and report 6 GHz on chips that have it (MT7922, MT7921K); off by default: 6 GHz joins need SAE hash-to-element or OWE, not implemented ([WIFI-6GHZ.md](WIFI-6GHZ.md)) |
 | `amtk_roam=0` | no in-driver roaming: stay on the joined BSSID until the link drops ([ROAMING.md](ROAMING.md)) |
@@ -127,8 +128,13 @@ validation).
 ```sh
 kmutil showloaded --list-only | grep MtkWireless
 ioreg -l -w0 | grep -E 'RustCore|RustSelfTestFailed'
-mtkctl sta; mtkctl log     # tools/mtkctl.c in kext/Wifi/vendor
+ioreg -r -c AirportMtkWlan -l -w0
 ```
+
+Join diagnostics are retained in `MTKWiFiJoin`, `MTKWiFiJoinLastFailed` and
+`MTKWiFiJoinLastAssocFailed`. Run `sudo bash scripts/collect-logs.sh` right
+after a failure to save them together with native Wi-Fi logs. The custom
+radio-control user client and its log ring have been removed.
 
 | Symptom | Fix |
 |---|---|

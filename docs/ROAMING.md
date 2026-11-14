@@ -87,8 +87,9 @@ and posts ROAM_START with reason "directed". If the scan keeps the current AP
 the request ends with a failed ROAM_DONE and the link is untouched.
 
 ioreg `MTKRoams` / `MTKRoamFailures` on the controller count roams. Roam
-decisions are logged to the driver log ring (`mtkctl log`, prefix
-`AirportMtkWlan-wcl: roam`).
+messages use the kernel-log prefix `AirportMtkWlan-wcl: roam`, but that log
+can be overwritten or throttled. Retain ioreg and native Wi-Fi logs with
+`scripts/collect-logs.sh`.
 
 ## AWDL coexistence
 
@@ -105,8 +106,8 @@ decisions are logged to the driver log ring (`mtkctl log`, prefix
 ## Testing on hardware
 
 Two APs with the same SSID and PSK on different channels; join one, walk away
-or lower its TX power. Expect in `mtkctl log`: `roam ... -> ...`, then
-`roam done status=0x0`; `ping` keeps running with a short gap; the Wi-Fi menu
+or lower its TX power. Confirm `MTKRoams` increases without an increase in
+`MTKRoamFailures`; `ping` keeps running with a short gap, and the Wi-Fi menu
 shows the new BSSID (Option-click) without a disconnect. `log stream
 --predicate 'subsystem == "com.apple.wifi"'` should show WCL's `Roam status`
 lines from `printRoamStatus`.

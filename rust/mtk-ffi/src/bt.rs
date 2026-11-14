@@ -387,11 +387,39 @@ pub unsafe extern "C" fn mtk_bt_le_controller_for_pipe(pipe: *const c_void) -> u
     unsafe { le().controller_for_pipe(pipe as usize) }
 }
 
+/// Revoke recycled address keys before the C++ route filters pipe classes.
+///
 /// # Safety
 /// Caller holds the LE lock. `pipe` is only compared, never dereferenced.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mtk_bt_le_bind_event_pipe(pipe: *const c_void, id: u64, mediatek: bool) {
-    unsafe { le().bind_event_pipe(pipe as usize, id, mediatek) }
+pub unsafe extern "C" fn mtk_bt_le_prepare_event_pipe(pipe: *const c_void, interface: u64) {
+    unsafe { le().prepare_event_pipe(pipe as usize, interface) }
+}
+
+/// # Safety
+/// Caller holds the LE lock. `pipe` is only compared, never dereferenced.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_bind_event_pipe(
+    pipe: *const c_void,
+    interface: u64,
+    id: u64,
+    mediatek: bool,
+) {
+    unsafe { le().bind_event_pipe(pipe as usize, interface, id, mediatek) }
+}
+
+/// # Safety
+/// Caller holds the LE lock; interface is a registry id, not an object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_unbind_interface(interface: u64) {
+    unsafe { le().unbind_interface(interface) }
+}
+
+/// # Safety
+/// Caller holds the LE lock; id is a registry id, not an object.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_le_unbind_controller(id: u64) {
+    unsafe { le().unbind_controller(id) }
 }
 
 #[repr(C)]
@@ -458,7 +486,11 @@ unsafe fn page_site<'a>(site: *const MtkBtPageSite) -> Option<mtk_bt::page_patch
 /// # Safety
 /// `page` must point to `len` readable bytes; `site` to a valid site.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn mtk_bt_page_find(page: *const u8, len: usize, site: *const MtkBtPageSite) -> i32 {
+pub unsafe extern "C" fn mtk_bt_page_find(
+    page: *const u8,
+    len: usize,
+    site: *const MtkBtPageSite,
+) -> i32 {
     use mtk_bt::page_patch::Match;
     let Some(site) = (unsafe { page_site(site) }) else {
         return MTK_BT_PAGE_BAD_SITE;
@@ -489,5 +521,6 @@ pub unsafe extern "C" fn mtk_bt_page_apply(
     let Some(site) = (unsafe { page_site(site) }) else {
         return false;
     };
-    site.apply_at(unsafe { bytes_mut(page, len) }, offset).is_ok()
+    site.apply_at(unsafe { bytes_mut(page, len) }, offset)
+        .is_ok()
 }

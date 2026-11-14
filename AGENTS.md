@@ -41,8 +41,8 @@ scripts/test-awdl.sh   # upstream AWDL C++/Python tests against the Rust core
   target, MacKernelSDK before the SDK's PrivateHeaders, header-map dirs as
   `-iquote`. Changing any of these changes IOKit vtable layouts; diff
   `nm -u` against an Xcode build after touching the flags. Tahoe
-  (`__IO80211_TARGET=__MAC_26_0`) only. Only files the build, `tests/awdl`,
-  `tools/mtkctl.c` or `scripts/test-*` use are kept, and the pre-Tahoe /
+  (`__IO80211_TARGET=__MAC_26_0`) only. Only files the build, `tests/awdl`
+  or `scripts/test-*` use are kept, and the pre-Tahoe /
   non-Airport `#if` branches (`__MAC_15_2`, `!AIRPORT_WCL`, `!AIRPORT`,
   `!IO80211FAMILY_V2`) were removed with unifdef; take anything else from
   upstream `dfca847`. Local edits (search for

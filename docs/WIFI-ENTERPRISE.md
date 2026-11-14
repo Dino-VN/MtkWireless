@@ -31,8 +31,10 @@ This does not authorize the port or complete the WCL join. The existing
 RX and TX gates admit only EtherType 0x888e while `ni_port_valid` is clear;
 ordinary IPv4 and IPv6 remain blocked. PMK installation and the net80211
 key handshake retain their existing behavior. No EAP credential parsing or
-payload logging was added. `mtkctl log` records `EAPOL transport=1 state=4`
-at setup and `EAPOL transport=0` at teardown.
+payload logging was added. Best-effort kernel messages record
+`EAPOL transport=1 state=4` at setup and `EAPOL transport=0` at teardown.
+Use the retained `MTKWiFiJoin` ioreg diagnostics and native EAPOL logs as
+well; the kernel log can be overwritten or throttled.
 
 ## Offline validation
 
@@ -55,7 +57,8 @@ Use the test build with bundle version 1.0.7, keeping the original boot args.
    `sudo tcpdump -i en2 -s 0 -w eapol.pcap 'ether proto 0x888e'`.
    Request/response packets and any EAP failure distinguish transport
    problems from later authentication failures. Retain airportd/eapolclient
-   logs and `mtkctl log` alongside the capture if the attempt still fails.
+   logs and `MTKWiFiJoin` ioreg diagnostics alongside the capture if the
+   attempt still fails (`scripts/collect-logs.sh` gathers both).
 3. Join the iPhone hotspot. The join scan must show one directed target,
    discover the BSS and advance to AUTH. Retest the home WPA2-PSK network.
 4. Cancel or fail an Enterprise attempt and switch to another network;

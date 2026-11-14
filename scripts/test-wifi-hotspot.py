@@ -261,7 +261,8 @@ tx = function(hal, 'int\nmwx_tx(')
 assert tx.index('mt->mt_join_attempt =') < tx.index('rv = mwx_dma_txwi_enqueue(')
 free = function(hal, 'void\nmwx_mac_tx_free(')
 assert free.index('mtk_join_tx_complete(') < free.index('mwx_txwi_put(')
-assert 'mt->mt_join_attempt = 0' in function(hal, 'void\nmwx_txwi_put(')
+assert 'mt->mt_join_attempt = 0' in function(hal, 'static void\nmwx_txwi_put_locked(')
+assert 'mwx_txwi_put_locked(sc, mt)' in function(hal, 'void\nmwx_txwi_put(')
 with tempfile.TemporaryDirectory(prefix='mtk-hotspot-') as tmp:
     p=Path(tmp);(p/'test.cpp').write_text(code)
     subprocess.run(['clang++','-std=c++17','-fsanitize=address,undefined','-Wall','-Wextra',

@@ -33,7 +33,8 @@ IOReturn AirportMtkSkywalkInterface::setVIRTUAL_IF_CREATE(apple80211_virt_if_cre
 IOReturn AirportMtkSkywalkInterface::getHT_CAPABILITY(apple80211_ht_capability *d)
 {
     if(!d) return kIOReturnBadArgument;
-    auto *ic=static_cast<AirportMtkWlan *>(getController())->fHalService->get80211Controller();
+    auto *ic=current80211();
+    if(!ic) return kIOReturnNotReady;
     bzero(d,sizeof(*d));
     d->version=APPLE80211_VERSION; d->hc_id=45; d->hc_len=26;
     d->hc_cap=ic->ic_htcaps; d->hc_param=ic->ic_ampdu_params;
@@ -45,7 +46,8 @@ IOReturn AirportMtkSkywalkInterface::getHT_CAPABILITY(apple80211_ht_capability *
 IOReturn AirportMtkSkywalkInterface::getVHT_CAPABILITY(apple80211_vht_capability *d)
 {
     if(!d) return kIOReturnBadArgument;
-    auto *ic=static_cast<AirportMtkWlan *>(getController())->fHalService->get80211Controller();
+    auto *ic=current80211();
+    if(!ic) return kIOReturnNotReady;
     bzero(d,sizeof(*d)); d->version=APPLE80211_VERSION;
     d->cap=ic->ic_vhtcaps & 0xffff; d->unk1=ic->ic_vhtcaps;
     return kIOReturnSuccess;
@@ -138,72 +140,6 @@ static int ieeeChanFlag2apple(int flags, int bw)
         }
     }
     return ret;
-}
-
-void AirportMtkSkywalkInterface::associateSSID(uint8_t *ssid, uint32_t ssid_len, const struct ether_addr &bssid, uint32_t authtype_lower, uint32_t authtype_upper, uint8_t *key, uint32_t key_len, int key_index)
-{
-    struct ieee80211com *ic = fHalService->get80211Controller();
-    
-    ieee80211_disable_rsn(ic);
-    ieee80211_disable_wep(ic);
-    
-    struct ieee80211_wpaparams     wpa;
-    struct ieee80211_nwkey         nwkey;
-    bzero(&wpa, sizeof(wpa));
-    bzero(&nwkey, sizeof(nwkey));
-    
-    memset(ic->ic_des_essid, 0, IEEE80211_NWID_LEN);
-    memcpy(ic->ic_des_essid, ssid, ssid_len);
-    ic->ic_des_esslen = ssid_len;
-    
-    bool is_zero = true;
-    for (int i = 0; i < IEEE80211_ADDR_LEN; i++)
-    is_zero &= bssid.octet[i] == 0;
-    
-    if (!is_zero) {
-        IEEE80211_ADDR_COPY(ic->ic_des_bssid, bssid.octet);
-        ic->ic_flags |= IEEE80211_F_DESBSSID;
-    }
-    else {
-        memset(ic->ic_des_bssid, 0, IEEE80211_ADDR_LEN);
-        ic->ic_flags &= ~IEEE80211_F_DESBSSID;
-    }
-
-    if (authtype_upper & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2 | APPLE80211_AUTHTYPE_WPA2_PSK | APPLE80211_AUTHTYPE_SHA256_PSK | APPLE80211_AUTHTYPE_SHA256_8021X)) {
-        XYLog("%s %d\n", __FUNCTION__, __LINE__);
-        wpa.i_protos = IEEE80211_WPA_PROTO_WPA1 | IEEE80211_WPA_PROTO_WPA2;
-    }
-    
-    if (authtype_upper & (APPLE80211_AUTHTYPE_WPA_PSK | APPLE80211_AUTHTYPE_WPA2_PSK | APPLE80211_AUTHTYPE_SHA256_PSK)) {
-        XYLog("%s %d\n", __FUNCTION__, __LINE__);
-        wpa.i_akms |= IEEE80211_WPA_AKM_PSK | IEEE80211_WPA_AKM_SHA256_PSK;
-        wpa.i_enabled = 1;
-        memcpy(ic->ic_psk, key, sizeof(ic->ic_psk));
-        ic->ic_flags |= IEEE80211_F_PSK;
-        ieee80211_ioctl_setwpaparms(ic, &wpa);
-    }
-    if (authtype_upper & (APPLE80211_AUTHTYPE_WPA | APPLE80211_AUTHTYPE_WPA2 | APPLE80211_AUTHTYPE_SHA256_8021X)) {
-        XYLog("%s %d\n", __FUNCTION__, __LINE__);
-        wpa.i_akms |= IEEE80211_WPA_AKM_8021X | IEEE80211_WPA_AKM_SHA256_8021X;
-        wpa.i_enabled = 1;
-        ieee80211_ioctl_setwpaparms(ic, &wpa);
-    }
-    
-    if (authtype_lower == APPLE80211_AUTHTYPE_SHARED) {
-        XYLog("shared key authentication is not supported!\n");
-        return;
-    }
-    
-    if (authtype_upper == APPLE80211_AUTHTYPE_NONE && authtype_lower == APPLE80211_AUTHTYPE_OPEN) { // Open or WEP Open System
-        if (key_len > 0) {
-            XYLog("%s %d\n", __FUNCTION__, __LINE__);
-            nwkey.i_wepon = IEEE80211_NWKEY_WEP;
-            nwkey.i_defkid = key_index + 1;
-            nwkey.i_key[key_index].i_keylen = (int)key_len;
-            nwkey.i_key[key_index].i_keydat = key;
-            ieee80211_ioctl_setnwkeys(ic, &nwkey);
-        }
-    }
 }
 
 void AirportMtkSkywalkInterface::setPTK(const u_int8_t *key, size_t key_len) {
@@ -312,7 +248,10 @@ init(IOService *provider)
     if (!instance)
         return false;
     this->fHalService = instance->fHalService;
+    if (!fHalService) return false;
+    fHalService->retain();
     this->scanSource = instance->scanSource;
+    if (scanSource) scanSource->retain();
     IOEthernetAddress address;
     if (instance->getHardwareAddress(&address) != kIOReturnSuccess)
         return false;
@@ -332,10 +271,19 @@ init(IOService *provider)
 //    return NULL;
 //}
 
+ieee80211com *AirportMtkSkywalkInterface::current80211() const
+{
+    if (wclStopping || !fHalService)
+        return nullptr;
+    return fHalService->get80211Controller();
+}
+
 IOReturn AirportMtkSkywalkInterface::
 getSSID(struct apple80211_ssid_data *sd)
 {
-    struct ieee80211com * ic = fHalService->get80211Controller();
+    if (!sd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(sd, 0, sizeof(*sd));
         sd->version = APPLE80211_VERSION;
@@ -372,7 +320,9 @@ setCIPHER_KEY(struct apple80211_key *key)
 IOReturn AirportMtkSkywalkInterface::
 getPHY_MODE(struct apple80211_phymode_data *pd)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!pd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic) return kIOReturnNotReady;
     
     pd->version = APPLE80211_VERSION;
     pd->phy_mode = APPLE80211_MODE_11A
@@ -386,7 +336,7 @@ getPHY_MODE(struct apple80211_phymode_data *pd)
     if (ic->ic_flags & IEEE80211_F_HEON)
         pd->phy_mode |= APPLE80211_MODE_11AX;
     
-    switch (fHalService->get80211Controller()->ic_curmode) {
+    switch (ic->ic_curmode) {
         case IEEE80211_MODE_AUTO:
             pd->active_phy_mode = APPLE80211_MODE_AUTO;
             break;
@@ -421,7 +371,10 @@ getPHY_MODE(struct apple80211_phymode_data *pd)
 IOReturn AirportMtkSkywalkInterface::
 getCHANNEL(struct apple80211_channel_data *cd)
 {
-    struct ieee80211com * ic = fHalService->get80211Controller();
+    if (!cd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss || !ic->ic_bss->ni_chan ||
+        ic->ic_bss->ni_chan == IEEE80211_CHAN_ANYC) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(cd, 0, sizeof(apple80211_channel_data));
         cd->version = APPLE80211_VERSION;
@@ -448,7 +401,9 @@ getSTATE(struct apple80211_state_data *sd)
 IOReturn AirportMtkSkywalkInterface::
 getMCS_INDEX_SET(struct apple80211_mcs_index_set_data *ad)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!ad) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(ad, 0, sizeof(*ad));
         ad->version = APPLE80211_VERSION;
@@ -507,12 +462,15 @@ getMCS_VHT(struct apple80211_mcs_vht_data *data)
 IOReturn AirportMtkSkywalkInterface::
 getRATE_SET(struct apple80211_rate_set_data *ad)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!ad) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(ad, 0, sizeof(*ad));
         ad->version = APPLE80211_VERSION;
-        ad->num_rates = ic->ic_bss->ni_rates.rs_nrates;
-        size_t size = min(ic->ic_bss->ni_rates.rs_nrates, ARRAY_SIZE(ad->rates));
+        size_t size = MIN(ic->ic_bss->ni_rates.rs_nrates,
+            MIN(ARRAY_SIZE(ad->rates), ARRAY_SIZE(ic->ic_bss->ni_rates.rs_rates)));
+        ad->num_rates = size;
         for (int i=0; i < size; i++) {
             struct apple80211_rate &apple_rate = ad->rates[i];
             apple_rate.version = APPLE80211_VERSION;
@@ -549,9 +507,9 @@ getTXPOWER(struct apple80211_txpower_data *txd)
 IOReturn AirportMtkSkywalkInterface::
 getRATE(struct apple80211_rate_data *rd)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
-    if (ic->ic_bss == NULL)
-        return 6;
+    if (!rd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     int nss;
     int sgi;
     int index = 0;
@@ -566,6 +524,7 @@ getRATE(struct apple80211_rate_data *rd)
             /* ni_vht_ss comes from firmware TX status once data flows. */
             nss = ic->ic_bss->ni_vht_ss > 0 ? ic->ic_bss->ni_vht_ss :
                 fHalService->getDriverInfo()->getTxNSS();
+            nss = nss > 1 ? 2 : 1;
             switch (ic->ic_bss->ni_chw) {
                 case IEEE80211_CHAN_WIDTH_40:
                     index += 4;
@@ -614,12 +573,15 @@ getRATE(struct apple80211_rate_data *rd)
                 index += 1;
             if (is_40mhz)
                 index += (IEEE80211_HT_RATESET_MIMO4_SGI + 1);
-            index += (ic->ic_bss->ni_txmcs / 16);
-            nss = ic->ic_bss->ni_txmcs / 8 + 1;
+            const unsigned mcs = MIN(ic->ic_bss->ni_txmcs, 15);
+            nss = mcs / 8 + 1;
             index += 2 * (nss - 1);
-            rd->rate[0] = ieee80211_std_ratesets_11n[index].rates[ic->ic_bss->ni_txmcs % 8] / 2;
-        } else
+            rd->rate[0] = ieee80211_std_ratesets_11n[index].rates[mcs % 8] / 2;
+        } else {
+            if (ic->ic_bss->ni_txrate >= MIN(ic->ic_bss->ni_rates.rs_nrates,
+                ARRAY_SIZE(ic->ic_bss->ni_rates.rs_rates))) return kIOReturnNotReady;
             rd->rate[0] = ic->ic_bss->ni_rates.rs_rates[ic->ic_bss->ni_txrate];
+        }
         return kIOReturnSuccess;
     }
     return 6;
@@ -628,7 +590,9 @@ getRATE(struct apple80211_rate_data *rd)
 IOReturn AirportMtkSkywalkInterface::
 getBSSID(struct apple80211_bssid_data *bd)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!bd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(bd, 0, sizeof(*bd));
         bd->version = APPLE80211_VERSION;
@@ -641,7 +605,9 @@ getBSSID(struct apple80211_bssid_data *bd)
 IOReturn AirportMtkSkywalkInterface::
 getRSSI(struct apple80211_rssi_data *rd)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!rd) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !ic->ic_bss) return kIOReturnNotReady;
     if (ic->ic_state == IEEE80211_S_RUN) {
         memset(rd, 0, sizeof(*rd));
         rd->num_radios = 1;
@@ -715,44 +681,11 @@ getNSS(struct apple80211_nss_data *data)
 }
 
 IOReturn AirportMtkSkywalkInterface::
-setASSOCIATE(struct apple80211_assoc_data *ad)
+setASSOCIATE(struct apple80211_assoc_data *)
 {
-    XYLog("%s [%s] mode=%d ad_auth_lower=%d ad_auth_upper=%d rsn_ie_len=%d%s%s%s%s%s%s%s\n", __FUNCTION__, ad->ad_ssid, ad->ad_mode, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_rsn_ie_len,
-          (ad->ad_flags & 2) ? ", Instant Hotspot" : "",
-          (ad->ad_flags & 4) ? ", Auto Instant Hotspot" : "",
-          (ad->ad_rsn_ie[APPLE80211_MAX_RSN_IE_LEN] & 1) ? ", don't disassociate" : "",
-          (ad->ad_rsn_ie[APPLE80211_MAX_RSN_IE_LEN] & 2) ? ", don't blacklist" : "",
-          (ad->ad_rsn_ie[APPLE80211_MAX_RSN_IE_LEN] & 4) ? ", closed Network" : "",
-          (ad->ad_rsn_ie[APPLE80211_MAX_RSN_IE_LEN] & 8) ? ", 802.1X" : "",
-          (ad->ad_rsn_ie[APPLE80211_MAX_RSN_IE_LEN] & 0x20) ? ", force BSSID" : "");
-    
-    struct apple80211_rsn_ie_data rsn_ie_data;
-    struct apple80211_authtype_data auth_type_data;
-    struct ieee80211com *ic = fHalService->get80211Controller();
-
-    if (!ad)
-        return kIOReturnError;
-    
-    if (ic->ic_state < IEEE80211_S_SCAN)
-        return kIOReturnSuccess;
-    
-    if (ic->ic_state == IEEE80211_S_ASSOC || ic->ic_state == IEEE80211_S_AUTH)
-        return kIOReturnSuccess;
-
-    if (ad->ad_mode != APPLE80211_AP_MODE_IBSS) {
-        disassocIsVoluntary = false;
-        auth_type_data.version = APPLE80211_VERSION;
-        auth_type_data.authtype_upper = ad->ad_auth_upper;
-        auth_type_data.authtype_lower = ad->ad_auth_lower;
-        setAUTH_TYPE(&auth_type_data);
-        rsn_ie_data.version = APPLE80211_VERSION;
-        rsn_ie_data.len = ad->ad_rsn_ie[1] + 2;
-        memcpy(rsn_ie_data.ie, ad->ad_rsn_ie, rsn_ie_data.len);
-        setRSN_IE(&rsn_ie_data);
-
-        associateSSID(ad->ad_ssid, ad->ad_ssid_len, ad->ad_bssid, ad->ad_auth_lower, ad->ad_auth_upper, ad->ad_key.key, ad->ad_key.key_len, ad->ad_key.key_index);
-    }
-    return kIOReturnSuccess;
+    // Tahoe joins belong to WCL_ASSOCIATE. The legacy format bypasses its
+    // bounds checks, security negotiation and per-attempt state.
+    return kIOReturnUnsupported;
 }
 
 IOReturn AirportMtkSkywalkInterface::
@@ -881,94 +814,71 @@ getMCS(struct apple80211_mcs_data* md)
 IOReturn AirportMtkSkywalkInterface::
 getLINK_CHANGED_EVENT_DATA(struct apple80211_link_changed_event_data *ed)
 {
-    if (ed == nullptr)
-        return 16;
-    
-    struct ieee80211com *ic = fHalService->get80211Controller();
+    if (!ed) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || !instance) return kIOReturnNotReady;
     
     bzero(ed, sizeof(apple80211_link_changed_event_data));
     ed->isLinkDown = !(instance->currentStatus & kIONetworkLinkActive);
     if (ed->isLinkDown) {
         ed->voluntary = disassocIsVoluntary;
         ed->reason = APPLE80211_LINK_DOWN_REASON_DEAUTH;
-    } else
+    } else {
+        if (!ic->ic_bss) return kIOReturnNotReady;
         ed->rssi = -(0 - MTK_MIN_DBM - ic->ic_bss->ni_rssi);
+    }
     XYLog("Link %s, reason: %d, voluntary: %d\n", ed->isLinkDown ? "down" : "up", ed->reason, ed->voluntary);
     return kIOReturnSuccess;
 }
 
 IOReturn AirportMtkSkywalkInterface::
-setSCAN_REQ(struct apple80211_scan_data *sd)
+setSCAN_REQ(struct apple80211_scan_data *)
 {
-    struct ieee80211com *ic = fHalService->get80211Controller();
-#if 0
-    XYLog("%s Type: %u BSS Type: %u PHY Mode: %u Dwell time: %u Rest time: %u Num channels: %u SSID: %s BSSID: %s\n",
-          __FUNCTION__,
-          sd->scan_type,
-          sd->bss_type,
-          sd->phy_mode,
-          sd->dwell_time,
-          sd->rest_time,
-          sd->num_channels,
-          sd->ssid,
-          ether_sprintf(sd->bssid.octet));
-#endif
-    if (fScanResultWrapping)
-        return 22;
-    if (ic->ic_state <= IEEE80211_S_INIT)
-        return 22;
-    if (sd->scan_type == APPLE80211_SCAN_TYPE_FAST || sd->scan_type == APPLE80211_SCAN_TYPE_PASSIVE) {
-        if (scanSource) {
-            scanSource->setTimeoutMS(100);
-            scanSource->enable();
-        }
-        return kIOReturnSuccess;
-    }
-    ieee80211_begin_cache_bgscan(&ic->ic_ac.ac_if);
-    if (scanSource) {
-        scanSource->setTimeoutMS(100);
-        scanSource->enable();
-    }
-    return kIOReturnSuccess;
+    // Only WCL_SCAN_REQ owns the scan timer and completion on Tahoe.
+    return kIOReturnUnsupported;
 }
 
 extern OSDictionary *convertScanToDictionary(apple80211_scan_result *a1);
 
-static int convertNodeToScanResult(MtkHalService *fHalService, struct ieee80211_node *fNextNodeToSend, apple80211_scan_result *result)
+static int convertNodeToScanResult(MtkHalService *fHalService, struct ieee80211_node *node, apple80211_scan_result *result)
 {
+    if (!result) return kIOReturnBadArgument;
+    if (!fHalService || !node || !node->ni_chan ||
+        node->ni_chan == IEEE80211_CHAN_ANYC) return kIOReturnNotReady;
     bzero(result, sizeof(*result));
     result->version = APPLE80211_VERSION;
-    if (fNextNodeToSend->ni_rsnie_tlv && fNextNodeToSend->ni_rsnie_tlv_len > 0) {
-        result->asr_ie_len = fNextNodeToSend->ni_rsnie_tlv_len;
-        memcpy(result->asr_ie_data, fNextNodeToSend->ni_rsnie_tlv, MIN(result->asr_ie_len, sizeof(result->asr_ie_data)));
-    } else {
-        result->asr_ie_len = 0;
+    if (node->ni_rsnie_tlv && node->ni_rsnie_tlv_len > 0) {
+        result->asr_ie_len = MIN(node->ni_rsnie_tlv_len, sizeof(result->asr_ie_data));
+        memcpy(result->asr_ie_data, node->ni_rsnie_tlv, result->asr_ie_len);
     }
-    result->asr_beacon_int = fNextNodeToSend->ni_intval;
-    for (int i = 0; i < result->asr_nrates; i++ )
-        result->asr_rates[i] = fNextNodeToSend->ni_rates.rs_rates[i];
-    result->asr_nrates = fNextNodeToSend->ni_rates.rs_nrates;
-    result->asr_age = (uint32_t)(airport_up_time() - fNextNodeToSend->ni_age_ts);
-    result->asr_cap = fNextNodeToSend->ni_capinfo;
+    result->asr_beacon_int = node->ni_intval;
+    result->asr_nrates = MIN(node->ni_rates.rs_nrates,
+        MIN(ARRAY_SIZE(result->asr_rates), ARRAY_SIZE(node->ni_rates.rs_rates)));
+    for (unsigned i = 0; i < result->asr_nrates; i++)
+        result->asr_rates[i] = node->ni_rates.rs_rates[i];
+    result->asr_age = (uint32_t)(airport_up_time() - node->ni_age_ts);
+    result->asr_cap = node->ni_capinfo;
     result->asr_channel.version = APPLE80211_VERSION;
-    result->asr_channel.channel = ieee80211_chan2ieee(fHalService->get80211Controller(), fNextNodeToSend->ni_chan);
-    result->asr_channel.flags = ieeeChanFlag2appleScanFlagVentura(fNextNodeToSend->ni_chan->ic_flags);
+    result->asr_channel.channel = ieee80211_chan2ieee(fHalService->get80211Controller(), node->ni_chan);
+    result->asr_channel.flags = ieeeChanFlag2appleScanFlagVentura(node->ni_chan->ic_flags);
     result->asr_noise = -fHalService->getDriverInfo()->getBSSNoise();
-    result->asr_rssi = -(0 - MTK_MIN_DBM - fNextNodeToSend->ni_rssi);
-    memcpy(result->asr_bssid, fNextNodeToSend->ni_bssid, IEEE80211_ADDR_LEN);
-    result->asr_ssid_len = fNextNodeToSend->ni_esslen;
+    result->asr_rssi = -(0 - MTK_MIN_DBM - node->ni_rssi);
+    memcpy(result->asr_bssid, node->ni_bssid, IEEE80211_ADDR_LEN);
+    result->asr_ssid_len = MIN(node->ni_esslen,
+        MIN(sizeof(result->asr_ssid), sizeof(node->ni_essid)));
     if (result->asr_ssid_len != 0)
-        memcpy(&result->asr_ssid, fNextNodeToSend->ni_essid, result->asr_ssid_len);
-    return 0;
+        memcpy(&result->asr_ssid, node->ni_essid, result->asr_ssid_len);
+    return kIOReturnSuccess;
 }
 
 IOReturn AirportMtkSkywalkInterface::
 getCURRENT_NETWORK(apple80211_scan_result *sr)
 {
-    if (fHalService->get80211Controller()->ic_state != IEEE80211_S_RUN || fHalService->get80211Controller()->ic_bss == NULL)
-        return kIOReturnError;
-    convertNodeToScanResult(fHalService, fHalService->get80211Controller()->ic_bss, sr);
-    return kIOReturnSuccess;
+    if (!sr) return kIOReturnBadArgument;
+    auto *ic = current80211();
+    if (!ic || ic->ic_state != IEEE80211_S_RUN || !ic->ic_bss)
+        return kIOReturnNotReady;
+    return convertNodeToScanResult(fHalService, ic->ic_bss, sr);
 }
 
 IOReturn AirportMtkSkywalkInterface::
@@ -981,27 +891,10 @@ getCOLOCATED_NETWORK_SCOPE_ID(apple80211_colocated_network_scope_id *as)
 }
 
 IOReturn AirportMtkSkywalkInterface::
-getSCAN_RESULT(struct apple80211_scan_result *sr)
+getSCAN_RESULT(struct apple80211_scan_result *)
 {
-    if (fNextNodeToSend == NULL) {
-        if (fScanResultWrapping) {
-            fScanResultWrapping = false;
-            return 5;
-        } else {
-            fNextNodeToSend = RB_MIN(ieee80211_tree, &fHalService->get80211Controller()->ic_tree);
-            if (fNextNodeToSend == NULL) {
-                return 5;
-            }
-        }
-    }
-//    XYLog("%s ni_bssid=%s ni_essid=%s channel=%d flags=%d asr_cap=%d asr_nrates=%d asr_ssid_len=%d asr_ie_len=%d asr_rssi=%d\n", __FUNCTION__, ether_sprintf(fNextNodeToSend->ni_bssid), fNextNodeToSend->ni_essid, ieee80211_chan2ieee(ic, fNextNodeToSend->ni_chan), ieeeChanFlag2apple(fNextNodeToSend->ni_chan->ic_flags, -1), fNextNodeToSend->ni_capinfo, fNextNodeToSend->ni_rates.rs_nrates, fNextNodeToSend->ni_esslen, fNextNodeToSend->ni_rsnie_tlv == NULL ? 0 : fNextNodeToSend->ni_rsnie_tlv_len, fNextNodeToSend->ni_rssi);
-    convertNodeToScanResult(fHalService, fNextNodeToSend, sr);
-    
-    fNextNodeToSend = RB_NEXT(ieee80211_tree, &HalService->get80211Controller()->ic_tree, fNextNodeToSend);
-    if (fNextNodeToSend == NULL)
-        fScanResultWrapping = true;
-
-    return kIOReturnSuccess;
+    // WCL owns scan results; never keep a borrowed node across legacy calls.
+    return kIOReturnUnsupported;
 }
 
 IOReturn AirportMtkSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *data)
@@ -1015,6 +908,7 @@ IOReturn AirportMtkSkywalkInterface::getHW_ADDR(apple80211_hw_mac_address *data)
 
 IOReturn AirportMtkSkywalkInterface::setMacAddress(mloAddrArray &addresses)
 {
+    if (wclStopping || !instance) return kIOReturnNotReady;
     return instance->setHardwareAddress(&addresses, IEEE80211_ADDR_LEN);
 }
 

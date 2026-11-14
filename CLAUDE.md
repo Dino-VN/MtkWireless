@@ -42,8 +42,8 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   target, MacKernelSDK before the SDK's PrivateHeaders, header-map dirs as
   `-iquote`. Changing any of these changes IOKit vtable layouts; diff
   `nm -u` against an Xcode build after touching the flags. Tahoe
-  (`__IO80211_TARGET=__MAC_26_0`) only. Only files the build, `tests/awdl`,
-  `tools/mtkctl.c` or `scripts/test-*` use are kept, and the pre-Tahoe /
+  (`__IO80211_TARGET=__MAC_26_0`) only. Only files the build, `tests/awdl`
+  or `scripts/test-*` use are kept, and the pre-Tahoe /
   non-Airport `#if` branches (`__MAC_15_2`, `!AIRPORT_WCL`, `!AIRPORT`,
   `!IO80211FAMILY_V2`) were removed with unifdef; take anything else from
   upstream `dfca847`. Local edits (search for
@@ -57,8 +57,9 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   channel only with a PM handshake, see below), TXWI `SW_POWER_MGMT` for Null
   data, DFS channels 52-144 flagged `IEEE80211_CHAN_DFS | PASSIVE` in
   `mwx_preinit` and sent as Linux `IEEE80211_CHAN_RADAR` in
-  `mt7921_mcu_set_channel_domain` (`mwx_chan_is_dfs`), HE offered by default
-  (`AirportMtkWlan.cpp`, `amtk_he=0` off), PMF (`IEEE80211_C_MFP`,
+  `mt7921_mcu_set_channel_domain` (`mwx_chan_is_dfs`), HE capability support
+  (`AirportMtkWlan.cpp`, `amtk_he=0` off; conservative HAL default also
+  disables HE, `amtk_knobs=0x2` enables it for testing), PMF (`IEEE80211_C_MFP`,
   `amtk_pmf=0` off; IGTK as mt76 sends it in `mt7921_mcu_sta_bip_update`,
   plus net80211 software BIP; `RXMGMTPROT` set at port valid), net80211
   WPA3-SAE (`ieee80211_sae.c`, AKM `IEEE80211_AKM_SAE`, EAPOL descriptor
@@ -216,9 +217,10 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   element (46) and puts WMM last (after HT/VHT/HE), as mac80211 does;
   level 3 dropped both together with HT, so it did not prove HT itself
   is at fault. Join diag `RunBw`/`RunCenter`/`RunSwitchError` (first RUN
-  channel switch; a failure silently falls back to 20 MHz). A/B without
-  reboots: boot-arg `amtk_hotspot_compat=0`, then `mtkctl knob` 0x22
-  (HT20), 0x12 (HT40), 0x202, 0x402. 1.0.24 hardware (19:30): level 2
+  channel switch; a failure silently falls back to 20 MHz). A/B PHY masks:
+  0x22 (HT20), 0x12 (HT40), 0x202, 0x402. To reproduce now, use boot-args
+  `amtk_hotspot_compat=0 amtk_knobs=<mask>` and reboot; there is no runtime
+  radio-control client. 1.0.24 hardware (19:30): level 2
   and even level 3 stalled (RunBw 0, no switch error) on a BSSID that had
   already seen a stalled join from our MAC; after the user restarted the
   hotspot (new BSSID) the first, level-3 join worked (M1 28 ms, DHCP,

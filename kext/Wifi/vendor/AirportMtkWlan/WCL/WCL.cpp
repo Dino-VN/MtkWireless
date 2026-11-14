@@ -16,8 +16,8 @@
 
 extern IOCommandGate *_fCommandGate;
 
-// Join/leave decisions go to the driver log ring (mtkctl log); the kernel log
-// quarantines this kext once the data path gets chatty.
+// Best-effort kernel messages. Retained join/roam diagnostics live in ioreg;
+// the kernel log can be overwritten or throttled once the data path gets chatty.
 #define WCL_LOG(fmt, ...) mtk_printf("AirportMtkWlan-wcl: " fmt, ##__VA_ARGS__)
 
 struct AirportMtkSkywalkInterface::CountryUpdate {
@@ -113,7 +113,9 @@ bool AirportMtkSkywalkInterface::initWCL()
 void AirportMtkSkywalkInterface::stopWCL()
 {
     // Pending country tasks must observe shutdown under the same gate.
-    if (_fCommandGate)
+    // Final free may occur after controller stop, or after a partial init.
+    const bool wasStopping = wclStopping;
+    if (!wasStopping && _fCommandGate && instance && fHalService)
         _fCommandGate->runAction(stopWCLGated, this);
     wclStopping = true;
     if (joinTimer) {
@@ -134,7 +136,7 @@ void AirportMtkSkywalkInterface::stopWCL()
     scanPending = joinPending = false;
     joinDeferred = false;
     explicit_bzero(&deferredJoin, sizeof(deferredJoin));
-    if (fHalService) {
+    if (!wasStopping && fHalService) {
         ieee80211com *ic = fHalService->get80211Controller();
         ic->ic_wcl_join_requested = false;
         ic->ic_wcl_scan_requested = false;
@@ -202,8 +204,10 @@ IOReturn AirportMtkSkywalkInterface::updateWCLLinkQualityGated(
 
 void AirportMtkSkywalkInterface::free()
 {
-    if (joinTimer)
-        stopWCL();
+    stopWCL();
+    OSSafeReleaseNULL(scanSource);
+    OSSafeReleaseNULL(fHalService);
+    instance = nullptr;
     IO80211InfraProtocol::free();
 }
 
@@ -927,7 +931,8 @@ IOReturn AirportMtkSkywalkInterface::leaveWCLNetwork()
         (ic->ic_state == IEEE80211_S_ASSOC || ic->ic_state == IEEE80211_S_RUN)) {
         IEEE80211_SEND_MGMT(ic, ic->ic_bss, IEEE80211_FC0_SUBTYPE_DEAUTH,
                             IEEE80211_REASON_AUTH_LEAVE);
-        IOSleep(10);    // let the frame leave before the STA record goes
+        // The serialized HAL state task gives DMA its 10 ms grace before
+        // removing STA_REC; never sleep on the native interrupt workloop.
     }
     if (d.Active) {
         d.EndedAtUS = mtk_join_now(); d.Active = 0;

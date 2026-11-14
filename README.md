@@ -125,7 +125,7 @@ fallback EFI:
    AirPods audio. Then run `scripts/Collect-AirDrop-BT.command` for the BLE
    advertising check.
 2. **MtkWirelessWifi**. Check `RustSelfTestFailed = 0` and `AwdlLayoutOk = Yes`, then scan,
-   join, DHCP, throughput and `mtkctl log`. Then AirDrop both ways;
+   join, DHCP and throughput. Retain the `MTKWiFiJoin` ioreg diagnostics, then AirDrop both ways;
    `scripts/Collect-AirDrop-AWDL.command` records AWDL if it fails.
 
 ## Collect diagnostics

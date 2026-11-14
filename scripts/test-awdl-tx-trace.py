@@ -84,7 +84,7 @@ def generate(ex):
     macros = ex.definitions(REG, ("MT_TX", "MT_LMAC", "MT_HDR_", "MWX_MAX_", "MWX_WTBL_",
         "MT_PACKET_", "MT_HW_TXP_", "MT_MSDU_", "MCU_UNI_CMD_STA_REC_UPDATE", "STA_REC_",
         "WTBL_", "STA_TYPE_", "NETWORK_", "CONN_STATE_", "EXTRA_INFO_", "MT_DMA_", "MWX_TXWI_MAX"))
-    macros += "\n" + ex.definitions(HAL, ("MWX_KNOB_",))
+    macros += "\n" + ex.definitions(HAL, ("MWX_KNOB_", "mwx_infra_ps", "mwx_set_infra_ps"))
     macros += "\n" + ex.definitions(IEEE, ("IEEE80211_FC", "IEEE80211_QOS_", "IEEE80211_ADDR_LEN",
         "IEEE80211_IS_MULTICAST", "IEEE80211_AID", "IEEE80211_ACTION_"))
     macros += "\n" + ex.definitions(NODE, ("IEEE80211_NODE_QOS",))
@@ -108,7 +108,8 @@ def generate(ex):
         "static int mwx_awdl_rate_start(", "static int mwx_awdl_fixed_rate(", "static void mwx_awdl_reset_rate(",
         "static uint16_t mwx_awdl_fixed_rate_value(", "uint32_t\nmt7921_mac_tx_rate_val(",
         "void\nmt7921_mac_write_txwi_80211(", "static inline uint8_t\nmt7921_lmac_mapping(",
-        "void\nmt7921_mac_write_txwi(", "struct mwx_txwi *\nmwx_txwi_get(", "void\nmwx_txwi_put(",
+        "void\nmt7921_mac_write_txwi(", "struct mwx_txwi *\nmwx_txwi_get(",
+        "static void\nmwx_txwi_put_locked(", "void\nmwx_txwi_put(",
         "int\nmwx_txwi_enqueue(", "static inline int\nmwx_dma_free_slots(", "int\nmwx_tx_full(",
         "static int\nmwx_dma_txwi_enqueue_locked(", "int\nmwx_dma_txwi_enqueue(",
         "static int\nmwx_dma_tx_cleanup_locked(", "void\nmwx_dma_tx_cleanup(", "static int\nmwx_eapol_keyinfo(",

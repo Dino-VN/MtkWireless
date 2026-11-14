@@ -169,6 +169,10 @@ private:
     static void tick(OSObject*, IOTimerEventSource*);
     void service();
     void serviceInGate();
+    static IOReturn outputGated(OSObject*,void*,void*,void*,void*);
+    UInt32 outputInGate(mbuf_t);
+    static IOReturn oobRequestGated(OSObject*,void*,void*,void*,void*);
+    IOReturn setOobRequestInGate(apple80211_awdl_oob_request*);
     void publishScheduler(uint64_t);
     void publishRocDiagnostics();
     mtkawdl::RocTrace rocTrace;
@@ -231,6 +235,10 @@ private:
     static IOReturn syncGated(OSObject*,void*,void*,void*,void*);
     IOReturn setSyncInGate(bool);
     mbuf_t makeFrame(const uint8_t*, size_t);
+    // Workloop-gated service scratch: makeFrame copies it before every
+    // firmware/native call that can sleep or re-enter this interface.
+    uint8_t serviceFrame[2304] = {};
+    uint8_t outputEthernet[1514] = {}, outputFrame[1552] = {};
     // Build one QoS A-MSDU from consecutive ready unicast data frames.
     // On success only the following queue entries are consumed; the caller
     // still owns `first`. Returns NULL to keep the legacy one-MPDU path.

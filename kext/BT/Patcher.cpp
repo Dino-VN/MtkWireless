@@ -12,6 +12,7 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
 #include <IOKit/IOLocks.h>
+#include <kern/clock.h>
 #include <kern/thread_call.h>
 #include <sys/syslimits.h>
 #include <sys/sysctl.h>
@@ -57,12 +58,15 @@ enum BluetoothdBuild : SInt32 { BuildUnread = 0, BuildOther = 1, Build25G241 = 2
 volatile SInt32 bluetoothdBuild;
 char bluetoothdBuildName[16];
 volatile SInt32 bluetoothdSitesAmbiguous;
-// mSBC latched Off before any MediaTek controller was probed (boot order).
-volatile SInt32 msbcOffBeforeProbe;
+// mSBC matching pages seen before USB scope was known (decision deferred).
+volatile SInt32 msbcDeferredBeforeProbe;
 // bluetoothd pages left native: no verifier restore, or no patch-range room.
 volatile SInt32 bluetoothdPagesUnpatched;
 // Per-feature decision for the current bluetoothd vnode (FeatureLatch), under pageLock.
 uint8_t featureLatch[3];
+// A validated native sender page may stay resident. Do not enable WBS until
+// that page is safely revalidated/patched; never retain its raw page pointer.
+bool msbcSenderNative;
 volatile SInt32 bluetoothdPages, bluetoothdPatched, bluetoothdAddressPatched, bluetoothdAddressRetryPatched;
 volatile SInt32 bluetoothdWbsPatched, bluetoothdHfpFillPatched;
 volatile SInt32 bluetoothdRpaHelpersPatched, bluetoothdRpaLegacyPatched, bluetoothdRpaScanPatched;
@@ -180,7 +184,7 @@ void publishCounters()
     // 2 bits per feature (adv, mSBC, RPA): 0 undecided, 1 on, 2 off.
     number("BluetoothdPatchFeatures", (uint32_t)(featureLatch[0] | featureLatch[1] << 2 | featureLatch[2] << 4));
     number("BluetoothdSitesAmbiguous", (uint32_t)bluetoothdSitesAmbiguous);
-    number("BluetoothdMsbcOffBeforeProbe", (uint32_t)msbcOffBeforeProbe);
+    number("BluetoothdMsbcDeferredBeforeProbe", (uint32_t)msbcDeferredBeforeProbe);
     number("BluetoothdPagesUnpatched", (uint32_t)bluetoothdPagesUnpatched);
     d->setObject("BluetoothdRpaEnabled",
                  rpaPatchEnabled && verifyFixRouted && build == Build25G332 ? kOSBooleanTrue : kOSBooleanFalse);
@@ -195,7 +199,7 @@ void publishCounters()
     number("BluetoothdRpaUpdatePatched", (uint32_t)bluetoothdRpaUpdatePatched);
     number("BluetoothdWbsPatched", (uint32_t)bluetoothdWbsPatched);
     number("BluetoothdHfpFillPatched", (uint32_t)bluetoothdHfpFillPatched);
-    number("MsbcScopeFix", 1);
+    number("MsbcScopeFix", 2);
     number("MsbcControllerScope", msbcControllerScope.observed());
     d->setObject("MsbcWidebandAllowed",
         msbcPatchEnabled && isMsbcReady() && msbcControllerScope.allowsWideband() ? kOSBooleanTrue : kOSBooleanFalse);
@@ -213,13 +217,27 @@ void publishCounters()
 }
 
 thread_call_t publishCall;
+volatile UInt32 publishQueued;
+constexpr uint32_t kCounterPublishDelayMs = 1000;
 
-// For page-in and page validation, which must not touch the registry; a
-// bluetoothd stuck in a SIGBUS loop sends no HCI traffic that would publish.
+// USB completions/EP0 and vnode hooks only queue a snapshot. Coalesce bursts
+// (including malformed events) to at most one registry allocation pass per
+// second, without extending the deadline on every new transfer.
 void publishLater()
 {
-    if (publishCall)
-        thread_call_enter(publishCall);
+    if (publishCall && OSCompareAndSwap(0, 1, &publishQueued)) {
+        uint64_t deadline = 0;
+        clock_interval_to_deadline(kCounterPublishDelayMs, kMillisecondScale, &deadline);
+        thread_call_enter_delayed(publishCall, deadline);
+    }
+}
+
+void publishDeferred(thread_call_param_t, thread_call_param_t)
+{
+    // Updates during this snapshot can queue the next one; none are stranded
+    // behind a flag that is cleared only after publication finishes.
+    __atomic_store_n(&publishQueued, 0, __ATOMIC_RELEASE);
+    publishCounters();
 }
 
 /* MtkBtLog and FirmwareLoaded are published together by MtkWirelessBTLoader
@@ -255,7 +273,7 @@ void fixReadClock(IOUSBHostDevice *device, StandardUSB::DeviceRequest &request, 
     if (data) {
         if (mtk_bt_fix_read_clock(request.bmRequestType, static_cast<uint8_t *>(data), 6)) {
             OSIncrementAtomic(&readClockRewritten);
-            publishCounters();
+            publishLater();
         }
         return;
     }
@@ -266,47 +284,104 @@ void fixReadClock(IOUSBHostDevice *device, StandardUSB::DeviceRequest &request, 
         mtk_bt_fix_read_clock(request.bmRequestType, cmd, sizeof(cmd)) &&
         descriptor->writeBytes(5, &cmd[5], 1) == 1) {
         OSIncrementAtomic(&readClockRewritten);
-        publishCounters();
+        publishLater();
     }
     descriptor->complete(kIODirectionInOut);
 }
 
 #pragma mark - Non-flushable ACL
 
-/* HCI ACL bulk OUT pipes of loaded MediaTek controllers. Pipes are only
- * created by IOUSBHostInterface::copyPipe, whose route binds them here, so
- * the ACL rewrite never touches another device's bulk data (a USB-MIDI pitch
- * bend has the same 4-byte shape). Addresses are lookup keys only; a reused
- * address is unbound when copyPipe hands it out again. */
-constexpr size_t kAclPipeSlots = 4;
-IOUSBHostPipe *aclPipes[kAclPipeSlots];
-volatile SInt32 aclPipeNext;
+/* HCI ACL bulk OUT pipes of loaded MediaTek controllers. Address keys and
+ * numeric owner ids only: retaining a pipe/interface here would keep a dead
+ * USB session alive across re-enumeration. leLock protects the entire record
+ * (not independently published address/owner fields). */
+constexpr size_t kAclPipeSlots = 8;
+struct AclPipeBinding {
+    uintptr_t pipe;
+    uint64_t interfaceId;
+    uint64_t controllerId;
+};
+AclPipeBinding aclPipes[kAclPipeSlots];
+size_t aclPipeNext;
 
 bool isMediaTekAclPipe(IOUSBHostPipe *pipe)
 {
-    for (auto &slot : aclPipes)
-        if (__atomic_load_n(&slot, __ATOMIC_ACQUIRE) == pipe)
-            return true;
-    return false;
+    if (!pipe || !leLock)
+        return false;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(pipe);
+    bool bound = false;
+    IOLockLock(leLock);
+    for (const auto &slot : aclPipes) {
+        if (slot.pipe == key) {
+            bound = true;
+            break;
+        }
+    }
+    IOLockUnlock(leLock);
+    return bound;
 }
 
-void bindAclPipe(IOUSBHostPipe *pipe, bool mediatek)
+// Clear every returned address before any descriptor or class filter. Rust
+// keeps provisional command state for a repeated live owner, but no mapping
+// is visible until the endpoint is classified and bound again.
+void preparePipeMappings(IOUSBHostPipe *pipe, uint64_t interfaceId)
 {
-    for (auto &slot : aclPipes) {
-        IOUSBHostPipe *expected = pipe;
-        __atomic_compare_exchange_n(&slot, &expected, nullptr, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
-    }
-    if (!mediatek)
+    if (!pipe || !leLock)
         return;
-    OSIncrementAtomic(&aclPipesBound);
-    for (auto &slot : aclPipes) {
-        IOUSBHostPipe *expected = nullptr;
-        if (__atomic_compare_exchange_n(&slot, &expected, pipe, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
-            return;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(pipe);
+    IOLockLock(leLock);
+    for (auto &slot : aclPipes)
+        if (slot.pipe == key)
+            slot = {};
+    mtk_bt_le_prepare_event_pipe(pipe, interfaceId);
+    IOLockUnlock(leLock);
+}
+
+void bindAclPipe(IOUSBHostPipe *pipe, uint64_t interfaceId, uint64_t controllerId, bool mediatek)
+{
+    if (!pipe || !leLock)
+        return;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(pipe);
+    IOLockLock(leLock);
+    for (auto &slot : aclPipes)
+        if (slot.pipe == key)
+            slot = {};
+    if (mediatek && interfaceId && controllerId) {
+        OSIncrementAtomic(&aclPipesBound);
+        AclPipeBinding *free = nullptr;
+        for (auto &slot : aclPipes)
+            if (!slot.pipe && !free)
+                free = &slot;
+        // A bounded table may evict a key, never retain obsolete USB objects.
+        if (!free)
+            free = &aclPipes[aclPipeNext++ % kAclPipeSlots];
+        *free = {key, interfaceId, controllerId};
     }
-    // Full: earlier controllers re-enumerated (wake with USB power cut).
-    const UInt32 n = (UInt32)OSIncrementAtomic(&aclPipeNext);
-    __atomic_store_n(&aclPipes[n % kAclPipeSlots], pipe, __ATOMIC_RELEASE);
+    IOLockUnlock(leLock);
+}
+
+void forgetInterfaceMappings(uint64_t interfaceId)
+{
+    if (!interfaceId || !leLock)
+        return;
+    IOLockLock(leLock);
+    for (auto &slot : aclPipes)
+        if (slot.interfaceId == interfaceId)
+            slot = {};
+    mtk_bt_le_unbind_interface(interfaceId);
+    IOLockUnlock(leLock);
+}
+
+void forgetControllerMappings(uint64_t controllerId)
+{
+    if (!controllerId || !leLock)
+        return;
+    IOLockLock(leLock);
+    for (auto &slot : aclPipes)
+        if (slot.controllerId == controllerId)
+            slot = {};
+    mtk_bt_le_unbind_controller(controllerId);
+    IOLockUnlock(leLock);
 }
 
 void fixAclFlush(IOUSBHostPipe *pipe, IOMemoryDescriptor *buffer, uint32_t length)
@@ -325,7 +400,7 @@ void fixAclFlush(IOUSBHostPipe *pipe, IOMemoryDescriptor *buffer, uint32_t lengt
             SYSLOG(DRV_NAME, "ACL PB flushable->non-flushable handle 0x%03x len %u",
                    (hdr[0] | (hdr[1] << 8)) & 0x0fff, length - 4);
         if ((n & 0x3ff) == 0)
-            publishCounters();
+            publishLater();
     }
     buffer->complete(kIODirectionInOut);
 }
@@ -370,7 +445,7 @@ uint32_t leReadyCommand(IOUSBHostDevice *device, StandardUSB::DeviceRequest &req
         IOLockUnlock(leLock);
     }
     if (observed)
-        publishCounters();
+        publishLater();
     return observed & 0xff;
 }
 
@@ -381,7 +456,7 @@ void leReadyUsbStatus(uint32_t command, IOReturn status)
     IOLockLock(leLock);
     mtk_bt_le_ready_usb_status(command, static_cast<uint32_t>(status));
     IOLockUnlock(leLock);
-    publishCounters();
+    publishLater();
 }
 
 uint64_t leControllerForPipe(IOUSBHostPipe *pipe)
@@ -417,7 +492,7 @@ uint64_t leArm(IOUSBHostDevice *device, StandardUSB::DeviceRequest &request, voi
     IOLockUnlock(leLock);
     if (token) {
         OSIncrementAtomic(&leCommands);
-        publishCounters();
+        publishLater();
     }
     return token;
 }
@@ -451,7 +526,7 @@ void leReceive(uint64_t id, IOMemoryDescriptor *buffer, uint32_t length)
         SYSLOG(DRV_NAME, "MediaTek 0xFD3C feature-mask status -> Command Complete, credits preserved");
     }
     if (rewritten || observed)
-        publishCounters();
+        publishLater();
 }
 
 /* Wraps a USB completion. Two references: the callback and the submitter,
@@ -673,9 +748,15 @@ IOReturn selectAlternateSetting(IOUSBHostInterface *interface, uint8_t alternate
 
 void interfaceClose(IOUSBHostInterface *interface, IOService *client, IOOptionBits options)
 {
-    const bool scoped = isMsbcReady() && msbcBridge &&
+    // IOUSBHostInterface has one open session. Only its actual owner closes
+    // it; a no-op close by another client must not invalidate live mappings.
+    // Its real close synchronously aborts session IO before we detach mSBC.
+    const bool closing = interface && client && interface->isOpen(client);
+    const bool scoped = closing && isMsbcReady() && msbcBridge &&
         (msbcBridge->ownsInterface(interface) || msbcCachedScoInterface(interface));
     const uint64_t generation = scoped ? msbcBridge->beginInterfaceChange() : 0;
+    if (closing)
+        forgetInterfaceMappings(interface->getRegistryEntryID());
     FunctionCast(interfaceClose, orgInterfaceClose)(interface, client, options);
     if (scoped)
         msbcBridge->detach(generation);
@@ -704,11 +785,13 @@ IOReturn getPipeProperties(IOService *client, uint8_t pipeRef, uint64_t *directi
 IOUSBHostPipe *copyPipe(IOUSBHostInterface *interface, uint8_t address)
 {
     IOUSBHostPipe *pipe = FunctionCast(copyPipe, orgCopyPipe)(interface, address);
+    if (!pipe)
+        return pipe;
+    const uint64_t interfaceId = interface ? interface->getRegistryEntryID() : 0;
+    preparePipeMappings(pipe, interfaceId);
     if ((address == 0x03 || address == 0x83) && isMsbcReady() && msbcBridge &&
         msbcBridge->observePipe(interface, pipe))
         msbcBridge->publishStatus();
-    if (!pipe)
-        return pipe;
     const auto *ep = pipe->getEndpointDescriptor();
     const auto *desc = interface ? interface->getInterfaceDescriptor() : nullptr;
     const bool hci = ep && desc && desc->bInterfaceClass == 0xE0 && desc->bInterfaceSubClass == 1 &&
@@ -720,12 +803,13 @@ IOUSBHostPipe *copyPipe(IOUSBHostInterface *interface, uint8_t address)
         for (IOService *p = interface->getProvider(); p && !device; p = p->getProvider())
             device = OSDynamicCast(IOUSBHostDevice, p);
     const bool mediatek = isLoadedMediaTek(device);
-    bindAclPipe(pipe, aclPipe && mediatek);
+    const uint64_t controllerId = device ? device->getRegistryEntryID() : 0;
+    bindAclPipe(pipe, interfaceId, controllerId, aclPipe && mediatek);
     if (leShimEnabled) {
-        // Any other pipe (id 0, false) only drops a stale mapping of this address.
+        // A same-interface endpoint that no longer carries HCI events is also
+        // unbound. No unrelated transfer schedules a diagnostic publication.
         IOLockLock(leLock);
-        mtk_bt_le_bind_event_pipe(pipe, eventPipe && device ? device->getRegistryEntryID() : 0,
-                                  eventPipe && mediatek);
+        mtk_bt_le_bind_event_pipe(pipe, interfaceId, controllerId, eventPipe && mediatek);
         IOLockUnlock(leLock);
     }
     return pipe;
@@ -759,14 +843,13 @@ void installMsbcBridge(KernelPatcher &patcher, size_t index, mach_vm_address_t a
                        bool copyPipeRouted)
 {
     if (getKernelVersion() != KernelVersion::Tahoe || checkKernelArgument("-mtkbtnomsbc") ||
-        !copyPipeRouted || !orgCopyPipe)
+        !copyPipeRouted || !orgCopyPipe || !orgInterfaceClose)
         return;
     KernelPatcher::RouteRequest routes[] {
         {"__ZN13IOUSBHostPipe2ioEP18IOMemoryDescriptorP25IOUSBHostIsochronousFramejyP30IOUSBHostIsochronousCompletion",
          reinterpret_cast<void *>(isoIo), orgIsoIo},
         {"__ZN18IOUSBHostInterface22selectAlternateSettingEh",
          reinterpret_cast<void *>(selectAlternateSetting), orgSelectAlternateSetting},
-        {"__ZN18IOUSBHostInterface5closeEP9IOServicej", reinterpret_cast<void *>(interfaceClose), orgInterfaceClose},
         {"__ZN31AppleUSBHostInterfaceUserClient17GetPipePropertiesEhPyS0_S0_S0_S0_",
          reinterpret_cast<void *>(getPipeProperties), orgGetPipeProperties}
     };
@@ -832,7 +915,11 @@ void processKext(void *, KernelPatcher &patcher, size_t index, mach_vm_address_t
                               reinterpret_cast<void *>(pipeIoSync), orgPipeIoSync);
     const bool pipes = route(patcher, index, address, size, "__ZN18IOUSBHostInterface8copyPipeEh",
                              reinterpret_cast<void *>(copyPipe), orgCopyPipe);
-    installMsbcBridge(patcher, index, address, size, pipes);
+    // HCI mapping teardown is needed even with -mtkbtnomsbc. Route close once;
+    // the mSBC installer requires this original, rather than routing it again.
+    const bool close = route(patcher, index, address, size, "__ZN18IOUSBHostInterface5closeEP9IOServicej",
+                             reinterpret_cast<void *>(interfaceClose), orgInterfaceClose);
+    installMsbcBridge(patcher, index, address, size, pipes && close);
     leShimEnabled = leLock && io && request && ioSync && pipes && !checkKernelArgument("-mtkbtnolefix");
     SYSLOG(DRV_NAME, "MediaTek LE feature-mask USB shim %s", leShimEnabled ? "enabled" : "unavailable");
     publishCounters();
@@ -1550,8 +1637,10 @@ void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t pa
         return;
     }
     IOLockLock(pageLock);
-    if (__atomic_load_n(&bluetoothdVnode, __ATOMIC_RELAXED) != vp)
+    if (__atomic_load_n(&bluetoothdVnode, __ATOMIC_RELAXED) != vp) {
         memset(featureLatch, 0, sizeof(featureLatch));
+        msbcSenderNative = false;
+    }
     __atomic_store_n(&bluetoothdVnode, vp, __ATOMIC_RELEASE);
     // The page may already hold our patch from an earlier fault; hand the
     // signature check the original bytes so the page never validates dirty.
@@ -1626,10 +1715,11 @@ const BluetoothdSite bluetoothdSites[] {
     BLUETOOTHD_RPA_SITE("RPA device", rpaDevice, bluetoothdRpaDevicePatched),
     BLUETOOTHD_RPA_SITE("RPA connect", rpaConnect, bluetoothdRpaConnectPatched),
     BLUETOOTHD_RPA_SITE("RPA update", rpaUpdate, bluetoothdRpaUpdatePatched),
-    BLUETOOTHD_SITE("HFP wideband gate", FeatureMsbc, ScopeKnownBuild, wbsFind, wbsFindMask, wbsReplace,
-                    wbsReplaceMask, bluetoothdWbsPatched),
+    // Sender before gate, including when both happen to match one page.
     BLUETOOTHD_SITE("HFP complete PCM chunks", FeatureMsbc, ScopeKnownBuild, hfpFillFind, hfpFillFindMask,
                     hfpFillReplace, hfpFillReplaceMask, bluetoothdHfpFillPatched),
+    BLUETOOTHD_SITE("HFP wideband gate", FeatureMsbc, ScopeKnownBuild, wbsFind, wbsFindMask, wbsReplace,
+                    wbsReplaceMask, bluetoothdWbsPatched),
     BLUETOOTHD_SITE("extended-advertising check", FeatureAdv, ScopeAnyBuild, extAdvFind, nullptr, extAdvReplace,
                     nullptr, bluetoothdPatched),
     BLUETOOTHD_SITE("per-set advertising address gate", FeatureAdv, ScopeKnownBuild, advAddressFind,
@@ -1668,20 +1758,21 @@ bool featureWanted(PatchFeature feature)
 }
 
 /*
- * Caller holds pageLock. A feature is decided at its first matching site in
- * this bluetoothd vnode and kept until the vnode changes: its patched pages
- * stay resident across bluetoothd relaunches, so a later flip of a gate
- * (mSBC readiness, controller scope) must not leave one site of a pair
- * patched and the other native (WBS on with the native sender overflowing).
+ * Caller holds pageLock. Once decided, a feature stays latched for this
+ * vnode: its patched pages can remain resident across bluetoothd relaunches.
+ * Unknown USB scope is not an Off decision. Early native pages are retried
+ * only on validation, never through a saved raw page pointer; the WBS gate
+ * additionally waits for the sender fix in patchBluetoothdPage.
  */
 bool featureOn(PatchFeature feature)
 {
     if (featureLatch[feature] == LatchUndecided) {
+        if (feature == FeatureMsbc && msbcPatchEnabled && !msbcControllerScope.observed()) {
+            __atomic_store_n(&msbcDeferredBeforeProbe, 1, __ATOMIC_RELAXED);
+            publishLater();
+            return false;
+        }
         featureLatch[feature] = featureWanted(feature) ? LatchOn : LatchOff;
-        // Kept Off (a half-patched pair is worse), but say why WBS fell back to CVSD.
-        if (feature == FeatureMsbc && featureLatch[feature] == LatchOff && msbcPatchEnabled &&
-            !msbcControllerScope.observed())
-            msbcOffBeforeProbe = 1;
     }
     return featureLatch[feature] == LatchOn;
 }
@@ -1700,14 +1791,22 @@ bool patchBluetoothdPage(void *data)
             continue;
         if (at < 0) {
             // Not specific enough for this build: never decide on it.
+            if (s.counter == &bluetoothdHfpFillPatched)
+                msbcSenderNative = true;
             if (featureLatch[s.feature] == LatchUndecided)
                 featureLatch[s.feature] = LatchOff;
             OSIncrementAtomic(&bluetoothdSitesAmbiguous);
             SYSLOG(DRV_NAME, "bluetoothd %s: ambiguous (%d), left native", s.name, (int)at);
             continue;
         }
+        if (s.counter == &bluetoothdHfpFillPatched)
+            msbcSenderNative = true;
+        if (s.counter == &bluetoothdWbsPatched && msbcSenderNative)
+            continue; // HFP's early native page may still be resident.
         if (!featureOn(s.feature) || !mtk_bt_page_apply(page, PAGE_SIZE, (size_t)at, &s.site))
             continue;
+        if (s.counter == &bluetoothdHfpFillPatched)
+            msbcSenderNative = false;
         if (s.counter == &bluetoothdRpaHelpersPatched)
             __atomic_store_n(&rpaHelpersReady, true, __ATOMIC_RELEASE);
         OSIncrementAtomic(s.counter);
@@ -1743,12 +1842,19 @@ void processPatcher(void *, KernelPatcher &patcher)
 void Patcher::observeMsbcController(bool supported)
 {
     msbcControllerScope.observe(supported);
-    publishCounters();
+    publishLater();
+}
+
+void Patcher::forgetController(uint64_t registryId)
+{
+    forgetControllerMappings(registryId);
 }
 
 void Patcher::init(uint32_t rustSelfTestFailed)
 {
     rustFailed = rustSelfTestFailed;
+    // USB diagnostics still need a publisher with the APFS verifier disabled.
+    publishCall = thread_call_allocate(publishDeferred, nullptr);
     if (getKernelVersion() < KernelVersion::Monterey) {
         lilu.onKextLoadForce(&kextIOBluetoothFamily, 1, processKext);
     } else {
@@ -1770,8 +1876,6 @@ void Patcher::init(uint32_t rustSelfTestFailed)
             pageSnapshot = static_cast<uint8_t *>(IOMalloc(PAGE_SIZE));
             verifyCopyLock = IOLockAlloc();
             verifyCopy = verifyCopyLock ? static_cast<uint8_t *>(IOMalloc(kVerifyCopySize)) : nullptr;
-            publishCall = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { publishCounters(); },
-                                               nullptr);
         }
         lilu.onKextLoadForce(&kextIOUSBHostFamily, 1, processKext);
         if (extAdvPatchEnabled || msbcPatchEnabled || verifyFixEnabled)

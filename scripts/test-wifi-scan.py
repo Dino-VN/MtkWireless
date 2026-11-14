@@ -118,8 +118,14 @@ struct mwx_softc {
     unsigned sc_flags=0, sc_scan_requests=0; int sc_scan_to=0;
     unsigned sc_awdl_scan_preempted=0;
 };
-unsigned aborts=0;
-void mwx_awdl_abort(mwx_softc*){++aborts;}
+// The operation's admission/lifetime is modeled here; its real implementation
+// is exercised separately by test-awdl-sync-recovery.py.
+unsigned aborts=0, admissionOwners=0;
+struct MwxAwdlInfraOperation {
+    explicit MwxAwdlInfraOperation(mwx_softc*) { ++admissionOwners; }
+    ~MwxAwdlInfraOperation() { --admissionOwners; }
+};
+void mwx_awdl_abort(mwx_softc*){assert(admissionOwners);++aborts;}
 void timeout_add_sec(int*,int){}
 ''' + admission + function(hal, 'int\nmwx_bgscan(') + r'''
 int main(){

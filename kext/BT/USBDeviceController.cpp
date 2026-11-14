@@ -213,7 +213,9 @@ IOReturn USBDeviceController::readWMTEvent(void *buf, uint32_t bufSize, uint32_t
         clock_get_uptime(&now);
         if (now >= deadline)
             return kIOReturnTimeout;
-        IODelay(500);
+        // Bring-up/shutdown run in a sleepable context (USB requests already
+        // block). Yield between empty polls instead of spinning for up to 10 s.
+        IOSleep(1);
     }
 }
 

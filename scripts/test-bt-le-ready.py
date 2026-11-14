@@ -32,6 +32,9 @@ using IOReturn = int32_t;
 using SInt32 = int32_t;
 using UInt32 = uint32_t;
 using mach_vm_address_t = uintptr_t;
+using thread_call_param_t = void *;
+using thread_call_t = void *;
+constexpr int kMillisecondScale = 1;
 constexpr IOReturn kIOReturnSuccess = 0;
 constexpr int kIODirectionInOut = 3;
 #define FunctionCast(fn, original) reinterpret_cast<decltype(&fn)>(original)
@@ -66,9 +69,16 @@ struct IOUSBHostCompletion {
     void *parameter;
 };
 bool leShimEnabled = true, leReadyMaskEnabled = true, randomAddressHack = false;
-int lockDepth, publications, allocations;
+int lockDepth, publications, allocations, queuedPublications;
+uint64_t now, publicationDeadline;
+void clock_interval_to_deadline(uint32_t delay, int scale, uint64_t *deadline) {
+    assert(scale == kMillisecondScale); *deadline = now + delay;
+}
+bool thread_call_enter_delayed(thread_call_t call, uint64_t deadline) {
+    assert(call); ++queuedPublications; publicationDeadline = deadline; return false;
+}
 void *leLock = reinterpret_cast<void *>(1);
-int32_t leCommands, leCompletions, leErrors;
+int32_t leCommands, leCompletions, leErrors, readClockRewritten;
 void IOLockLock(void *) { assert(!lockDepth++); }
 void IOLockUnlock(void *) { assert(lockDepth-- == 1); }
 void OSIncrementAtomic(volatile SInt32 *v) { ++*v; }
@@ -79,9 +89,9 @@ bool OSCompareAndSwap(UInt32 old, UInt32 value, volatile UInt32 *p) {
 bool allocationFails;
 void *IOMalloc(size_t size) { if (allocationFails) return nullptr; ++allocations; return malloc(size); }
 void IOFree(void *p, size_t) { --allocations; free(p); }
-void publishCounters() { assert(!lockDepth); ++publications; }
+void (*duringPublication)();
+void publishCounters() { assert(!lockDepth); ++publications; if (duringPublication) duringPublication(); }
 bool isLoadedMediaTek(IOUSBHostDevice *d) { return d && d->loaded; }
-void fixReadClock(StandardUSB::DeviceRequest &, void *, IOMemoryDescriptor *) {}
 void randomAddress(void *, IOService *, StandardUSB::DeviceRequest &, void *, IOMemoryDescriptor *, unsigned) {}
 void fixAclFlush(IOUSBHostPipe *, IOMemoryDescriptor *, uint32_t) {}
 mach_vm_address_t orgDeviceRequest, orgPipeIo, orgPipeIoSync;
@@ -123,8 +133,10 @@ static_assert(offsetof(mtk_bt_le_ready_diagnostics, meta) == 232);
 '''
 
 state = source[source.index('struct LeCompletion {'):source.index('LeCompletion *makeLeCompletion(')]
+state += source[source.index('thread_call_t publishCall;'):source.index('// USB completions/EP0')]
 wrappers = '\n'.join(function(name) for name in (
-    'bool readRequestBytes(', 'uint32_t leReadyCommand(', 'void leReadyUsbStatus(',
+    'void publishLater(', 'void publishDeferred(', 'bool readRequestBytes(', 'void fixReadClock(',
+    'uint32_t leReadyCommand(', 'void leReadyUsbStatus(',
     'uint64_t leControllerForPipe(', 'void leCancel(', 'uint64_t leArm(', 'void leReceive(',
     'LeCompletion *makeLeCompletion(', 'void releaseLeCompletion(', 'void leUsbCompletion(',
     'void finishLeSubmission(', 'IOReturn deviceRequest(', 'IOReturn pipeIo(', 'IOReturn pipeIoSync('))
@@ -133,6 +145,18 @@ int main() {
     orgDeviceRequest = reinterpret_cast<uintptr_t>(originalRequest);
     orgPipeIo = reinterpret_cast<uintptr_t>(originalPipe);
     orgPipeIoSync = reinterpret_cast<uintptr_t>(originalPipeSync);
+    // A missing deferred publisher never falls back to registry allocation in
+    // USB hooks. Bursts keep the first deadline, including a long noisy stream.
+    publishLater(); assert(!publishQueued && !queuedPublications && !publications);
+    publishCall = reinterpret_cast<void *>(1);
+    for (unsigned i = 0; i < 10000; ++i) { now = i; publishLater(); }
+    assert(publishQueued && queuedPublications == 1 && publicationDeadline == 1000 && !publications);
+    duringPublication = [] { publishLater(); };
+    publishDeferred(nullptr, nullptr);
+    assert(publications == 1 && queuedPublications == 2 && publishQueued && publicationDeadline == now + 1000);
+    duringPublication = nullptr; publishDeferred(nullptr, nullptr);
+    assert(publications == 2 && !publishQueued);
+    publications = queuedPublications = 0;
     IOUSBHostDevice device;
     StandardUSB::DeviceRequest request {0x20, 0, 0, 0, 11};
     IOUSBHostCompletion completion {nullptr, client, reinterpret_cast<void *>(17)};
@@ -171,7 +195,7 @@ int main() {
     // Real 0xFD3C rewrite remains separate and preserves command credits.
     IOMemoryDescriptor feature; feature.bytes = {0x3c, 0xfd, 8, 0xfd, 0xfd, 1, 0xff, 9, 0, 0, 0};
     deviceRequest(&device, nullptr, request, nullptr, &feature, length, nullptr, 1000);
-    IOUSBHostPipe pipe; mtk_bt_le_bind_event_pipe(&pipe, 42, true);
+    IOUSBHostPipe pipe; mtk_bt_le_bind_event_pipe(&pipe, 420, 42, true);
     IOMemoryDescriptor event;
     event.bytes = {0x0f, 4, 1, 3, 0x3c, 0xfd};
     assert(!pipeIo(&pipe, &event, event.bytes.size(), &completion, 1000));
@@ -196,7 +220,37 @@ int main() {
     allocationFails = true;
     pipeIo(&pipe, &event, wire.size(), &completion, 1000); finish(0, wire.size());
     assert(snapshot().meta[1].count == 2);
-    puts("PASS: production LE EP0/interrupt routes, real Rust ABI, scope, mask writes, async lifetime/errors, FD3C coexistence");
+    allocationFails = false;
+    // Malformed hardware events update counters but never allocate a registry
+    // dictionary per transfer; unrelated recycled pipes do not even observe.
+    event.bytes = {0x3e, 0xff};
+    auto malformed = snapshot().malformed;
+    for (unsigned i = 0; i < 1000; ++i) {
+        pipeIo(&pipe, &event, event.bytes.size(), &completion, 1000); finish(0, event.bytes.size());
+    }
+    assert(snapshot().malformed == malformed + 1000 && !allocations && !publications && queuedPublications == 1);
+    mtk_bt_le_prepare_event_pipe(&pipe, 999);
+    assert(!mtk_bt_le_controller_for_pipe(&pipe));
+    mtk_bt_le_bind_event_pipe(&pipe, 999, 0, false);
+    malformed = snapshot().malformed;
+    for (unsigned i = 0; i < 1000; ++i) {
+        pipeIo(&pipe, &event, event.bytes.size(), &completion, 1000); finish(0, event.bytes.size());
+    }
+    assert(snapshot().malformed == malformed && !allocations && !publications && queuedPublications == 1);
+    // Preserve the prior Read Clock fix: both raw and descriptor requests on
+    // other devices/classes stay untouched despite their identical bytes.
+    for (bool raw : {false, true}) for (bool loaded : {false, true})
+    for (uint8_t type : {uint8_t(0x20), uint8_t(0x40), uint8_t(0xa0)}) {
+        IOMemoryDescriptor command; command.bytes = {7, 0x14, 3, 0xb, 0, 0};
+        StandardUSB::DeviceRequest clock {type, 0, 0, 0, 6}; device.loaded = loaded;
+        int before = readClockRewritten;
+        fixReadClock(&device, clock, raw ? command.bytes.data() : nullptr, raw ? nullptr : &command);
+        const bool changed = loaded && type == 0x20;
+        assert(command.bytes[5] == changed && readClockRewritten == before + changed && !command.prepared);
+    }
+    assert(!publications && queuedPublications == 1);
+    publishDeferred(nullptr, nullptr); assert(publications == 1 && !publishQueued);
+    puts("PASS: production LE/Read Clock scope, real Rust ABI, coalesced deferred diagnostics, malformed/foreign pipe reuse, async lifetimes/errors, FD3C coexistence");
 }
 '''
 host = root / 'build/rust-bt-host'

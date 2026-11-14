@@ -186,7 +186,7 @@ WIFI_VENDOR_SOURCES=(
     $V/mtk80211/openbsd/net80211/ieee80211_ioctl.c $V/mtk80211/openbsd/net80211/ieee80211_ra.c
     $V/mtk80211/openbsd/crypto/rmd160.c $V/mtk80211/openbsd/crypto/cmac.c $V/mtk80211/openbsd/net80211/ieee80211.c
     $V/mtk80211/openbsd/crypto/chachapoly.c $V/mtk80211/openbsd/sys/_task.cpp $V/mtk80211/openbsd/crypto/key_wrap.c
-    $V/SimpleMtkWlan/MtkWlanUserClient.cpp $V/mtk80211/openbsd/net80211/ieee80211_pae_output.c
+    $V/mtk80211/openbsd/net80211/ieee80211_pae_output.c
     $V/mtk80211/openbsd/net80211/ieee80211_pae_input.c $V/mtk80211/openbsd/crypto/rijndael.c
     $V/mtk80211/openbsd/crypto/gmac.c $V/mtk80211/openbsd/net80211/ieee80211_mira.c
     $V/mtk80211/openbsd/crypto/ecb3_enc.c $V/mtk80211/openbsd/sys/arp.c
@@ -199,7 +199,7 @@ WIFI_VENDOR_SOURCES=(
 # Xcode resolves "header.h" through a header map of all project headers;
 # these are the directories it covers.
 WIFI_QUOTE_DIRS=(mtk80211/openbsd/sys mtk80211/openbsd/crypto mtk80211/linux SimpleMtkWlan
-    mtk80211/openbsd/net80211 AirportMtkWlan mtk80211 include/ClientKit include/HAL
+    mtk80211/openbsd/net80211 AirportMtkWlan mtk80211 include/HAL
     SimpleMtkWlan/hal_mwx AirportMtkWlan/WCL include)
 WIFI_LIB="$(rust_lib wifi)"
 WIFI_GEN="$ROOT/build/gen/wifi"

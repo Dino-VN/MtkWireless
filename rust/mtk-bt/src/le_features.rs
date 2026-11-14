@@ -160,6 +160,10 @@ struct Controller {
     registry_id: u64,
     /// Address of its HCI event (interrupt IN) pipe; a lookup key only.
     event_pipe: usize,
+    /// Address being classified by copyPipe; not an observable pipe mapping.
+    prepared_pipe: usize,
+    /// Registry id of the interface that handed out the pipe, never an object.
+    event_interface: u64,
     pending: Pending,
 }
 
@@ -177,6 +181,8 @@ impl LeFeatures {
             controllers: [Controller {
                 registry_id: 0,
                 event_pipe: 0,
+                prepared_pipe: 0,
+                event_interface: 0,
                 pending: Pending {
                     generation: 0,
                     active: false,
@@ -258,17 +264,71 @@ impl LeFeatures {
             .map_or(0, |c| c.registry_id)
     }
 
-    /// An HCI event pipe was handed out for device `id`. Any other mapping of
-    /// the same pipe address is stale (the object was freed and reused).
-    pub fn bind_event_pipe(&mut self, pipe: usize, id: u64, is_mediatek: bool) {
+    /// Clear every returned address key before inspecting its pipe class.
+    /// The same live interface keeps only provisional command state, not a
+    /// pipe mapping, until bind_event_pipe validates its endpoint again.
+    pub fn prepare_event_pipe(&mut self, pipe: usize, interface: u64) {
+        if pipe == 0 {
+            return;
+        }
         for c in &mut self.controllers {
-            if c.event_pipe == pipe && (!is_mediatek || c.registry_id != id) {
+            if c.event_pipe == pipe || c.prepared_pipe == pipe {
                 c.event_pipe = 0;
-                c.pending.reset();
+                if c.event_interface == interface && interface != 0 {
+                    c.prepared_pipe = pipe;
+                } else {
+                    c.prepared_pipe = 0;
+                    c.event_interface = 0;
+                    c.pending.reset();
+                }
             }
         }
-        if is_mediatek && let Some(c) = self.find_or_create(id) {
+    }
+
+    /// An HCI event pipe was handed out for device `id`. Interface registry
+    /// ids distinguish a live repeated lookup from a recycled object address.
+    pub fn bind_event_pipe(&mut self, pipe: usize, interface: u64, id: u64, is_mediatek: bool) {
+        if pipe == 0 {
+            return;
+        }
+        let bind = is_mediatek && interface != 0 && id != 0;
+        for c in &mut self.controllers {
+            if c.event_pipe == pipe || c.prepared_pipe == pipe {
+                c.prepared_pipe = 0;
+                if !bind || c.registry_id != id || c.event_interface != interface {
+                    c.event_pipe = 0;
+                    c.event_interface = 0;
+                    c.pending.reset();
+                }
+            }
+        }
+        if bind && let Some(c) = self.find_or_create(id) {
+            if c.event_interface != 0 && c.event_interface != interface {
+                c.pending.reset();
+            }
             c.event_pipe = pipe;
+            c.prepared_pipe = 0;
+            c.event_interface = interface;
+        }
+    }
+
+    /// Called before the owning interface closes and aborts its session's IO.
+    pub fn unbind_interface(&mut self, interface: u64) {
+        if interface == 0 {
+            return;
+        }
+        for c in &mut self.controllers {
+            if c.event_interface == interface {
+                *c = Controller::default();
+            }
+        }
+    }
+
+    /// The loader's provider is stopping (unplug/reset). Late completions keep
+    /// numeric ids and unique tokens, so they cannot affect a new controller.
+    pub fn unbind_controller(&mut self, id: u64) {
+        if let Some(c) = self.find(id) {
+            *c = Controller::default();
         }
     }
 
@@ -423,7 +483,7 @@ mod tests {
         let token = le.command(10, &FEATURE_COMMAND);
         assert_ne!(token, 0);
         assert_eq!(le.receive(11, &mut status(1, 1)).reply, Reply::None);
-        le.bind_event_pipe(0x1000, 10, true);
+        le.bind_event_pipe(0x1000, 100, 10, true);
         assert_eq!(le.controller_for_pipe(0x1000), 10);
         assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::Rewritten);
     }
@@ -445,10 +505,85 @@ mod tests {
     #[test]
     fn pipe_rebinding() {
         let mut le = LeFeatures::new();
-        le.bind_event_pipe(0x1000, 10, true);
+        le.bind_event_pipe(0x1000, 100, 10, true);
         le.command(10, &FEATURE_COMMAND);
         // Same address handed to a non-MediaTek device: mapping and state cleared.
-        le.bind_event_pipe(0x1000, 20, false);
+        le.bind_event_pipe(0x1000, 200, 20, false);
+        assert_eq!(le.controller_for_pipe(0x1000), 0);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::None);
+    }
+
+    #[test]
+    fn reused_pipe_is_revoked_before_classification() {
+        let mut le = LeFeatures::new();
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        le.command(10, &FEATURE_COMMAND);
+        // A USB-MIDI/HID interface receives the freed address. No Bluetooth
+        // descriptor or new binding is needed to revoke the stale key.
+        le.prepare_event_pipe(0x1000, 200);
+        assert_eq!(le.controller_for_pipe(0x1000), 0);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::None);
+        le.bind_event_pipe(0x1000, 200, 0, false);
+        assert_eq!(le.controller_for_pipe(0x1000), 0);
+    }
+
+    #[test]
+    fn repeated_live_pipe_lookup_preserves_pending_command() {
+        let mut le = LeFeatures::new();
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        le.command(10, &FEATURE_COMMAND);
+        le.prepare_event_pipe(0x1000, 100);
+        assert_eq!(
+            le.controller_for_pipe(0x1000),
+            0,
+            "unmapped until classified"
+        );
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        assert_eq!(le.controller_for_pipe(0x1000), 10);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::Rewritten);
+    }
+
+    #[test]
+    fn close_unplug_and_late_completion_do_not_cross_sessions() {
+        let mut le = LeFeatures::new();
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        let first = le.command(10, &FEATURE_COMMAND);
+        le.unbind_interface(999); // a different interface/client
+        assert_eq!(le.controller_for_pipe(0x1000), 10);
+        le.prepare_event_pipe(0x1000, 100);
+        le.unbind_interface(100); // close while a lookup is being classified
+        assert_eq!(le.controller_for_pipe(0x1000), 0);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::None);
+        // Same interface/device reopened: a late failed EP0 submission carries
+        // the old token and must not cancel the new session's command.
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        let second = le.command(10, &FEATURE_COMMAND);
+        assert_ne!(first, second);
+        le.cancel(10, first);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::Rewritten);
+        le.command(10, &FEATURE_COMMAND);
+        le.unbind_controller(10);
+        le.bind_event_pipe(0x1000, 200, 20, true);
+        le.command(20, &FEATURE_COMMAND);
+        le.cancel(10, second);
+        assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::None);
+        assert_eq!(le.receive(20, &mut status(1, 1)).reply, Reply::Rewritten);
+    }
+
+    #[test]
+    fn null_keys_and_same_interface_class_changes_fail_closed() {
+        let mut le = LeFeatures::new();
+        le.bind_event_pipe(0x1000, 100, 10, true);
+        le.command(10, &FEATURE_COMMAND);
+        le.prepare_event_pipe(0, 0);
+        le.bind_event_pipe(0, 0, 0, false);
+        le.unbind_interface(0);
+        le.unbind_controller(0);
+        assert_eq!(le.controller_for_pipe(0x1000), 10);
+        // The same interface changed to a non-event endpoint.
+        le.prepare_event_pipe(0x1000, 100);
+        assert_eq!(le.controller_for_pipe(0x1000), 0);
+        le.bind_event_pipe(0x1000, 100, 0, false);
         assert_eq!(le.controller_for_pipe(0x1000), 0);
         assert_eq!(le.receive(10, &mut status(1, 1)).reply, Reply::None);
     }
@@ -457,11 +592,11 @@ mod tests {
     fn slot_reuse_prefers_free_slots() {
         let mut le = LeFeatures::new();
         for id in 1..=8 {
-            le.bind_event_pipe(id as usize * 0x100, id, true);
+            le.bind_event_pipe(id as usize * 0x100, id * 10, id, true);
         }
         le.command(1, &FEATURE_COMMAND);
         // Table full: device 9 takes the first slot without a pending command.
-        le.bind_event_pipe(0x900, 9, true);
+        le.bind_event_pipe(0x900, 90, 9, true);
         assert_eq!(le.controller_for_pipe(0x100), 1, "pending controller kept");
         assert_eq!(le.controller_for_pipe(0x200), 0);
         assert_eq!(le.controller_for_pipe(0x900), 9);

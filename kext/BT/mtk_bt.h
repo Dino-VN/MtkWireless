@@ -64,7 +64,11 @@ bool mtk_bt_le_candidate_request(uint8_t bm_request_type, uint8_t b_request,
 uint64_t mtk_bt_le_command(uint64_t registry_id, const uint8_t *cmd, size_t len);
 void mtk_bt_le_cancel(uint64_t registry_id, uint64_t token);
 uint64_t mtk_bt_le_controller_for_pipe(const void *pipe);
-void mtk_bt_le_bind_event_pipe(const void *pipe, uint64_t registry_id, bool mediatek);
+/* Numeric interface ids distinguish repeated copyPipe from recycled addresses. */
+void mtk_bt_le_prepare_event_pipe(const void *pipe, uint64_t interface_id);
+void mtk_bt_le_bind_event_pipe(const void *pipe, uint64_t interface_id, uint64_t registry_id, bool mediatek);
+void mtk_bt_le_unbind_interface(uint64_t interface_id);
+void mtk_bt_le_unbind_controller(uint64_t registry_id);
 
 enum { MTK_BT_LE_NONE = 0, MTK_BT_LE_UNCHANGED = 1, MTK_BT_LE_REWRITTEN = 2 };
 typedef struct mtk_bt_le_received {

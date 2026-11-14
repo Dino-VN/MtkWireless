@@ -125,11 +125,6 @@ void interruptTrampoline(OSObject *ih, IOInterruptEventSource *, int count) {
 	(void)_ih->func(_ih->arg); // jump to actual interrupt handler
 }
 
-/* IOInterruptEventSource index in use; -1 until established. */
-#define MTK_LOG_RING_SIZE (256 * 1024)
-static char mtk_log_ring[MTK_LOG_RING_SIZE];
-static volatile SInt64 mtk_log_head;
-
 int
 mtk_printf(const char *fmt, ...)
 {
@@ -145,35 +140,11 @@ mtk_printf(const char *fmt, ...)
 	if (n >= (int)sizeof(buf))
 		n = sizeof(buf) - 1;
 
-	SInt64 pos = OSAddAtomic64(n, &mtk_log_head);
-	for (int i = 0; i < n; i++)
-		mtk_log_ring[(pos + i) % MTK_LOG_RING_SIZE] = buf[i];
 	(printf)("%s", buf);
 	return n;
 }
 
-/*
- * Copy log bytes starting at *cursor into out. Returns the number of bytes
- * copied and advances *cursor; skips ahead if the ring already overwrote it.
- */
-uint32_t
-mtk_log_read(uint64_t *cursor, char *out, uint32_t len, uint64_t *head_out)
-{
-	uint64_t head = (uint64_t)mtk_log_head;
-	uint64_t cur = *cursor;
-
-	if (head > MTK_LOG_RING_SIZE && cur < head - MTK_LOG_RING_SIZE)
-		cur = head - MTK_LOG_RING_SIZE;
-	if (cur > head)
-		cur = head;
-	uint32_t n = (uint32_t)((head - cur) < len ? (head - cur) : len);
-	for (uint32_t i = 0; i < n; i++)
-		out[i] = mtk_log_ring[(cur + i) % MTK_LOG_RING_SIZE];
-	*cursor = cur + n;
-	*head_out = head;
-	return n;
-}
-
+/* IOInterruptEventSource index in use; -1 until established. */
 int mtk_compat_intr_index = -1;
 int mtk_compat_intr_is_msi = 0;
 
@@ -426,7 +397,7 @@ void bus_dmamap_destroy(bus_dma_tag_t tag, bus_dmamap_t dmam) {
 
 int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 	if (map == 0 || mb == 0)
-		return 1;
+		return EINVAL;
 	IOPhysicalSegment segs[23];
 	if (map->mem) {
 		map->mem->complete();
@@ -437,10 +408,10 @@ int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 	map->dm_bounce = false;
 	map->dm_nsegs = map->cursor->getPhysicalSegmentsWithCoalesce(mb, segs, 23);
 	if (map->dm_nsegs == 0)
-		return 1;
+		return EFBIG;
 	size_t pktlen = mbuf_pkthdr_len(mb);
 	if (pktlen > UINT32_MAX)
-		return 1;
+		return EFBIG;
 	map->dm_mapsize = (bus_size_t)pktlen;
 	bool needs_bounce = false;
 	for (int i = 0; i < map->dm_nsegs; i++) {
@@ -469,13 +440,13 @@ int bus_dmamap_load(bus_dmamap_t map, mbuf_t mb) {
 			    alloc_dma_memory(bounce_size, PAGE_SIZE,
 			    kIOMemoryPhysicallyContiguous);
 			if (mem == 0)
-				return 1;
+				return ENOMEM;
 			map->dm_bounce_mem = mem;
 			map->dm_bounce_size = bounce_size;
 		}
 		bus_addr_t addr = map->dm_bounce_mem->getPhysicalAddress();
 		if (addr > UINT32_MAX) {
-			return 1;
+			return EFBIG;
 		}
 		map->dm_bounce = true;
 		map->dm_nsegs = 1;

@@ -200,7 +200,7 @@ bool MtkWirelessBTLoader::start(IOService *provider)
     char firmware[64] {};
     bool ok = bringUp(firmware, sizeof(firmware));
     publish(ok, ok ? firmware : nullptr);
-    release();
+    releaseUsbSession();
     if (!ok) {
         PMstop();
         super::stop(provider);
@@ -252,7 +252,7 @@ void MtkWirelessBTLoader::publish(bool loaded, const char *firmware)
     }
 }
 
-void MtkWirelessBTLoader::release()
+void MtkWirelessBTLoader::releaseUsbSession()
 {
     OSSafeReleaseNULL(m_usb);
     if (m_device && m_device->isOpen(this))
@@ -322,7 +322,7 @@ void MtkWirelessBTLoader::armOpenWatchdog()
         return;
     uint64_t deadline = 0;
     clock_interval_to_deadline(kWatchdogDelayMs, kMillisecondScale, &deadline);
-    // The pending call owns a reference (release() here is the USB close).
+    // The pending call owns an OSObject reference, not the USB session.
     super::retain();
     if (thread_call_enter_delayed(m_openWatchdog, deadline))
         super::release(); // was already pending and keeps its own reference
@@ -382,7 +382,9 @@ void MtkWirelessBTLoader::stop(IOService *provider)
     // freed in free().
     if (m_openWatchdog && thread_call_cancel(m_openWatchdog))
         super::release();
-    release();
+    if (auto *device = OSDynamicCast(IOUSBHostDevice, provider))
+        Patcher::forgetController(device->getRegistryEntryID());
+    releaseUsbSession();
     PMstop();
     super::stop(provider);
 }
