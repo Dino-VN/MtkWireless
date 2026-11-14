@@ -114,6 +114,31 @@ int32_t mtk_bt_page_find(const uint8_t *page, size_t len, const mtk_bt_page_site
 /* Writes the site at offset if it still matches there. */
 bool mtk_bt_page_apply(uint8_t *page, size_t len, size_t offset, const mtk_bt_page_site *site);
 
+/* Minimum-build filter only; signature/layout checks remain mandatory. */
+bool mtk_bt_tahoe_build_since(const uint8_t *build, size_t len, uint32_t number);
+
+/* A complete immutable, vnode-bound relocation plan, prepared before exec.
+ * File offsets include the FAT slice base. Addresses are unslid segment VAs.
+ * The C++ shell allocates these structures off the kernel stack. */
+enum { MTK_BT_RPA_MAX_IMAGE = 64 * 1024 * 1024, MTK_BT_RPA_EDITS = 7, MTK_BT_RPA_EDIT_BYTES = 296 };
+typedef struct mtk_bt_rpa_edit {
+    uint64_t file_offset;
+    uint32_t len, reserved;
+    uint8_t original[MTK_BT_RPA_EDIT_BYTES], replacement[MTK_BT_RPA_EDIT_BYTES];
+} mtk_bt_rpa_edit;
+typedef struct mtk_bt_rpa_plan {
+    uint64_t slice_offset, slice_size, text_address, text_file_offset, text_size, helper_address;
+    uint8_t uuid[16];
+    uint32_t count, reserved;
+    mtk_bt_rpa_edit edits[MTK_BT_RPA_EDITS];
+} mtk_bt_rpa_plan;
+enum { MTK_BT_COMMON_ADVERTISING = 1, MTK_BT_COMMON_MSBC = 2 };
+/* Five existing byte descriptors: extAdv, address, retry, WBS, HFP fill.
+ * Returns independent verified-feature bits; never requires RPA activation. */
+uint32_t mtk_bt_common_validate(const uint8_t *image, size_t len, const mtk_bt_page_site sites[5]);
+int32_t mtk_bt_rpa_resolve(const uint8_t *image, size_t len, mtk_bt_rpa_plan *out);
+int32_t mtk_bt_rpa_apply_page(const mtk_bt_rpa_plan *plan, uint64_t offset, uint8_t *page, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

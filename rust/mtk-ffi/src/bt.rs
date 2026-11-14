@@ -524,3 +524,98 @@ pub unsafe extern "C" fn mtk_bt_page_apply(
     site.apply_at(unsafe { bytes_mut(page, len) }, offset)
         .is_ok()
 }
+
+/// Build filter, not an ABI claim: only Darwin 25, at/after 25G<number>.
+/// # Safety
+/// `build` points to `len` readable bytes, without a trailing NUL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_tahoe_build_since(
+    build: *const u8,
+    len: usize,
+    number: u32,
+) -> bool {
+    if build.is_null() || len > 15 {
+        return false;
+    }
+    mtk_bt::page_patch::tahoe_build_since(unsafe { bytes(build, len) }, number)
+}
+
+/// Validate common advertising/HFP features independently of RPA.
+/// # Safety
+/// `sites` points to five valid byte descriptors (extAdv, address, retry, WBS,
+/// fill); `image` is readable for len and does not alias the descriptor table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_common_validate(
+    image: *const u8,
+    len: usize,
+    sites: *const MtkBtPageSite,
+) -> u32 {
+    if image.is_null() || sites.is_null() || len > mtk_bt::rpa::MAX_IMAGE {
+        return 0;
+    }
+    let empty = mtk_bt::page_patch::Site {
+        find: &[],
+        find_mask: &[],
+        replace: &[],
+        replace_mask: &[],
+    };
+    let mut parsed = [empty; 5];
+    for (i, entry) in parsed.iter_mut().enumerate() {
+        let Some(site) = (unsafe { page_site(sites.add(i)) }) else {
+            return 0;
+        };
+        if site.find.len() > 4096 {
+            return 0;
+        }
+        *entry = site;
+    }
+    mtk_bt::rpa::validate_common(unsafe { bytes(image, len) }, &parsed)
+}
+
+/// Resolve a complete bounded image before executable-page validation.
+/// `out` is caller-owned, off the kernel stack; failure leaves count=0.
+/// # Safety
+/// Input is readable and output points to a writable, non-aliasing Plan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_rpa_resolve(
+    image: *const u8,
+    len: usize,
+    out: *mut mtk_bt::rpa::Plan,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    unsafe {
+        core::ptr::write_bytes(out, 0, 1);
+    }
+    if image.is_null() || len > mtk_bt::rpa::MAX_IMAGE {
+        return -1;
+    }
+    match mtk_bt::rpa::resolve(unsafe { bytes(image, len) }, unsafe { &mut *out }) {
+        Ok(()) => 0,
+        Err(error) => {
+            klog!("RPA resolver: {:?}", error);
+            -1
+        }
+    }
+}
+
+/// Whole-page precheck followed by all edits for that page. Negative means
+/// the caller must reject executable validation, not run half an RPA group.
+/// # Safety
+/// Plan is initialized/readable; page is writable and does not alias it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mtk_bt_rpa_apply_page(
+    plan: *const mtk_bt::rpa::Plan,
+    offset: u64,
+    page: *mut u8,
+    len: usize,
+) -> i32 {
+    if plan.is_null() || page.is_null() || len != 4096 {
+        return -1;
+    }
+    match mtk_bt::rpa::apply_page(unsafe { &*plan }, offset, unsafe { bytes_mut(page, len) }) {
+        Ok(mask) => mask as i32,
+        Err(_) => -1,
+    }
+}

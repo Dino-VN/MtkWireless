@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the actual opt-in bluetoothd page hook; optionally check a binary."""
 import argparse
+import os
+import runpy
 from pathlib import Path
 import platform
 import re
@@ -20,8 +22,11 @@ args = parser.parse_args()
 
 
 def function(declaration):
-    start = source.index(declaration)
-    opening = source.index("{", start)
+    # Match a definition, not a forward declaration followed by another body.
+    declaration = declaration.removesuffix("\n{")
+    match = re.search(re.escape(declaration) + r"[^;{}]*\{", source)
+    assert match, declaration
+    start, opening = match.start(), match.end() - 1
     depth, end = 1, opening + 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
@@ -84,6 +89,8 @@ mock = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -112,7 +119,7 @@ int kernel;
 bool flag, noExtAdv, noVerifyFix, msbcReady, extAdvPatchEnabled, extAdvPatchRouted, msbcPatchEnabled;
 bool noRpa, rpaPatchEnabled, rpaHelpersReady, leReadyMaskEnabled, noLeReadyMask, anyBuild;
 bool anyBuildPatches;
-enum BluetoothdBuild : int32_t { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3 };
+enum BluetoothdBuild : int32_t { BuildUnread = 0, BuildOther = 1, Build25G241 = 2, Build25G332 = 3, Build25G342 = 4, BuildLater = 5 };
 int32_t bluetoothdBuild;
 char bluetoothdBuildName[16];
 int32_t bluetoothdSitesAmbiguous, bluetoothdPagesUnpatched, msbcDeferredBeforeProbe;
@@ -207,6 +214,41 @@ void publishDeferred(thread_call_param_t, thread_call_param_t) {}
 int pathError, validations, searches;
 // The real Rust matcher, wrapped: count searches and pause after a write.
 #include "mtk_bt.h"
+struct image_params { uint64_t untouched = 0x123456789abcdef0ULL; };
+int macResult, macCalls, vnodeRefs, fileReads;
+bool fileReadFails, execRouteFails;
+uint32_t vnodeVersion = 7;
+void (*duringRead)();
+std::vector<uint8_t> rpaFixture;
+int originalMacExec(vfs_context_t, vnode_t, image_params *params) {
+    ++macCalls; assert(params && params->untouched == 0x123456789abcdef0ULL); return macResult;
+}
+int vnode_ref(vnode_t) { ++vnodeRefs; return 0; }
+uint32_t vnode_vid(vnode_t) { return vnodeVersion; }
+namespace FileIO {
+size_t readFileSize(vnode_t, vfs_context_t) { assert(lockDepth == 0); return rpaFixture.size(); }
+}
+#ifndef __APPLE__
+using user_addr_t = uintptr_t;
+#endif
+struct uio { void *buffer = nullptr; size_t size = 0, remaining = 0; };
+using uio_t = uio *;
+constexpr int UIO_SYSSPACE = 2, UIO_READ = 0, IO_NODELOCKED = 8;
+int uios;
+uio_t uio_create(int count, off_t offset, int segment, int rw) {
+    assert(count == 1 && offset == 0 && segment == UIO_SYSSPACE && rw == UIO_READ); ++uios; return new uio;
+}
+int uio_addiov(uio_t io, user_addr_t address, size_t size) {
+    io->buffer = reinterpret_cast<void *>(address); io->size = io->remaining = size; return 0;
+}
+int VNOP_READ(vnode_t, uio_t io, int flags, vfs_context_t) {
+    assert(lockDepth == 0 && flags == IO_NODELOCKED && io->size == rpaFixture.size()); ++fileReads;
+    if (duringRead) duringRead();
+    if (fileReadFails) return 5;
+    memcpy(io->buffer, rpaFixture.data(), io->size); io->remaining = 0; return 0;
+}
+size_t uio_resid(uio_t io) { return io->remaining; }
+void uio_free(uio_t io) { --uios; delete io; }
 int pageFinds;
 int32_t harnessPageFind(const uint8_t *page, size_t len, const mtk_bt_page_site *site) {
     assert(validations && len == PAGE_SIZE && lockDepth == 1); ++searches; ++pageFinds;
@@ -260,6 +302,10 @@ struct KernelPatcher {
     bool routeFails = false;
     bool routeMultipleLong(int id, RouteRequest *routes, size_t count) {
         assert(id == KernelID && count == 1);
+        if (!strcmp(routes[0].symbol, "_mac_vnode_check_exec")) {
+            if (execRouteFails || routeFails) return false;
+            *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalMacExec); return true;
+        }
         assert(!strcmp(routes[0].symbol, "_cs_validate_page"));
         if (routeFails) return false;
         *routes[0].original = reinterpret_cast<mach_vm_address_t>(originalValidate); return true;
@@ -362,6 +408,11 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     writeVerifyCode(0x70);
     msbcReady = extAdvPatchEnabled = extAdvPatchRouted = msbcPatchEnabled = false;
     noRpa = rpaPatchEnabled = rpaHelpersReady = false; bluetoothdBuild = BuildUnread; bluetoothdBuildName[0] = 0;
+    free(rpaPlan); rpaPlan = nullptr; bluetoothdImageVnode = nullptr; bluetoothdImageVid = 0;
+    rpaExecRouted = rpaValidationStarted = false; rpaPlanState = RpaPlanUnread; rpaPlanRejected = 0;
+    bluetoothdCommonAbi = 0; bluetoothdForeignPagesRolledBack = 0;
+    macResult = macCalls = vnodeRefs = fileReads = 0; fileReadFails = execRouteFails = false;
+    duringRead = nullptr; vnodeVersion = 7;
     anyBuild = anyBuildPatches = false; bluetoothdSitesAmbiguous = bluetoothdPagesUnpatched = 0;
     memset(featureLatch, 0, sizeof(featureLatch)); msbcSenderNative = false; msbcDeferredBeforeProbe = 0;
     free(verifyCopy); verifyCopy = nullptr; verifyCopyLock = nullptr;
@@ -376,151 +427,169 @@ void reset(int version, bool enabled, bool disableAdv, bool disableVerify = fals
     orgCsValidatePage = reinterpret_cast<mach_vm_address_t>(originalValidate);
     lilu.pageRegistrations = 0; lilu.patcher.routeFails = false;
 }
-struct RpaSite {
-    const uint8_t *find, *replacement;
-    size_t length, pageOffset;
-    int32_t *counter;
-};
-const RpaSite rpaSites[] {
-    {rpaHelpersFind25G332, rpaHelpersReplace25G332, sizeof(rpaHelpersFind25G332), 0xb88, &bluetoothdRpaHelpersPatched},
-    {rpaLegacyFind25G332, rpaLegacyReplace25G332, sizeof(rpaLegacyFind25G332), 0x3dd, &bluetoothdRpaLegacyPatched},
-    {rpaScanFind25G332, rpaScanReplace25G332, sizeof(rpaScanFind25G332), 0x4c3, &bluetoothdRpaScanPatched},
-    {rpaDecodeFind25G332, rpaDecodeReplace25G332, sizeof(rpaDecodeFind25G332), 0x834, &bluetoothdRpaDecodePatched},
-    {rpaDeviceFind25G332, rpaDeviceReplace25G332, sizeof(rpaDeviceFind25G332), 0x002, &bluetoothdRpaDevicePatched},
-    {rpaConnectFind25G332, rpaConnectReplace25G332, sizeof(rpaConnectFind25G332), 0x0c3, &bluetoothdRpaConnectPatched},
-    {rpaUpdateFind25G332, rpaUpdateReplace25G332, sizeof(rpaUpdateFind25G332), 0x1da, &bluetoothdRpaUpdatePatched},
-};
-Page helperPage() {
+// A native page suffices to exercise verifier failure and unsupported scope.
+Page helperPage() { return {}; }
+bool prepareRpa(vnode_t path = "/usr/sbin/bluetoothd", bool isolate = true) {
+    image_params params;
+    if (!rpaExecRouted) return false;
+    assert(macVnodeCheckExec(&fakeContext, path, &params) == macResult);
+    assert(params.untouched == 0x123456789abcdef0ULL && uios == 0);
+    if (isolate && rpaPlanState == RpaPlanReady) {
+        // Isolate the RPA ledger tests; advertising/mSBC are tested separately.
+        extAdvPatchEnabled = msbcPatchEnabled = false;
+    }
+    return rpaPlanState == RpaPlanReady;
+}
+Page plannedPage(size_t edit) {
     Page page {};
-    memcpy(page.data() + 0xb88, rpaHelpersFind25G332, sizeof(rpaHelpersFind25G332));
+    const size_t offset = rpaPlan->edits[edit].file_offset & ~(PAGE_SIZE-1);
+    assert(offset + PAGE_SIZE <= rpaFixture.size());
+    memcpy(page.data(), rpaFixture.data() + offset, PAGE_SIZE);
     return page;
 }
+void recursiveReadValidation() {
+    Page page {}; apply(page);
+}
 void rpaTests() {
-    // Other macOS builds (25G241 shares child signatures) keep RPA off.
-    // kern.osversion is empty when the kext starts (launchd sets it later):
-    // init must not decide, and an empty value is retried, not cached.
-    osBuild = "";
-    reset(25, true, false, false); noRpa = false; osversionReads = 0; Patcher::init(0);
-    assert(rpaPatchEnabled && !osversionReads);
-    { Page helpers = helperPage(), original = helpers; apply(helpers);
-      assert(!rpaHelpersReady && helpers == original && bluetoothdBuild == BuildUnread && osversionReads == 1); }
-    osBuild = "25G332";
-    { Page helpers = helperPage(); apply(helpers); assert(rpaHelpersReady && bluetoothdBuild == Build25G332);
-      const int reads = osversionReads; apply(helpers); assert(osversionReads == reads); }
-    osBuild = "25G241";
-    reset(25, true, false, false); noRpa = false; Patcher::init(0);
-    assert(rpaPatchEnabled);
-    { Page helpers = helperPage(), original = helpers; apply(helpers);
-      assert(!rpaHelpersReady && !bluetoothdRpaHelpersPatched && helpers == original && bluetoothdBuild == Build25G241); }
-    for (size_t i = 1; i < std::size(rpaSites); ++i) {
-        const auto &site = rpaSites[i];
-        Page page {}; memcpy(page.data() + site.pageOffset, site.find, site.length);
-        const Page before = page; apply(page); assert(page == before && !*site.counter);
+    const char *btd = "/usr/sbin/bluetoothd";
+    for (const char *build : {"25G241", "25G332", "25G342", "25H100"}) {
+        osBuild = build; reset(25, true, false); Patcher::init(0);
+        const bool enabled = strcmp(build, "25G241") != 0;
+        assert(prepareRpa() == enabled);
+        assert(rpaPlanState == (enabled ? RpaPlanReady : RpaPlanDisabled));
+        assert(fileReads == 1 && vnodeRefs == 1 && bluetoothdCommonAbi == 3);
     }
     osBuild = "25G332";
-    for (int version : {20, 21, 24, 25, 26}) for (bool disableAdv : {false, true})
-    for (bool disableRpa : {false, true}) for (bool disableVerify : {false, true}) {
+    for (int version : {20,21,24,25,26}) for (bool disableAdv : {false,true})
+    for (bool disableRpa : {false,true}) for (bool disableVerify : {false,true}) {
         reset(version, true, disableAdv, disableVerify); noRpa = disableRpa; Patcher::init(0);
         const bool enabled = version == 25 && !disableAdv && !disableRpa && !disableVerify;
-        assert(rpaPatchEnabled == (version == 25 && !disableAdv && !disableRpa));
-        Page helpers = helperPage(), original = helpers;
-        apply(helpers);
-        assert(rpaHelpersReady == enabled && bluetoothdRpaHelpersPatched == enabled);
-        if (enabled) memcpy(original.data() + 0xb88, rpaHelpersReplace25G332, sizeof(rpaHelpersReplace25G332));
-        assert(helpers == original);
-        for (size_t i = 1; i < std::size(rpaSites); ++i) {
-            const auto &site = rpaSites[i];
-            Page page {}; memcpy(page.data() + site.pageOffset, site.find, site.length);
-            Page expected = page;
-            if (enabled) memcpy(expected.data() + site.pageOffset, site.replacement, site.length);
-            apply(page);
-            assert(page == expected && *site.counter == enabled);
-            apply(page); assert(page == expected && *site.counter == 2 * enabled);
-        }
+        assert(prepareRpa() == enabled);
+        assert(!rpaHelpersReady); // Readiness is the plan, not a prefaulted helper.
+        if (enabled) assert(rpaPlan->count == MTK_BT_RPA_EDITS && verifyFixRouted && patchRangeCount);
     }
-    // The helper page is faulted lazily (end of __TEXT): a child page
-    // validated before it must still be patched; its call faults the helpers in.
-    reset(25, true, false); Patcher::init(0);
-    for (size_t i = 1; i < std::size(rpaSites); ++i) {
-        const auto &site = rpaSites[i];
-        Page page {}; memcpy(page.data() + site.pageOffset, site.find, site.length);
-        Page expected = page; memcpy(expected.data() + site.pageOffset, site.replacement, site.length);
-        apply(page);
-        assert(page == expected && *site.counter == 1 && !rpaHelpersReady);
-    }
-    Page helper = helperPage(); apply(helper); assert(rpaHelpersReady);
-    for (const auto &site : rpaSites) {
-        for (size_t offset : {size_t(0), PAGE_SIZE - site.length}) {
-            Page page {}; memcpy(page.data() + offset, site.find, site.length);
-            const int previous = *site.counter; apply(page);
-            assert(!memcmp(page.data() + offset, site.replacement, site.length) && *site.counter == previous + 1);
-            apply(page); assert(*site.counter == previous + 2);
-        }
-        Page wrong {}; memcpy(wrong.data(), site.find, site.length); wrong[site.length - 1] ^= 1;
-        Page page = wrong; const int previous = *site.counter; apply(page);
-        assert(page == wrong && *site.counter == previous);
-        for (const char *path : {"/usr/sbin/BlueTool", "/tmp/bluetoothd", "/usr/sbin/bluetoothd.backup"}) {
-            page = {}; memcpy(page.data(), site.find, site.length);
-            const Page before = page; apply(page, path); assert(page == before && *site.counter == previous);
-        }
-        std::array<uint8_t, PAGE_SIZE * 2> crossing {};
-        memcpy(crossing.data() + PAGE_SIZE - 10, site.find, site.length);
-        const auto before = crossing;
-        csValidatePage("/usr/sbin/bluetoothd", nullptr, 0, crossing.data(), nullptr, nullptr, nullptr);
-        csValidatePage("/usr/sbin/bluetoothd", nullptr, PAGE_SIZE, crossing.data() + PAGE_SIZE, nullptr, nullptr, nullptr);
-        assert(crossing == before && *site.counter == previous);
-    }
-    // A changed helper anchor (other bytes at the end of __TEXT) is left alone.
-    reset(25, true, false); Patcher::init(0);
-    helper = helperPage(); helper[0xb88 + 4] ^= 1;
-    const Page unsupported = helper; apply(helper);
-    assert(helper == unsupported && !rpaHelpersReady);
-    reset(25, true, false); verifySymbolsMissing = true; Patcher::init(0);
-    helper = helperPage(); const Page noVerify = helper; apply(helper);
-    assert(helper == noVerify && !rpaHelpersReady && !bluetoothdRpaHelpersPatched);
+    // MAC rejection, wrong vnode, missing route/read/verify, and early/recursive
+    // executable validation cannot accidentally activate a partial plan.
+    reset(25,true,false); Patcher::init(0); macResult = 13;
+    assert(!prepareRpa() && rpaPlanState == RpaPlanUnread && !fileReads);
+    reset(25,true,false); Patcher::init(0);
+    assert(!prepareRpa("/tmp/bluetoothd") && rpaPlanState == RpaPlanUnread && !fileReads);
+    reset(25,true,false); execRouteFails = true; Patcher::init(0);
+    assert(!rpaExecRouted && !prepareRpa() && !fileReads);
+    reset(25,true,false); fileReadFails = true; Patcher::init(0);
+    assert(!prepareRpa() && rpaPlanState == RpaPlanReadFailed && !patchRangeCount);
+    reset(25,true,false); verifySymbolsMissing = true; Patcher::init(0);
+    assert(!prepareRpa() && rpaPlanState == RpaPlanNoVerify && !patchRangeCount);
+    reset(25,true,false); Patcher::init(0); Page untouched {}; apply(untouched);
+    assert(!prepareRpa() && rpaPlanState == RpaPlanLate && !fileReads);
+    reset(25,true,false); duringRead = recursiveReadValidation; Patcher::init(0);
+    assert(!prepareRpa() && rpaPlanState == RpaPlanLate && !patchRangeCount);
+    reset(25,true,false); Patcher::init(0); patchRangeCount = kPatchRanges;
+    assert(!prepareRpa() && rpaPlanState == RpaPlanNoRoom);
 
-    // One verify block containing every RPA patch, existing advertising
-    // patches and a wrapped foreign patch. Helpers span >96 changed bytes.
-    reset(25, true, false); Patcher::init(0);
-    const char *btd = "/usr/sbin/bluetoothd";
-    std::vector<uint8_t> file(PAGE_SIZE * 4, 0x5a);
-    const size_t offsets[] {0xb88, PAGE_SIZE + 0x3dd, PAGE_SIZE + 0x4c3,
-                           2 * PAGE_SIZE + 0x834, PAGE_SIZE + 0x802,
-                           2 * PAGE_SIZE + 0xc3, 2 * PAGE_SIZE + 0x1da};
-    for (size_t i = 0; i < std::size(rpaSites); ++i)
-        memcpy(file.data() + offsets[i], rpaSites[i].find, rpaSites[i].length);
-    memcpy(file.data() + 3 * PAGE_SIZE + 210, extAdvFind, sizeof(extAdvFind));
-    memcpy(file.data() + 3 * PAGE_SIZE + 310, advAddressFind, sizeof(advAddressFind));
-    memcpy(file.data() + 3 * PAGE_SIZE + 410, advAddressRetryFind, sizeof(advAddressRetryFind));
-    memcpy(file.data() + 3 * PAGE_SIZE + 3000, foreignFind, sizeof(foreignFind));
-    pristine = file.data();
+    // All destinations are bound to universal-file offsets. Children may run
+    // before their helper page faults; no callback pointer is retained.
+    reset(25,true,false); Patcher::init(0); assert(prepareRpa());
+    const uint32_t reserved = patchRangeCount;
+    auto file = rpaFixture;
+    file.resize((file.size()+16383)&~size_t(16383));
     auto cache = file, expected = file;
-    for (size_t i = 0; i < std::size(rpaSites); ++i)
-        memcpy(expected.data() + offsets[i], rpaSites[i].replacement, rpaSites[i].length);
-    memcpy(expected.data() + 3 * PAGE_SIZE + 210, extAdvReplace, sizeof(extAdvReplace));
-    memcpy(expected.data() + 3 * PAGE_SIZE + 310, advAddressReplace, sizeof(advAddressReplace));
-    memcpy(expected.data() + 3 * PAGE_SIZE + 410, advAddressRetryReplace, sizeof(advAddressRetryReplace));
-    memcpy(expected.data() + 3 * PAGE_SIZE + 3000, foreignReplace, sizeof(foreignReplace));
-    for (size_t page = 0; page < 4; ++page)
-        csValidatePage(btd, nullptr, page * PAGE_SIZE, cache.data() + page * PAGE_SIZE, nullptr, nullptr, nullptr);
-    assert(cache == expected && patchRangeCount < kPatchRanges && !patchRangeOverflow);
-    for (const auto &site : rpaSites) assert(*site.counter == 1);
-    const uint32_t ranges = patchRangeCount;
-    assert(fakeOps[kVerifyIndex] == verifyOp);
-    assert(verifyCall(btd, 0, cache.data(), cache.size()) == 0);
-    assert(cache == expected && verifyRestored == 1 && !verifyRestoreFailed);
-    // Revalidation is idempotent, and a refault must reuse the same ranges.
-    for (size_t page = 0; page < 4; ++page) {
-        csValidatePage(btd, nullptr, page * PAGE_SIZE, cache.data() + page * PAGE_SIZE, nullptr, nullptr, nullptr);
-        Page fresh; memcpy(fresh.data(), file.data() + page * PAGE_SIZE, PAGE_SIZE);
-        csValidatePage(btd, nullptr, page * PAGE_SIZE, fresh.data(), nullptr, nullptr, nullptr);
-        assert(!memcmp(fresh.data(), expected.data() + page * PAGE_SIZE, PAGE_SIZE));
+    pristine = file.data();
+    std::vector<uint64_t> pages;
+    for (size_t i = 1; i < MTK_BT_RPA_EDITS; ++i) {
+        const uint64_t off = rpaPlan->edits[i].file_offset & ~(uint64_t(PAGE_SIZE)-1);
+        if (std::find(pages.begin(),pages.end(),off) == pages.end()) pages.push_back(off);
     }
-    assert(patchRangeCount == ranges && !patchRangeOverflow);
-    auto tampered = cache; tampered[0x6c8] ^= 1;
-    assert(verifyCall(btd, 0, tampered.data(), tampered.size()) == 94);
-    assert(verifyRestoreFailed == 1);
-    puts("PASS: RPA build/boot/verify gates, page boundaries, counters and full verify-block restoration");
+    const uint64_t helper = rpaPlan->edits[0].file_offset & ~(uint64_t(PAGE_SIZE)-1);
+    for (const auto &edit : rpaPlan->edits)
+        memcpy(expected.data()+edit.file_offset,edit.replacement,edit.len);
+    for (uint64_t off : pages) {
+        csValidatePage(btd,nullptr,off,cache.data()+off,nullptr,nullptr,nullptr);
+        assert(!rpaHelpersReady);
+    }
+    csValidatePage(btd,nullptr,helper,cache.data()+helper,nullptr,nullptr,nullptr);
+    assert(rpaHelpersReady && cache == expected && patchRangeCount == reserved);
+    assert(bluetoothdRpaHelpersPatched == 1 && bluetoothdRpaLegacyPatched == 1 && bluetoothdRpaScanPatched == 1 &&
+           bluetoothdRpaDecodePatched == 1 && bluetoothdRpaDevicePatched == 1 && bluetoothdRpaConnectPatched == 1 && bluetoothdRpaUpdatePatched == 1);
+    assert(prepareRpa() && fileReads == 1 && vnodeRefs == 1); // immutable across re-exec
+    pages.push_back(helper);
+    for (uint64_t off : pages) {
+        csValidatePage(btd,nullptr,off,cache.data()+off,nullptr,nullptr,nullptr);
+        Page fresh {}; memcpy(fresh.data(),file.data()+off,PAGE_SIZE);
+        csValidatePage(btd,nullptr,off,fresh.data(),nullptr,nullptr,nullptr);
+        assert(!memcmp(fresh.data(),expected.data()+off,PAGE_SIZE));
+    }
+    assert(patchRangeCount == reserved && !patchRangeOverflow);
+    const uint64_t block = helper & ~uint64_t(16383);
+    assert(verifyCall(btd,block,cache.data()+block,16384) == 0 && verifyRestored && !verifyRestoreFailed);
+    // After activation, unrelated ledger exhaustion cannot skip the helper.
+    for (uint32_t i = reserved; i < kPatchRanges; ++i) patchRanges[i] = {};
+    patchRangeCount = kPatchRanges;
+    Page fresh = plannedPage(0); csValidatePage(btd,nullptr,helper,fresh.data(),nullptr,nullptr,nullptr);
+    assert(!memcmp(fresh.data(),expected.data()+helper,PAGE_SIZE));
+    // A changed destination rejects executable validation, with no partial
+    // write to any other destination on the same page.
+    reset(25,true,false); Patcher::init(0); assert(prepareRpa());
+    Page bad = plannedPage(1); const auto &edit = rpaPlan->edits[1];
+    bad[edit.file_offset % PAGE_SIZE] ^= 1; const Page before = bad;
+    int validated = 1, tainted = 0, nx = 0;
+    csValidatePage(btd,nullptr,edit.file_offset & ~(uint64_t(PAGE_SIZE)-1),bad.data(),&validated,&tainted,&nx);
+    assert(bad == before && !validated && tainted && nx && rpaPlanRejected == 1);
+    static char different[] = "/usr/sbin/bluetoothd";
+    Page other = plannedPage(0), original = other;
+    csValidatePage(different,nullptr,rpaPlan->edits[0].file_offset & ~(uint64_t(PAGE_SIZE)-1),other.data(),nullptr,nullptr,nullptr);
+    assert(other == original && !rpaHelpersReady);
+    // Downstream BlueToolFixup writes on a different vnode must be rolled
+    // back, not left resident outside the referenced image's restore ledger.
+    Page foreign {}; memcpy(foreign.data()+800,foreignFind,sizeof(foreignFind));
+    const Page native = foreign; const uint32_t ranges = patchRangeCount;
+    std::vector<uint8_t> nativeBlock(16384,0);
+    memcpy(nativeBlock.data(),native.data(),PAGE_SIZE); pristine = nativeBlock.data();
+    for (int i = 0; i < 2; ++i)
+        csValidatePage(different,nullptr,0,foreign.data(),nullptr,nullptr,nullptr);
+    assert(foreign == native && patchRangeCount == ranges && bluetoothdForeignPagesRolledBack == 2);
+    memcpy(nativeBlock.data(),foreign.data(),PAGE_SIZE);
+    assert(verifyCall(different,0,nativeBlock.data(),nativeBlock.size()) == 0);
+    // Common features on an unlisted layout are validated even with RPA off.
+    osBuild = "25H100";
+    for (bool disableAdv : {false,true}) {
+        reset(25,true,disableAdv); noRpa = true; Patcher::init(0);
+        assert(!prepareRpa(btd,false) && rpaPlanState == RpaPlanDisabled && bluetoothdCommonAbi == 3);
+        msbcReady = true; Patcher::observeMsbcController(true);
+        Page page = originals(), expected = page;
+        memcpy(expected.data()+10,wbsReplace,sizeof(wbsReplace));
+        memcpy(expected.data()+110,hfpFillReplace,sizeof(hfpFillReplace));
+        if (!disableAdv) {
+            memcpy(expected.data()+210,extAdvReplace,sizeof(extAdvReplace));
+            memcpy(expected.data()+310,advAddressReplace,sizeof(advAddressReplace));
+            memcpy(expected.data()+410,advAddressRetryReplace,sizeof(advAddressRetryReplace));
+        }
+        apply(page); assert(page == expected && bluetoothdWbsPatched == 1 && bluetoothdHfpFillPatched == 1);
+        assert(bluetoothdPatched == !disableAdv && !rpaHelpersReady);
+    }
+    // A missing RPA signature does not veto a valid common ABI.
+    const auto goodFixture = rpaFixture;
+    rpaFixture[0x4000+0x2100] ^= 1;
+    reset(25,true,false); Patcher::init(0);
+    assert(!prepareRpa(btd,false) && rpaPlanState == RpaPlanInvalid && bluetoothdCommonAbi == 3);
+    Page page = originals(); apply(page); assert(bluetoothdPatched == 1 && bluetoothdAddressPatched == 1);
+    rpaFixture = goodFixture;
+    // A missing advertising signature cannot veto HFP-only validation.
+    rpaFixture[0x4000+0x5300] ^= 1;
+    reset(25,true,true); Patcher::init(0);
+    assert(!prepareRpa(btd,false) && rpaPlanState == RpaPlanDisabled && bluetoothdCommonAbi == MTK_BT_COMMON_MSBC);
+    msbcReady = true; Patcher::observeMsbcController(true); page = originals(); apply(page);
+    assert(bluetoothdWbsPatched == 1 && bluetoothdHfpFillPatched == 1 && !bluetoothdPatched);
+    rpaFixture = goodFixture;
+    // The opposite direction is independent too: failed HFP ABI leaves valid
+    // advertising enabled, including with the explicit RPA opt-out.
+    rpaFixture[0x4000+0x5500] ^= 1;
+    reset(25,true,false); noRpa = true; Patcher::init(0);
+    assert(!prepareRpa(btd,false) && bluetoothdCommonAbi == MTK_BT_COMMON_ADVERTISING);
+    msbcReady = true; Patcher::observeMsbcController(true); page = originals(); apply(page);
+    assert(bluetoothdPatched == 1 && bluetoothdAddressPatched == 1 && !bluetoothdWbsPatched && !bluetoothdHfpFillPatched);
+    rpaFixture = goodFixture; osBuild = "25G332";
+    puts("PASS: dynamic pre-exec RPA, independent advertising/HFP validation, vnode rollback, lazy helper and reserved restoration");
 }
 // Build scopes: masked sites on 25G241, unlisted builds and -mtkbtanybuild,
 // ambiguous matches, and the per-vnode feature decision.
@@ -536,22 +605,22 @@ void buildTests() {
     assert(bluetoothdAddressPatched == 1 && bluetoothdAddressRetryPatched == 1 && bluetoothdBuild == Build25G241);
     // Unlisted build: only ScopeAnyBuild sites, unless -mtkbtanybuild; never RPA.
     for (bool any : {false, true}) {
-        osBuild = "25H100";
+        osBuild = "25G240";
         reset(25, true, false); anyBuild = any; Patcher::init(0); msbcReady = true;
         Patcher::observeMsbcController(true);
         assert(anyBuildPatches == any);
         assert(!bluetoothdAddressRetryPatched);  // known-build scope, like advAddress
         Page p = originals(), expected = p;
-        memcpy(expected.data() + 210, extAdvReplace, sizeof(extAdvReplace));
         if (any) {
+            memcpy(expected.data() + 210, extAdvReplace, sizeof(extAdvReplace));
             memcpy(expected.data() + 10, wbsReplace, sizeof(wbsReplace));
             memcpy(expected.data() + 110, hfpFillReplace, sizeof(hfpFillReplace));
             memcpy(expected.data() + 310, advAddressReplace, sizeof(advAddressReplace));
             memcpy(expected.data() + 410, advAddressRetryReplace, sizeof(advAddressRetryReplace));
         }
         apply(p);
-        assert(p == expected && bluetoothdBuild == BuildOther && !strcmp(bluetoothdBuildName, "25H100"));
-        assert(bluetoothdPatched == 1 && bluetoothdAddressRetryPatched == any);
+        assert(p == expected && bluetoothdBuild == BuildOther && !strcmp(bluetoothdBuildName, "25G240"));
+        assert(bluetoothdPatched == any && bluetoothdAddressRetryPatched == any);
         // Retry without advAddress stalls the set start: its guard calls a
         // helper that returns 0 without sending HCI or calling the callback
         // when the gate is false (verified on 25G332). ScopeKnownBuild, like advAddress.
@@ -559,6 +628,21 @@ void buildTests() {
         Page helpers = helperPage(); const Page original = helpers; apply(helpers);
         assert(helpers == original && !rpaHelpersReady && !bluetoothdRpaHelpersPatched);
     }
+    for (const char *build : {"25G342", "25H100"}) {
+        osBuild = build; reset(25,true,false); Patcher::init(0); msbcReady = true;
+        if (!strcmp(build,"25H100")) assert(prepareRpa("/usr/sbin/bluetoothd",false));
+        Patcher::observeMsbcController(true);
+        Page p = originals(), expected = p;
+        memcpy(expected.data()+10,wbsReplace,sizeof(wbsReplace));
+        memcpy(expected.data()+110,hfpFillReplace,sizeof(hfpFillReplace));
+        memcpy(expected.data()+210,extAdvReplace,sizeof(extAdvReplace));
+        memcpy(expected.data()+310,advAddressReplace,sizeof(advAddressReplace));
+        memcpy(expected.data()+410,advAddressRetryReplace,sizeof(advAddressRetryReplace));
+        apply(p); assert(p == expected && bluetoothdAddressPatched == 1 && bluetoothdAddressRetryPatched == 1);
+        assert(!anyBuildPatches && !rpaHelpersReady); // The helper itself stays lazy.
+    }
+    osBuild = "25H100"; reset(25,true,false); Patcher::init(0);
+    Page pending = originals(); apply(pending); assert(pending == originals()); // no partial advertising before preflight
     osBuild = "25G332";
     // Two matches in one page: neither is patched, and the feature is off for this vnode.
     reset(25, true, false); Patcher::init(0);
@@ -585,7 +669,7 @@ void buildTests() {
     Patcher::observeMsbcController(false);
     apply(page);
     assert(bluetoothdWbsPatched == 1 && !memcmp(page.data() + 10, wbsReplace, sizeof(wbsReplace)));
-    puts("PASS: masked sites patch 25G241 as before; unlisted builds get only build-independent sites (or all but RPA with -mtkbtanybuild); ambiguous and per-vnode decisions");
+    puts("PASS: historical 25G241 bytes, 25G241+ masked sites including 25G342, below-minimum override, ambiguous and per-vnode decisions");
 }
 void msbcOrderingTests() {
     for (bool senderFirst : {false, true}) for (bool bridgeReadyAtPage : {false, true}) {
@@ -804,7 +888,7 @@ void verifyRaceTests() {
     const size_t blockOffset = 0x4000 + 0xaa0000;
     const size_t pageOffset = blockOffset + 0x2000;
     std::vector<uint8_t> file(blockOffset + PAGE_SIZE * 4, 0x5a);
-    memcpy(file.data() + blockOffset + 0x2b88, rpaHelpersFind25G332, sizeof(rpaHelpersFind25G332));
+    memcpy(file.data() + blockOffset + 0x2b88, extAdvFind, sizeof(extAdvFind));
     pristine = file.data();
     for (bool knownVnode : {false, true}) {
         reset(25, true, false); Patcher::init(0);
@@ -835,7 +919,7 @@ void verifyRaceTests() {
         patcher.join(); verifier.join(); afterReplacement = nullptr;
         assert(result == 0 && verifyRestored == 1 && !verifyRestoreFailed);
         assert(!memcmp(cache.data() + blockOffset + 0x2b88,
-                       rpaHelpersReplace25G332, sizeof(rpaHelpersReplace25G332)));
+                       extAdvReplace, sizeof(extAdvReplace)));
     }
 
     // Verification of an untouched block must also exclude a new patch until
@@ -870,6 +954,10 @@ void verifyRaceTests() {
     puts("PASS: concurrent patch/verify waits for recorded originals, including first vnode, fat offsets and untouched blocks");
 }
 int main() {
+    const char *fixture = std::getenv("MTK_RPA_FIXTURE"); assert(fixture);
+    std::ifstream stream(fixture, std::ios::binary); assert(stream);
+    rpaFixture.assign(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    assert(!rpaFixture.empty());
     for (int version : {21, 25}) for (bool disable : {false, true}) {
         reset(version, false, true, true); noLeReadyMask = disable; Patcher::init(0);
         assert(leReadyMaskEnabled == (version == 25 && !disable));
@@ -951,11 +1039,18 @@ int main() {
     verifyOpTests();
     rpaTests();
     verifyRaceTests();
+    if (const char *path = std::getenv("MTK_RPA_REAL_BINARY")) {
+        std::ifstream input(path,std::ios::binary); assert(input);
+        rpaFixture.assign(std::istreambuf_iterator<char>(input),std::istreambuf_iterator<char>());
+        osBuild = "25G342"; reset(25,true,false); noRpa = true; Patcher::init(0);
+        assert(!prepareRpa("/usr/sbin/bluetoothd",false) && rpaPlanState == RpaPlanDisabled && bluetoothdCommonAbi == 3);
+        puts("PASS: supplied binary common advertising/HFP ABI validates independently with RPA disabled");
+    }
     puts("PASS: actual page hook gates unknown/unsupported/mixed controllers; supported IDs retain WBS; verification and advertising checks pass");
 }
 '''
 
-declarations = "\n".join(array(name)[0] for name in names)
+declarations = "\n".join(array(name)[0] for name in names if "25G332" not in name)
 types = source[source.index("// struct vnop_verify_args"):source.index("/*\n * offsetof(struct vnode, v_op)")]
 
 
@@ -1003,13 +1098,14 @@ else:
 state_start = source.index("constexpr size_t kPatchRangeMax")
 state = source[state_start:source.index("\n", source.index("uint8_t *verifyCopy;"))]
 site_table = source[source.index("enum PatchFeature : uint8_t"):source.index("bool siteScopeAllows(")]
-forward = "bool patchBluetoothdPage(void *data);\n"
+rpa_state = source[source.index("mach_vm_address_t orgMacVnodeCheckExec;"):source.index("// -mtkbtanybuild:")]
+forward = "bool patchBluetoothdPage(void *data);\nSInt32 readBluetoothdBuild();\nint32_t applyRpaPage(vnode_t, uint64_t, void *, int *, int *, int *);\n"
 wrappers = forward + "\n\n".join(function(name) for name in (
     "bool isMsbcReady()", "void recordPatchRange(", "void recordPageDiff(", "void restorePatchedPageLocked(", "static __attribute__((noinline)) bool isBluetoothdPath(", "bool isBluetoothd(",
     "uint32_t decodeVnodeOpsOffset(", "void noteVerifyFailure(", "template <typename Verify>\nerrno_t verifyBluetoothdBlock(",
     "int verifyOp(void *arg)", "void installVerifyOp(", "void csValidatePage(", "SInt32 readBluetoothdBuild()",
-    "bool siteScopeAllows(", "bool featureWanted(", "bool featureOn(", "bool patchBluetoothdPage(void *data)\n{",
-    "void processPatcher(",
+    "bool siteScopeAllows(", "bool commonFeatureAllowed(", "bool featureWanted(", "bool featureOn(", "bool patchBluetoothdPage(void *data)\n{",
+    "int readRpaImage(", "uint32_t validateCommonImage(", "int macVnodeCheckExec(", "int32_t applyRpaPage(", "void processPatcher(",
     "void Patcher::observeMsbcController(", "void Patcher::init("))
 compiler = shutil.which("clang++")
 assert compiler, "clang++ is required"
@@ -1021,13 +1117,19 @@ with tempfile.TemporaryDirectory(prefix="mtk-msbc-pages-") as directory:
     directory = Path(directory)
     cpp, binary = directory / "pages.cpp", directory / "pages"
     scope_include = '#include "' + str(ROOT / "kext/BT/msbc/MsbcControllerScope.hpp") + '"\n'
-    cpp.write_text(scope_include + mock + declarations + history_code + state + "\n" + types + vop_mock +
+    cpp.write_text(scope_include + mock + rpa_state + declarations + history_code + state + "\n" + types + vop_mock +
                    real_code + "\n" + site_table + wrappers + tests)
     sanitizer = [] if args.no_sanitize else ["-fsanitize=" + ("thread" if args.thread_sanitize else "address,undefined"),
                                             "-fno-sanitize-recover=all"]
     subprocess.run([compiler, "-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-I", str(ROOT / "kext/BT"), "-I", str(ROOT / "kext/include"),
                     *sanitizer, str(cpp), str(rust_host / "debug/libmtk_ffi.a"), "-o", str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    fixture = directory / "rpa-fixture.bin"
+    factory = runpy.run_path(str(ROOT / "scripts/bt-rpa-fixture.py"))
+    fixture.write_bytes(factory["image"](fat=0x4000)[0])
+    environment = {**os.environ, "MTK_RPA_FIXTURE": str(fixture)}
+    if args.binary:
+        environment["MTK_RPA_REAL_BINARY"] = str(args.binary.resolve())
+    subprocess.run([str(binary)], check=True, env=environment)
 
     if platform.machine() == "x86_64":
         # Replace only controller lookup with the argument; execute the real gate instructions.

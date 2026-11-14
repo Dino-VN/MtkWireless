@@ -225,7 +225,7 @@ def validate_rpa():
     # Some child signatures are identical on 25G241; the page hook must keep
     # them untouched until the 25G332 helper anchor was installed.
     if uuid != bytes.fromhex('7ef7ef4d9b0e355abba8f34713b2580a'):
-        print('RPA fallback: this build is unsupported (25G332 only)')
+        print('SKIP: historical RPA byte oracle is 25G332-only; use test-bt-rpa-resolver.py for dynamic layouts')
         return
     targets = {
         'rpaHelpers': 0x100aa2b88, 'rpaLegacy': 0x10020c3dd,
@@ -492,9 +492,8 @@ def validate_le_ready_mask_contract():
     print(f'PASS: 25G332 generic mask {old_mask:#x} disables DLE/PHY; HCI repair is {old_mask | 0x840:#x}; native readiness evidence checked')
 
 validate_le_ready_mask_contract()
-# Patcher.cpp's ScopeKnownBuild sites (advAddress, wbs, hfpFill) apply only to
-# builds listed in readBluetoothdBuild, or with -mtkbtanybuild. A new build
-# passing every check above (on an unpatched copy, e.g. from its installer)
-# can be listed there; RPA still needs its own arrays.
+# These are common-site/historical byte checks. Runtime minimum-build sites
+# retain the verified legacy layouts and independently preflight advertising
+# and HFP on unlisted layouts. Dynamic RPA is checked by its own resolver test.
 print('bluetoothd x86_64 LC_UUID ' + (uuid.hex().upper() if uuid else 'missing'))
 print('Bluetooth page patch validation passed')

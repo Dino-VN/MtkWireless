@@ -58,7 +58,10 @@ impl Site<'_> {
     }
 
     fn matches_at(&self, page: &[u8], at: usize) -> bool {
-        let Some(window) = at.checked_add(self.find.len()).and_then(|end| page.get(at..end)) else {
+        let Some(window) = at
+            .checked_add(self.find.len())
+            .and_then(|end| page.get(at..end))
+        else {
             return false;
         };
         window
@@ -115,6 +118,48 @@ impl Site<'_> {
     }
 }
 
+/// Conservative Darwin-build ordering for the Tahoe ABI family. Seed suffixes
+/// at the exact minimum precede its release; a later train/number may qualify,
+/// but still needs all native signatures/layout guards. Other Darwin majors
+/// never qualify just because their numeric value is larger.
+pub fn tahoe_build_since(build: &[u8], minimum: u32) -> bool {
+    use mtk_common::Reader;
+    let mut r = Reader::new(build);
+    if build.len() > 15 || r.take(2).ok() != Some(b"25") {
+        return false;
+    }
+    let Ok(train) = r.u8() else {
+        return false;
+    };
+    if !train.is_ascii_uppercase() {
+        return false;
+    }
+    let mut number = 0u32;
+    let mut digits = 0;
+    let mut seed = false;
+    while !r.is_empty() {
+        let Ok(c) = r.u8() else {
+            return false;
+        };
+        if c.is_ascii_digit() && !seed {
+            let Some(next) = number
+                .checked_mul(10)
+                .and_then(|n| n.checked_add((c - b'0') as u32))
+            else {
+                return false;
+            };
+            number = next;
+            digits += 1;
+        } else if c.is_ascii_lowercase() && !seed && r.is_empty() && digits > 0 {
+            seed = true;
+        } else {
+            return false;
+        }
+    }
+    digits > 0
+        && (train > b'G' || (train == b'G' && (number > minimum || (number == minimum && !seed))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,7 +170,35 @@ mod tests {
     const RMASK: [u8; 6] = [0xff, 0xff, 0, 0, 0, 0];
 
     fn site() -> Site<'static> {
-        Site { find: &FIND, find_mask: &MASK, replace: &REPLACE, replace_mask: &RMASK }
+        Site {
+            find: &FIND,
+            find_mask: &MASK,
+            replace: &REPLACE,
+            replace_mask: &RMASK,
+        }
+    }
+
+    #[test]
+    fn minimum_tahoe_build_is_not_a_whitelist_or_future_abi() {
+        for build in ["25G241", "25G332", "25G342", "25G999a", "25H1"] {
+            assert!(tahoe_build_since(build.as_bytes(), 241), "{build}");
+        }
+        for build in [
+            "",
+            "25G240",
+            "25G241a",
+            "25F999",
+            "26A1",
+            "24G999",
+            "25G",
+            "25G-1",
+            "25G342xyz",
+            "25G9999999999999",
+        ] {
+            assert!(!tahoe_build_since(build.as_bytes(), 241), "{build}");
+        }
+        assert!(!tahoe_build_since(b"25G241", 332));
+        assert!(tahoe_build_since(b"25G342", 332));
     }
 
     #[test]
@@ -174,7 +247,12 @@ mod tests {
 
     #[test]
     fn empty_masks_are_exact() {
-        let s = Site { find: &FIND, find_mask: &[], replace: &REPLACE, replace_mask: &[] };
+        let s = Site {
+            find: &FIND,
+            find_mask: &[],
+            replace: &REPLACE,
+            replace_mask: &[],
+        };
         let mut page = [0u8; 16];
         page[2..8].copy_from_slice(&FIND);
         assert_eq!(s.find_in(&page).unwrap(), Match::One(2));
@@ -187,11 +265,36 @@ mod tests {
     #[test]
     fn malformed_sites() {
         let bad = [
-            Site { find: &[], find_mask: &[], replace: &[], replace_mask: &[] },
-            Site { find: &FIND, find_mask: &[], replace: &REPLACE[..5], replace_mask: &[] },
-            Site { find: &FIND, find_mask: &MASK[..5], replace: &REPLACE, replace_mask: &[] },
-            Site { find: &FIND, find_mask: &[], replace: &REPLACE, replace_mask: &RMASK[..2] },
-            Site { find: &FIND, find_mask: &[0, 0xff, 0xff, 0xff, 0xff, 0xff], replace: &REPLACE, replace_mask: &[] },
+            Site {
+                find: &[],
+                find_mask: &[],
+                replace: &[],
+                replace_mask: &[],
+            },
+            Site {
+                find: &FIND,
+                find_mask: &[],
+                replace: &REPLACE[..5],
+                replace_mask: &[],
+            },
+            Site {
+                find: &FIND,
+                find_mask: &MASK[..5],
+                replace: &REPLACE,
+                replace_mask: &[],
+            },
+            Site {
+                find: &FIND,
+                find_mask: &[],
+                replace: &REPLACE,
+                replace_mask: &RMASK[..2],
+            },
+            Site {
+                find: &FIND,
+                find_mask: &[0, 0xff, 0xff, 0xff, 0xff, 0xff],
+                replace: &REPLACE,
+                replace_mask: &[],
+            },
         ];
         for s in bad {
             assert!(s.check().is_err());
@@ -202,6 +305,9 @@ mod tests {
     #[test]
     fn applied_matches_historical_exact_patch() {
         let s = site();
-        assert_eq!(s.applied(&[0xe8, 1, 2, 3, 4, 0xc3]).unwrap(), [0x90, 0x90, 2, 3, 4, 0xc3]);
+        assert_eq!(
+            s.applied(&[0xe8, 1, 2, 3, 4, 0xc3]).unwrap(),
+            [0x90, 0x90, 2, 3, 4, 0xc3]
+        );
     }
 }
