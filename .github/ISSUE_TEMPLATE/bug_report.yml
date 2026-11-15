@@ -1,0 +1,107 @@
+name: Bug report / Báo lỗi
+description: Report a Wi-Fi, Bluetooth, Continuity, sleep/wake or installation problem / Báo lỗi hoạt động hoặc cài đặt.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve MtkWireless. Check the [installation guide](https://github.com/Dino-VN/MtkWireless#install), [known limitations](https://github.com/Dino-VN/MtkWireless#what-works), and existing issues first.
+
+        Cảm ơn bạn đã giúp cải thiện MtkWireless. Hãy xem [hướng dẫn cài đặt](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#cài-đặt), [giới hạn đã biết](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#những-gì-hoạt-động) và các issue hiện có trước.
+
+        **This issue is public. Do not upload an unredacted collector ZIP, HCI trace, IORegistry dump or full OpenCore config.** They may contain SSIDs, MAC/IP addresses, serial numbers, device/user names and private activity. Share only redacted excerpts here; arrange any full diagnostic archive privately with a maintainer.
+
+        **Issue này công khai. Không đăng ZIP log, HCI trace, bản IORegistry hoặc toàn bộ config OpenCore chưa ẩn thông tin cá nhân.** Chỉ đăng trích đoạn đã ẩn dữ liệu riêng tư; trao đổi với người duy trì trước khi gửi gói log đầy đủ qua kênh riêng.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting / Trước khi gửi
+      options:
+        - label: I checked the documentation and searched existing issues / Tôi đã đọc tài liệu và tìm trong các issue hiện có.
+          required: true
+        - label: I will not post unredacted personal information or diagnostic archives / Tôi sẽ không đăng thông tin cá nhân hoặc gói log chưa được ẩn dữ liệu riêng tư.
+          required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected feature / Tính năng bị lỗi
+      multiple: true
+      options:
+        - Wi-Fi (scan, join, DHCP, roaming)
+        - Bluetooth / BLE / audio
+        - AirDrop / Handoff / Universal Clipboard
+        - Instant Hotspot
+        - iPhone Mirroring / Mirra (experimental)
+        - Sleep / wake
+        - Installer / updater / diagnostics
+        - Other / Khác
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and build / Phiên bản và build macOS
+      description: Run `sw_vers` and include the build number / Chạy `sw_vers`, ghi cả số build.
+      placeholder: "26.7.2 (25G332)"
+    validations:
+      required: true
+  - type: input
+    id: kext_version
+    attributes:
+      label: MtkWireless version / Phiên bản MtkWireless
+      description: Include Release/Debug, pre-release status, or commit for a local build / Ghi Release/Debug, pre-release hoặc commit nếu build local.
+      placeholder: "1.1.1 pre-release, Release; or local build at <commit>"
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware / Phần cứng
+      description: Chip/PCI/USB IDs are useful; do not include serial numbers or unique MAC addresses. Use N/A where not applicable / Không ghi số sê-ri hoặc địa chỉ MAC; ghi N/A cho mục không liên quan.
+      placeholder: |
+        CPU / SMBIOS:
+        Wi-Fi chip + PCI ID (e.g. MT7921, 14c3:7961):
+        Bluetooth USB ID (e.g. 0489:e0cd):
+        Peer device + OS (iPhone/iOS, headset, AP, etc.):
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened / Lỗi gặp phải
+      description: Describe what you expected and what actually happened / Mô tả kết quả mong đợi và kết quả thực tế.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce / Các bước tái hiện
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: conditions
+    attributes:
+      label: Conditions and previous working version / Điều kiện và bản từng hoạt động
+      description: Include relevant boot-args and other wireless kexts. For Hotspot, mention same iCloud/Family and whether a USB cable is connected. For sleep issues, include the wake reason / Ghi boot-arg, kext liên quan; với Hotspot ghi cùng iCloud/Family và có cắm USB không; với sleep ghi wake reason.
+      placeholder: |
+        Always or intermittent / Luôn lỗi hay thỉnh thoảng:
+        Before/after sleep / Trước hay sau sleep:
+        Wi-Fi band and width / Băng tần và độ rộng kênh:
+        AirDrop/AWDL active / AirDrop/AWDL có đang chạy:
+        Same iCloud / Family / USB cable (Hotspot):
+        Relevant boot-args and kexts / Boot-arg và kext liên quan:
+        Last working version / Bản gần nhất hoạt động:
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted logs and error messages / Log đã ẩn thông tin cá nhân và thông báo lỗi
+      description: |
+        Collect logs immediately after the failure, before restarting Bluetooth or toggling Wi-Fi: [instructions](https://github.com/Dino-VN/MtkWireless#reporting-a-problem). Include the failure time/time zone and a short redacted excerpt or driver counters. If collection fails, include that error instead. `--include-hci` only copies existing traces; it does not enable tracing.
+
+        Thu thập log ngay sau lỗi, trước khi restart Bluetooth hoặc bật/tắt Wi-Fi: [hướng dẫn](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#báo-lỗi). Ghi thời điểm/múi giờ và trích đoạn log hoặc bộ đếm driver đã ẩn thông tin cá nhân. Nếu không thu được log, ghi lỗi của công cụ. `--include-hci` chỉ chép trace có sẵn, không bật ghi trace.
+      placeholder: Paste only redacted excerpts here / Chỉ dán trích đoạn đã ẩn thông tin cá nhân ở đây.
+      render: text

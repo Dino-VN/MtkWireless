@@ -1,6 +1,10 @@
 # MtkWireless
 
-[Tiếng Việt](README.vi.md) · [Releases](https://github.com/Dino-VN/MtkWireless/releases) · [Support on Ko-fi](https://ko-fi.com/dinovn)
+[Tiếng Việt](README.vi.md) · [Releases](https://github.com/Dino-VN/MtkWireless/releases)
+
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20the%20project-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/dinovn)
+
+**Quick links:** [Requirements](#requirements) · [What works](#what-works) · [Install](#install) · [Troubleshooting](#check-that-it-loaded) · [Report a problem](#reporting-a-problem) · [Mirroring](#iphone-mirroring-with-mirra) · [Build](#build-from-source) · [Credits](#credits) · [License](#license) · [Support](#support)
 
 Wi-Fi and Bluetooth for MediaTek MT7921 / MT7922 cards on macOS 26 Tahoe
 (OpenCore, Intel x86_64). The protocol logic is written in Rust; C++ is kept

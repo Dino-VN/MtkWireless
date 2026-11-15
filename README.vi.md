@@ -1,6 +1,10 @@
 # MtkWireless
 
-[English](README.md) · [Bản phát hành](https://github.com/Dino-VN/MtkWireless/releases) · [Ủng hộ trên Ko-fi](https://ko-fi.com/dinovn)
+[English](README.md) · [Bản phát hành](https://github.com/Dino-VN/MtkWireless/releases)
+
+[![Ủng hộ trên Ko-fi](https://img.shields.io/badge/Ko--fi-%E1%BB%A6ng%20h%E1%BB%99%20d%E1%BB%B1%20%C3%A1n-FF5E5B?style=for-the-badge&logo=ko-fi&logoColor=white)](https://ko-fi.com/dinovn)
+
+**Đến nhanh:** [Yêu cầu](#yêu-cầu) · [Tính năng](#những-gì-hoạt-động) · [Cài đặt](#cài-đặt) · [Xử lý lỗi](#kiểm-tra-kext-đã-nạp) · [Báo lỗi](#báo-lỗi) · [Mirroring](#iphone-mirroring-với-mirra) · [Build](#build-từ-mã-nguồn) · [Đóng góp](#ghi-nhận-đóng-góp) · [Giấy phép](#giấy-phép) · [Ủng hộ](#ủng-hộ)
 
 Wi-Fi và Bluetooth cho card MediaTek MT7921 / MT7922 trên macOS 26 Tahoe
 (OpenCore, Intel x86_64). Phần xử lý giao thức được viết bằng Rust; C++ chỉ
