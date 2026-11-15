@@ -12,6 +12,9 @@ body:
         **This issue is public. Do not upload an unredacted collector ZIP, HCI trace, IORegistry dump or full OpenCore config.** They may contain SSIDs, MAC/IP addresses, serial numbers, device/user names and private activity. Share only redacted excerpts here; arrange any full diagnostic archive privately with a maintainer.
 
         **Issue này công khai. Không đăng ZIP log, HCI trace, bản IORegistry hoặc toàn bộ config OpenCore chưa ẩn thông tin cá nhân.** Chỉ đăng trích đoạn đã ẩn dữ liệu riêng tư; trao đổi với người duy trì trước khi gửi gói log đầy đủ qua kênh riêng.
+        Collector redaction is automatic and best-effort. Review every file before sharing privately; it does not guarantee anonymity. `--no-redact` is PRIVATE RAW.
+
+        Công cụ tự ẩn dữ liệu theo best-effort. Kiểm tra từng tệp trước khi gửi riêng; không bảo đảm ẩn danh. `--no-redact` là PRIVATE RAW.
   - type: checkboxes
     id: checks
     attributes:
@@ -100,8 +103,8 @@ body:
     attributes:
       label: Redacted logs and error messages / Log đã ẩn thông tin cá nhân và thông báo lỗi
       description: |
-        Collect logs immediately after the failure, before restarting Bluetooth or toggling Wi-Fi: [instructions](https://github.com/Dino-VN/MtkWireless#reporting-a-problem). Include the failure time/time zone and a short redacted excerpt or driver counters. If collection fails, include that error instead. `--include-hci` only copies existing traces; it does not enable tracing.
+        Collect logs immediately after the failure, before restarting Bluetooth or toggling Wi-Fi: [instructions](https://github.com/Dino-VN/MtkWireless#reporting-a-problem). Include the failure time/time zone and a short redacted excerpt or driver counters. If collection fails, include that error instead. Automatic redaction is best-effort: review the ZIP before sharing privately; arbitrary private text may remain. `--no-redact` is PRIVATE RAW; binary HCI/logarchive/kext attachments require it.
 
-        Thu thập log ngay sau lỗi, trước khi restart Bluetooth hoặc bật/tắt Wi-Fi: [hướng dẫn](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#báo-lỗi). Ghi thời điểm/múi giờ và trích đoạn log hoặc bộ đếm driver đã ẩn thông tin cá nhân. Nếu không thu được log, ghi lỗi của công cụ. `--include-hci` chỉ chép trace có sẵn, không bật ghi trace.
+        Thu thập log ngay sau lỗi, trước khi restart Bluetooth hoặc bật/tắt Wi-Fi: [hướng dẫn](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#báo-lỗi). Ghi thời điểm/múi giờ và trích đoạn log hoặc bộ đếm driver đã ẩn thông tin cá nhân. Nếu không thu được log, ghi lỗi của công cụ. Công cụ mặc định tự ẩn dữ liệu theo best-effort: kiểm tra ZIP trước khi gửi riêng; văn bản riêng tư có thể còn lại. `--no-redact` là PRIVATE RAW; HCI/logarchive/bản chép kext bắt buộc dùng chế độ này.
       placeholder: Paste only redacted excerpts here / Chỉ dán trích đoạn đã ẩn thông tin cá nhân ở đây.
       render: text

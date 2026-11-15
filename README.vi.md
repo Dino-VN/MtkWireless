@@ -247,13 +247,18 @@ sudo bash -c "$script" -- --last 15m --verbose --notes "AirDrop Mac to iPhone st
 | `--last 15m` | Thu thập log trong khoảng thời gian dài hơn mặc định 5 phút |
 | `--notes "..."` | Đính kèm mô tả lỗi |
 | `--verbose` | Bao gồm log mức info/debug |
+| `--no-redact` | Tắt ẩn dữ liệu; gói PRIVATE RAW |
 | `--logarchive` | Thêm log archive gốc của macOS (zip lớn hơn) |
 | `--include-hci` | Chép các HCI trace có sẵn thay vì chỉ liệt kê |
 | `--include-kexts` | Chép các gói kext |
 
-**Gói log không được ẩn danh.** Nó có thể chứa SSID, địa chỉ MAC và IP,
-số sê-ri, tên thiết bị và người dùng. Hãy gửi riêng; không đính kèm vào
-issue công khai. Dữ liệu Keychain và khóa liên kết Bluetooth không được chép.
+Mặc định, công cụ tự động ẩn địa chỉ MAC/IP, đường dẫn người dùng, UUID,
+email và các tên/SSID/số sê-ri nhận diện được bằng mã thay thế nhất quán trong gói.
+Đây là xử lý **best-effort**, không bảo đảm ẩn danh: văn bản riêng tư khác có thể
+còn lại. Hãy kiểm tra tất cả tệp và tên tệp trước khi chia sẻ; gửi riêng cho người
+đáng tin cậy. `--no-redact` tạo gói **PRIVATE RAW** chưa ẩn dữ liệu. Các tùy chọn
+binary bên trên bắt buộc có `--no-redact`. Chế độ ẩn dữ liệu bỏ payload binary
+và plist data; chỉ giữ executable `bluetoothd` gốc của Apple đã xác minh. Không chép Keychain hoặc khóa Bluetooth.
 
 ## Build từ mã nguồn
 

@@ -246,13 +246,18 @@ sudo bash -c "$script" -- --last 15m --verbose --notes "AirDrop Mac to iPhone st
 | `--last 15m` | Collect a longer log window than the default 5 minutes |
 | `--notes "..."` | Attach a description of what went wrong |
 | `--verbose` | Include info/debug log levels |
+| `--no-redact` | Disable redaction; PRIVATE RAW bundle |
 | `--logarchive` | Add a native log archive (larger zip) |
 | `--include-hci` | Copy existing HCI traces instead of only listing them |
 | `--include-kexts` | Copy the kext bundles |
 
-**The bundle is not anonymized.** It can contain SSIDs, MAC and IP addresses,
-serial numbers, device and user names. Send it privately; do not attach it to
-a public issue. Keychain data and Bluetooth link keys are not copied.
+By default, automatic redaction replaces MAC/IP addresses, user paths, UUIDs,
+emails and recognized names/SSIDs/serials with consistent pseudonyms within the
+bundle. This is **best-effort, not anonymity**: arbitrary private text may remain.
+Review all files and filenames before sharing; send privately to someone you trust.
+`--no-redact` produces a **PRIVATE RAW** bundle. The binary attachment options
+above require `--no-redact`. Redacted mode omits opaque binary and plist data
+payloads; only the verified shipped Apple `bluetoothd` executable is retained. Keychain data and Bluetooth link keys are not copied.
 
 ## Build from source
 

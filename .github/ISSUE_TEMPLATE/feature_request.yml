@@ -12,6 +12,9 @@ body:
         This issue is public. Do not include serial numbers, unique MAC addresses, account details or unredacted diagnostic archives.
 
         Issue này công khai. Không đăng số sê-ri, địa chỉ MAC riêng của thiết bị, thông tin tài khoản hoặc gói log chưa ẩn thông tin cá nhân.
+        Collector redaction is automatic and best-effort. Review every file before sharing privately; it does not guarantee anonymity. `--no-redact` is PRIVATE RAW.
+
+        Công cụ tự ẩn dữ liệu theo best-effort. Kiểm tra từng tệp trước khi gửi riêng; không bảo đảm ẩn danh. `--no-redact` là PRIVATE RAW.
   - type: checkboxes
     id: checks
     attributes:
