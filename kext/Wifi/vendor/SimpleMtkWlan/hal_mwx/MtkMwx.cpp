@@ -642,6 +642,21 @@ struct mwx_softc {
 	volatile SInt32		sc_power_req;	/* bumped by every enable/disable */
 	volatile SInt32		sc_power_done;	/* last request the task served */
 	int			sc_power_result;
+	/* MtkWireless: system sleep (HIF suspend + WFDMA/IRQ quiesce + firmware
+	 * own), as mt7921_pci_suspend/resume. Served by sc_syspm_task. */
+	struct task		sc_syspm_task;
+	volatile SInt32		sc_syspm_req;
+	volatile SInt32		sc_syspm_done;
+	int			sc_syspm_want;	/* 1 suspend, 0 resume */
+	int			sc_syspm_result;
+	volatile int		sc_sys_suspended; /* WFDMA off, firmware owns */
+	uint32_t		sc_syspm_suspends;
+	uint32_t		sc_syspm_resumes;
+	uint32_t		sc_syspm_failures;
+	int			sc_syspm_last_error;
+	uint32_t		sc_syspm_last_step;
+	uint32_t		sc_syspm_dma_busy;	/* GLO_CFG busy bits at timeout */
+	uint32_t		sc_syspm_dma_reinit;	/* resumes that rebuilt rings */
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
@@ -974,6 +989,7 @@ void	mwx_reset(struct mwx_softc *);
 void	mwx_reset_timeo(void *);
 void	mwx_reset_task(void *);
 void	mwx_power_task(void *);
+void	mwx_syspm_task(void *);
 int	mwx_txwi_alloc(struct mwx_softc *, int);
 void	mwx_txwi_free(struct mwx_softc *);
 struct mwx_txwi	*mwx_txwi_get(struct mwx_softc *);
@@ -3008,6 +3024,7 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_edca_task, mwx_edca_task, sc, "mwx_edca");
 	task_set(&sc->sc_reset_task, mwx_reset_task, sc, "mwx_reset");
 	task_set(&sc->sc_power_task, mwx_power_task, sc, "mwx_power");
+	task_set(&sc->sc_syspm_task, mwx_syspm_task, sc, "mwx_syspm");
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
@@ -3163,6 +3180,188 @@ mwx_power_task(void *arg)
 		ifp->if_flags &= ~IFF_UP;
 	OSSynchronizeIO();
 	sc->sc_power_done = req;
+}
+
+/*
+ * MtkWireless: system sleep, after the power task stopped the interface.
+ * mt7921_pci_suspend: driver own, HIF suspend, deep sleep, WFDMA idle and
+ * disabled, host interrupts masked, firmware own. Resume reverses it; a
+ * firmware that lost its WFDMA context gets its rings rebuilt first
+ * (mwx_dma_reinit_cond). WoWLAN stays off. Boot-arg amtk_syspm=0 skips it.
+ */
+enum {
+	MWX_SYSPM_STEP_NONE = 0,
+	MWX_SYSPM_STEP_DRV_OWN = 1,
+	MWX_SYSPM_STEP_HIF = 2,
+	MWX_SYSPM_STEP_DMA_IDLE = 3,
+	MWX_SYSPM_STEP_FW_OWN = 4,
+	MWX_SYSPM_STEP_REINIT = 5,
+	MWX_SYSPM_STEP_DONE = 6,
+};
+
+static int
+mwx_mcu_set_hif_suspend(struct mwx_softc *sc, int suspend)
+{
+	struct {
+		struct {
+			uint8_t hif_type;	/* 2: PCIe */
+			uint8_t pad[3];
+		} __packed hdr;
+		struct {
+			uint16_t tag;		/* 0: UNI_HIF_CTRL_BASIC */
+			uint16_t len;
+			uint8_t suspend;
+			uint8_t pad[7];
+		} __packed hif_suspend;
+	} __packed req = {};
+
+	req.hdr.hif_type = 2;
+	req.hif_suspend.tag = htole16(0);
+	req.hif_suspend.len = htole16(sizeof(req.hif_suspend));
+	req.hif_suspend.suspend = suspend ? 1 : 0;
+	return mwx_mcu_send_wait(sc, MCU_UNI_CMD_HIF_CTRL, &req, sizeof(req));
+}
+
+static IOReturn
+mwx_syspm_quiesce_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	int rv;
+
+	/* The workloop gate excludes a queued RX/MCU interrupt callback. */
+	rv = mwx_poll(sc, MT_WFDMA0_GLO_CFG, 0,
+	    MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, 100);
+	if (rv != 0)
+		sc->sc_syspm_dma_busy = mwx_read(sc, MT_WFDMA0_GLO_CFG) &
+		    (MT_WFDMA0_GLO_CFG_TX_DMA_BUSY | MT_WFDMA0_GLO_CFG_RX_DMA_BUSY);
+	mwx_clear(sc, MT_WFDMA0_GLO_CFG,
+	    MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, 0);
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0);
+	mwx_barrier(sc);
+	return rv;
+}
+
+static IOReturn
+mwx_syspm_unquiesce_gated(OSObject *, void *arg, void *, void *, void *)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+
+	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0xff);
+	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, sc->sc_intr_mask);
+	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+	mwx_set(sc, MT_WFDMA0_GLO_CFG,
+	    MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+	mwx_barrier(sc);
+	return kIOReturnSuccess;
+}
+
+static int
+mwx_syspm_run_gated(struct mwx_softc *sc, IOWorkLoop::Action action)
+{
+	pci_intr_handle_t ih = (pci_intr_handle_t)sc->sc_ih;
+
+	if (!ih || !ih->workloop)
+		return ENXIO;
+	return ih->workloop->runAction(action, ih, sc) ==
+	    kIOReturnSuccess ? 0 : ETIMEDOUT;
+}
+
+static int
+mwx_sys_suspend(struct mwx_softc *sc)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	int rv;
+
+	if (!sc->sc_fw_loaded || sc->sc_sys_suspended || !sc->sc_memh)
+		return 0;
+	if (ifp->if_flags & IFF_RUNNING)
+		mwx_stop(ifp);
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DRV_OWN;
+	if ((rv = mwx_mcu_drv_pmctrl(sc)) != 0)
+		return rv;
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_HIF;
+	if ((rv = mwx_mcu_set_hif_suspend(sc, 1)) != 0) {
+		/* The firmware keeps running; wake re-initialises it anyway. */
+		MWX_DEV_LOG(sc, "syspm: HIF suspend failed error=%d\n", rv);
+		return rv;
+	}
+	/* Always deep sleep while suspended (no response is awaited; the
+	 * DMA idle poll below lets the command leave the ring). */
+	mwx_mcu_set_deep_sleep(sc, 1);
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DMA_IDLE;
+	sc->sc_sys_suspended = 1;
+	OSSynchronizeIO();
+	if (mwx_syspm_run_gated(sc, mwx_syspm_quiesce_gated) != 0)
+		MWX_DEV_LOG(sc, "syspm: WFDMA still busy=0x%x, disabled anyway\n",
+		    sc->sc_syspm_dma_busy);
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_FW_OWN;
+	if ((rv = mwx_mcu_fw_pmctrl(sc)) != 0) {
+		MWX_DEV_LOG(sc, "syspm: firmware own failed error=%d\n", rv);
+		return rv;
+	}
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DONE;
+	return 0;
+}
+
+static int
+mwx_sys_resume(struct mwx_softc *sc)
+{
+	int rv, rv2;
+
+	if (!sc->sc_sys_suspended)
+		return 0;
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DRV_OWN;
+	rv = mwx_mcu_drv_pmctrl(sc);
+	if (rv == 0) {
+		sc->sc_syspm_last_step = MWX_SYSPM_STEP_REINIT;
+		if (!(mwx_read(sc, MT_WFDMA_DUMMY_CR) & MT_WFDMA_NEED_REINIT))
+			sc->sc_syspm_dma_reinit++;
+		/* Rebuilds and re-enables rings + interrupts if lost. */
+		rv = mwx_dma_reinit_cond(sc);
+	}
+	/* Even after an error: the next init (or its firmware reload) must
+	 * not find WFDMA and host interrupts disabled. */
+	mwx_syspm_run_gated(sc, mwx_syspm_unquiesce_gated);
+	sc->sc_sys_suspended = 0;
+	OSSynchronizeIO();
+	if (rv != 0)
+		return rv;
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_HIF;
+	rv2 = mwx_mcu_set_hif_suspend(sc, 0);
+	if (rv2 != 0)
+		MWX_DEV_LOG(sc, "syspm: HIF resume failed error=%d\n", rv2);
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DONE;
+	return rv2;
+}
+
+void
+mwx_syspm_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	SInt32 req = sc->sc_syspm_req;
+	int rv;
+
+	OSSynchronizeIO();
+	if (sc->sc_detaching)
+		rv = ENXIO;
+	else if (sc->sc_syspm_want) {
+		rv = mwx_sys_suspend(sc);
+		sc->sc_syspm_suspends++;
+	} else {
+		rv = mwx_sys_resume(sc);
+		sc->sc_syspm_resumes++;
+	}
+	if (rv != 0) {
+		sc->sc_syspm_failures++;
+		sc->sc_syspm_last_error = rv;
+	}
+	MWX_DEV_LOG(sc, "syspm %s result=%d step=%u suspended=%d\n",
+	    sc->sc_syspm_want ? "suspend" : "resume", rv,
+	    sc->sc_syspm_last_step, sc->sc_sys_suspended);
+	sc->sc_syspm_result = rv;
+	OSSynchronizeIO();
+	sc->sc_syspm_done = req;
 }
 
 int
@@ -4576,6 +4775,8 @@ mwx_mcu_send_msg(struct mwx_softc *sc, uint32_t cmd, void *data, size_t len,
 {
 	struct mbuf *m;
 
+	if (sc->sc_sys_suspended && cmd != MCU_UNI_CMD_HIF_CTRL)
+		return EBUSY;
 	m = mwx_mcu_alloc_msg(len);
 	if (m == NULL)
 		return ENOMEM;
@@ -8868,6 +9069,60 @@ MtkMwx::waitPowerTransition()
 			return kIOReturnNotAttached;
 	}
 	return kIOReturnTimeout;
+}
+
+static bool
+mwx_syspm_enabled()
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		int value = 1;
+		PE_parse_boot_argn("amtk_syspm", &value, sizeof(value));
+		enabled = value != 0;
+	}
+	return enabled != 0;
+}
+
+IOReturn
+MtkMwx::systemPower(bool suspend)
+{
+	if (!com || com->sc_detaching || !com->sc_nswq)
+		return kIOReturnNotAttached;
+	if (!mwx_syspm_enabled())
+		return kIOReturnUnsupported;
+	if (!suspend && !com->sc_sys_suspended)
+		return kIOReturnSuccess;
+	com->sc_syspm_want = suspend ? 1 : 0;
+	OSSynchronizeIO();
+	SInt32 requested = OSIncrementAtomic(&com->sc_syspm_req) + 1;
+	task_add(com->sc_nswq, &com->sc_syspm_task);
+	/* HIF control waits up to the MCU timeout; keep this below the PM
+	 * acknowledgement budget requested by AirportMtkWlan. */
+	for (unsigned i = 0; i < 300; i++) {
+		OSSynchronizeIO();
+		if (com->sc_syspm_done == requested)
+			return com->sc_syspm_result ? kIOReturnIOError : kIOReturnSuccess;
+		mwxSleepNsec(com, 0, "mwx-syspm", MSEC_TO_NSEC(10));
+		if (com->sc_detaching)
+			return kIOReturnNotAttached;
+	}
+	return kIOReturnTimeout;
+}
+
+void
+MtkMwx::systemPowerStats(uint32_t out[8])
+{
+	memset(out, 0, sizeof(uint32_t) * 8);
+	if (!com)
+		return;
+	out[0] = com->sc_syspm_suspends;
+	out[1] = com->sc_syspm_resumes;
+	out[2] = com->sc_syspm_failures;
+	out[3] = (uint32_t)com->sc_syspm_last_error;
+	out[4] = com->sc_syspm_last_step;
+	out[5] = com->sc_syspm_dma_busy;
+	out[6] = com->sc_syspm_dma_reinit;
+	out[7] = (uint32_t)com->sc_sys_suspended;
 }
 
 const char *

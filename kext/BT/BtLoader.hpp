@@ -40,6 +40,8 @@ private:
     IOUSBHostDevice *m_device {nullptr};
     USBDeviceController *m_usb {nullptr};
     thread_call_t m_openWatchdog {nullptr};
+    volatile bool m_sleeping {false};
+    volatile bool m_watchdogDeferred {false};
 };
 
 #endif /* MtkWirelessBT_BtLoader_hpp */

@@ -226,6 +226,7 @@ public:
     virtual IOReturn setWakeOnMagicPacket( bool active ) override;
     void setPowerStateOff(void);
     void setPowerStateOn(void);
+    void publishSystemPowerStats(MtkMwx *hal);
     void unregistPM();
     bool initPCIPowerManagment(IOPCIDevice *provider);
 

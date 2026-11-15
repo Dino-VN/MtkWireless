@@ -57,6 +57,10 @@ public:
     int mwxSleepNsec(void *ident, int priority, const char *wmesg, uint64_t timo);
     void mwxWakeup(void *ident);
     IOReturn waitPowerTransition();
+    // System sleep: HIF suspend + WFDMA/IRQ quiesce + firmware own (true),
+    // or its reverse (false). Call with the interface already stopped.
+    IOReturn systemPower(bool suspend);
+    void systemPowerStats(uint32_t out[8]);
 
     // Called on the driver's main workloop. RX callback borrows the frame;
     // awdlTransmit always consumes its mbuf, including on error.

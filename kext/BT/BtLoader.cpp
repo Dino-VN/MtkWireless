@@ -259,8 +259,25 @@ void MtkWirelessBTLoader::releaseUsbSession()
         m_device->close(this);
 }
 
-IOReturn MtkWirelessBTLoader::setPowerState(unsigned long, IOService *)
+// System sleep: a USB reset now would race the host controller's own
+// suspend (2026-11-15: a re-enumeration put PTXH into a reset loop). Defer a
+// pending open watchdog until wake; the 20 s wait then starts again.
+IOReturn MtkWirelessBTLoader::setPowerState(unsigned long state, IOService *)
 {
+    if (state == 0) {
+        m_sleeping = true;
+        if (m_openWatchdog && thread_call_cancel(m_openWatchdog)) {
+            m_watchdogDeferred = true;
+            super::release();
+            BTLog("sleep: open watchdog deferred\n");
+        }
+    } else if (m_sleeping) {
+        m_sleeping = false;
+        if (m_watchdogDeferred) {
+            m_watchdogDeferred = false;
+            armOpenWatchdog();
+        }
+    }
     return IOPMAckImplied;
 }
 
@@ -354,7 +371,10 @@ void MtkWirelessBTLoader::openWatchdogFired(thread_call_param_t param, thread_ca
     // Retained parent: stop()/detach may run concurrently.
     IORegistryEntry *parent = self->copyParentEntry(gIOServicePlane);
     auto *device = OSDynamicCast(IOUSBHostDevice, parent);
-    if (device && !self->isInactive() && !device->isInactive() && !hciInterfaceOpen(device)) {
+    if (self->m_sleeping) {
+        self->m_watchdogDeferred = true;
+        BTLog("open watchdog fired during sleep, deferred\n");
+    } else if (device && !self->isInactive() && !device->isInactive() && !hciInterfaceOpen(device)) {
         const uint64_t now = uptimeSeconds();
         if (now - gWatchdogWindowStart > kWatchdogWindowSec) {
             gWatchdogWindowStart = now;

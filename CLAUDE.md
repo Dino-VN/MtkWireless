@@ -119,6 +119,25 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   exact length and keeps every AWDL/IPv6 check; it never scans for an inner
   SNAP. Before this fix iOS 27 to Mac stalled after QUIC HELLO.
 
+## System sleep (unverified on hardware)
+
+- `AirportMtkWlan::setPowerStateOff` stops the HAL, then `MtkMwx::systemPower(true)`
+  runs `mt7921_pci_suspend`'s sequence on the task queue: driver own, HIF
+  suspend (`MCU_UNI_CMD_HIF_CTRL`, PCIe, tag 0), deep sleep, WFDMA idle poll
+  and TX/RX DMA off plus host/PCIe interrupt masks under the workloop gate,
+  firmware own. `sc_sys_suspended` then refuses every MCU message except
+  HIF control. Wake reverses it before the HAL start (driver own,
+  `mwx_dma_reinit_cond`, interrupts + DMA on, HIF resume), also when Wi-Fi
+  stays off. PM budget 10 s each way. ioreg `MTKSleepSuspendStatus`,
+  `MTKWakeResumeStatus`, `MTKSysPM*`. Boot-arg `amtk_syspm=0` off. WoWLAN
+  stays unsupported.
+- BT loader defers its open watchdog while the system sleeps (a USB reset
+  during the host controller's suspend is unsafe; 2026-11-15 a user-space
+  re-enumeration put PTXH into a reset loop until reboot).
+- ASRock B450M-HDV (2026-11-15): every S3 woke ~1 s later with reason
+  `GPP0..GP11` (shared PCIe GPE 0x08), 112 dark wakes in 2 h. Not our
+  hardware: fixed in OpenCore with SSDT-GPRW (GPE 0x08 only; USB 0x19 kept).
+
 ## Wi-Fi roaming (docs/ROAMING.md, unverified on hardware)
 
 - Join LinkStatus up (first beacon) is posted only once `ic_state == RUN`:

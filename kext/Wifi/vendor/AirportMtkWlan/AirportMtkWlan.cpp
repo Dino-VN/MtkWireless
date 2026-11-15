@@ -1320,7 +1320,8 @@ IOReturn AirportMtkWlan::setPowerState(unsigned long powerStateOrdinal, IOServic
                 retain();
                 if (thread_call_enter(powerOffThreadCall))
                     release();
-                result = 5000000;
+                // HAL stop (<= 4 s) + system suspend (<= 3 s).
+                result = 10000000;
             }
             break;
         case kPowerStateOn:
@@ -1328,7 +1329,8 @@ IOReturn AirportMtkWlan::setPowerState(unsigned long powerStateOrdinal, IOServic
                 retain();
                 if (thread_call_enter(powerOnThreadCall))
                     release();
-                result = 5000000;
+                // System resume (<= 3 s) + HAL start (<= 4 s).
+                result = 10000000;
             }
             break;
 
@@ -1411,14 +1413,42 @@ void AirportMtkWlan::setPowerStateOff()
         IOReturn status = hal->waitPowerTransition();
         setProperty("MTKSleepStopStatus", static_cast<uint64_t>(status), 32);
         IOLog("AirportMtkWlan: sleep HAL stop status=0x%x\n", status);
+        // MtkWireless: quiesce WFDMA/interrupts and hand the chip to the
+        // firmware only after the stop finished (mt7921_pci_suspend).
+        if (status == kIOReturnSuccess) {
+            status = hal->systemPower(true);
+            setProperty("MTKSleepSuspendStatus", static_cast<uint64_t>(status), 32);
+            IOLog("AirportMtkWlan: sleep HAL suspend status=0x%x\n", status);
+        }
+        publishSystemPowerStats(hal);
     }
     pmPolicyMaker->acknowledgeSetPowerState();
+}
+
+void AirportMtkWlan::publishSystemPowerStats(MtkMwx *hal)
+{
+    uint32_t stats[8];
+    hal->systemPowerStats(stats);
+    static const char *const keys[8] = {
+        "MTKSysPMSuspends", "MTKSysPMResumes", "MTKSysPMFailures",
+        "MTKSysPMLastError", "MTKSysPMLastStep", "MTKSysPMDmaBusy",
+        "MTKSysPMDmaReinit", "MTKSysPMSuspended",
+    };
+    for (unsigned i = 0; i < 8; i++)
+        setProperty(keys[i], static_cast<uint64_t>(stats[i]), 32);
 }
 
 void AirportMtkWlan::setPowerStateOn()
 {
     XYLog("%s\n", __FUNCTION__);
     pmPowerState = kPowerStateOn;
+    if (auto *hal = OSDynamicCast(MtkMwx, fHalService)) {
+        // Undo the system suspend even when Wi-Fi stays off.
+        IOReturn status = hal->systemPower(false);
+        setProperty("MTKWakeResumeStatus", static_cast<uint64_t>(status), 32);
+        IOLog("AirportMtkWlan: wake HAL resume status=0x%x\n", status);
+        publishSystemPowerStats(hal);
+    }
     if (power_state && bsdInterface && fHalService) {
         IOReturn status = enableAdapter(bsdInterface);
         if (status == kIOReturnSuccess) {
