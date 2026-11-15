@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation and documentation / Cài đặt và tài liệu
+    url: https://github.com/Dino-VN/MtkWireless#install
+    about: Installation, updates and troubleshooting; Vietnamese README linked at the top / Cài đặt, cập nhật và xử lý lỗi; có bản tiếng Việt.
+  - name: Known limitations / Giới hạn đã biết
+    url: https://github.com/Dino-VN/MtkWireless#what-works
+    about: Check tested hardware, macOS builds and experimental features / Xem phần cứng, build macOS đã thử và tính năng thử nghiệm.
+  - name: Diagnostic collection and privacy / Thu thập log và quyền riêng tư
+    url: https://github.com/Dino-VN/MtkWireless#reporting-a-problem
+    about: Collect logs locally and redact personal information before posting / Thu thập log cục bộ và ẩn thông tin cá nhân trước khi đăng.

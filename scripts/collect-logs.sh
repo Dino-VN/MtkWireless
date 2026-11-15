@@ -9,6 +9,7 @@ export LC_ALL=C
 
 LAST=5m
 ARCHIVE=0
+REDACT=1
 VERBOSE=0
 INCLUDE_HCI=0
 INCLUDE_KEXTS=0
@@ -31,6 +32,8 @@ STARTED=$(/bin/date '+%Y-%m-%d %H:%M:%S%z')
 usage() {
     printf '%s\n' \
         'Usage: collect-logs.sh [--last 5m] [--verbose] [--logarchive] [--output DIR] [--notes TEXT]' \
+        '  --no-redact        PRIVATE raw bundle; disables automatic privacy redaction.' \
+        '  Binary archive/HCI/kext options require --no-redact.' \
         '  --last WINDOW      Recent logs: 1m through 7d (default 5m).' \
         '  --verbose          Include info/debug messages and extra log categories.' \
         '  --logarchive       Native archive: 64 MB log-data budget; symbols can add size.' \
@@ -53,6 +56,7 @@ while [ $# -gt 0 ]; do
                 --notes) NOTES=$2 ;;
             esac
             shift 2 ;;
+        --no-redact) REDACT=0; shift ;;
         --verbose) VERBOSE=1; shift ;;
         --logarchive) ARCHIVE=1; shift ;;
         --no-logarchive) ARCHIVE=0; shift ;;
@@ -62,6 +66,10 @@ while [ $# -gt 0 ]; do
         *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
+if [ "$REDACT" -eq 1 ] && [ "$((ARCHIVE + INCLUDE_HCI + INCLUDE_KEXTS))" -ne 0 ]; then
+    printf 'Binary attachments require --no-redact (PRIVATE raw mode).\n' >&2
+    exit 2
+fi
 if [[ ! "$LAST" =~ ^([1-9][0-9]{0,4})(m|h|d)$ ]]; then
     usage >&2; exit 2
 fi
@@ -99,6 +107,7 @@ OUT=$(/usr/bin/mktemp -d "$OUTPUT_BASE/MtkWireless-Logs-$(/bin/date +%Y%m%d-%H%M
 OUT=$(cd "$OUT" && pwd -P) || exit 1
 ZIP_FILE="$OUT.zip"
 /bin/mkdir -p "$OUT"/{system,hardware,ioreg,network,services,preferences,logs,bluetooth,crashes,kexts,efi} || exit 1
+printf 'PRIVATE staging: collection/redaction may be incomplete. Do not share.\n' > "$OUT/PRIVATE-STAGING.txt"
 printf 'started\tseconds\texit_status\toutput\tcommand\n' > "$OUT/commands.tsv"
 
 info() {
@@ -273,7 +282,12 @@ log_show() {
 }
 
 info "Output: $OUT"
-info 'This bundle contains SSIDs, MAC/IP addresses, serial numbers, device names and private logs. Share only with someone you trust.'
+if [ "$REDACT" -eq 1 ]; then
+    info 'Automatic redaction is best-effort. Review all files before sharing; arbitrary private text may remain.'
+else
+    info 'PRIVATE RAW MODE: identifiers and private activity are not redacted. Do not post publicly.'
+    printf 'PRIVATE RAW: no automatic redaction.\n' > "$OUT/PRIVATE-RAW.txt"
+fi
 info 'Read-only: no daemon restarts, no Wi-Fi/BT/AWDL changes, no EFI mounts, no uploads.'
 info 'Run this right after a failure. If the problem is still occurring, keep the current state during collection.'
 info "Focused mode: $LAST of recent logs; 1 MiB output / 16 MiB input / 30 seconds per text sample."
@@ -309,6 +323,9 @@ snapshot before
 
 info '[2/8] macOS, card hardware, USB/PCI and power state'
 capture system/sw-vers.txt 15 /usr/bin/sw_vers
+for key in ComputerName LocalHostName HostName; do
+    capture "system/$key.txt" 15 /usr/sbin/scutil --get "$key"
+done
 capture system/uname.txt 15 /usr/bin/uname -a
 capture system/uptime.txt 15 /usr/bin/uptime
 capture system/sysctl.txt 20 /usr/sbin/sysctl kern.osversion kern.version kern.boottime kern.bootargs hw.model hw.machine hw.memsize machdep.cpu.brand_string
@@ -424,7 +441,11 @@ for key in ActivityAdvertisingAllowed ActivityReceivingAllowed; do
 done
 
 info '[5/8] bluetoothd binary, recent crash/panic reports and existing HCI/Lilu logs'
-if [ -f /usr/sbin/bluetoothd ]; then
+# Only Apple's valid signed, root-owned, non-writable shipped executable is exempt.
+if [ -f /usr/sbin/bluetoothd ] && [ ! -L /usr/sbin/bluetoothd ] &&
+    [ "$(/usr/bin/stat -f '%u' /usr/sbin/bluetoothd)" = 0 ] &&
+    [ "$(/usr/bin/stat -f '%Sp' /usr/sbin/bluetoothd)" = -rwxr-xr-x ] &&
+    /usr/bin/codesign --verify --strict -R 'anchor apple' /usr/sbin/bluetoothd 2>/dev/null; then
     capture bluetooth/copy-binary.txt 30 /bin/cp /usr/sbin/bluetoothd "$OUT/bluetooth/bluetoothd"
     capture bluetooth/binary-sha256.txt 30 /usr/bin/shasum -a 256 /usr/sbin/bluetoothd
     capture bluetooth/binary-file.txt 15 /usr/bin/file /usr/sbin/bluetoothd
@@ -538,23 +559,128 @@ snapshot after
     printf 'Share privately with a trusted debugger; this script never uploads anything.\n'
 } > "$OUT/README.txt"
 
-info '[8/8] ZIP on Desktop / selected output directory'
-# Reserve a new file; never overwrite an existing archive.
-if ! (set -o noclobber; : > "$ZIP_FILE") 2>/dev/null; then
-    info "ERROR: Archive already exists. Uncompressed files: $OUT"; exit 1
+# No collection or path-bearing writes are allowed after this point.
+if [ "$REDACT" -eq 1 ]; then
+    info 'Redacting bundle before packaging (best-effort; review required).'
+    /usr/bin/xattr -cr "$OUT" >/dev/null 2>&1 || {
+        printf 'ERROR: metadata cleanup failed; no ZIP created.\n' >&2; exit 1
+    }
+    # Convert binary property lists, including .spx/crash files, before text filtering.
+    while IFS= read -r -d '' candidate; do
+        if [ "$(/usr/bin/head -c 8 "$candidate")" = bplist00 ]; then
+            /usr/bin/plutil -convert xml1 "$candidate" >/dev/null 2>&1 || {
+                printf 'ERROR: plist conversion failed; no ZIP created. Private staging retained.\n' >&2
+                exit 1
+            }
+        fi
+    done < <(/usr/bin/find "$OUT" -type f -print0)
+    if ! MTK_REDACT_HOME="$OWNER_HOME" MTK_REDACT_USER="$OWNER_USER" /usr/bin/perl - "$OUT" <<'MTK_REDACTOR'
+use strict;
+use warnings;
+use File::Find;
+my $root = shift @ARGV;
+my (%ids, @files);
+my $next = 0;
+sub token { my ($v) = @_; return $ids{lc $v} ||= sprintf('REDACTED_%06d', ++$next); }
+sub remember {
+    my ($v) = @_;
+    return unless defined($v) && length($v) > 1;
+    my $plain = $v;
+    $plain =~ s/&quot;/"/g; $plain =~ s/&apos;/'/g;
+    $plain =~ s/&lt;/</g; $plain =~ s/&gt;/>/g; $plain =~ s/&amp;/&/g;
+    my $t = token($plain); $ids{lc $v} = $t;
+    my $xml = $plain; $xml =~ s/&/&amp;/g; $xml =~ s/</&lt;/g;
+    $xml =~ s/>/&gt;/g; $ids{lc $xml} = $t;
+}
+remember($ENV{MTK_REDACT_HOME}); remember($ENV{MTK_REDACT_USER}); remember($root);
+find({no_chdir => 1, wanted => sub {
+    die "symlink in staging\n" if -l $_;
+    push @files, $File::Find::name if -f $_;
+}}, $root);
+my %data;
+for my $p (sort @files) {
+    next if $p eq "$root/bluetooth/bluetoothd";
+    open my $f, '<:raw', $p or die "read failed\n";
+    local $/; my $s = <$f>; close $f or die "close failed\n";
+    # NUL lists are text records; all other opaque data is omitted, never guessed.
+    if ($p !~ /\.nul$/ && $s =~ /[\x00-\x08\x0b\x0c\x0e-\x1f]/) {
+        $s = "[collector] Opaque binary omitted in redacted mode.\n";
+    }
+    # Plist data blobs can encode MACs, UUIDs or arbitrary private bytes. They
+    # cannot be safely treated as text; omit payload while retaining valid XML.
+    $s =~ s{(<data>)[^<]*(</data>)}{$1$2}g;
+    $data{$p} = $s;
+    if ($p =~ m{/system/(?:ComputerName|LocalHostName|HostName)\.txt$}) {
+        my $v = $s; $v =~ s/\s+$//; remember($v);
+    }
+    # Snapshot schema keys (not generic 'name': that would erase chip/model names).
+    my $key = qr/(?:SSID|SSID_STR|computer_name|local_host_name|user_name|machine_name|serial_number|ComputerName|LocalHostName|HostName|DeviceName|UserName|SerialNumber|IOPlatformSerialNumber|IOPlatformUUID|SystemSerialNumber|account|account_id|AccountID|AppleID|email|email_address|UniqueDeviceID|device_name|bluetooth_name|device_title)/i;
+    while ($s =~ /<key>($key)<\/key>\s*<string>([^<]+)<\/string>/g) { remember($2); }
+    while ($s =~ /"($key)"\s*:\s*"((?:\\.|[^"\\])*)"/g) { remember($2); }
+    while ($s =~ /(?:SSID|Computer Name|HostName|Device Name|Serial Number|UserName)\s*[:=]\s*([^\r\n]+)/gi) { remember($1); }
+}
+my @known = sort {length($b) <=> length($a)} keys %ids;
+sub scrub {
+    my ($s) = @_;
+    # Literal replacement preserves XML/JSON delimiters and NUL record structure.
+    for my $v (@known) { $s =~ s/\Q$v\E/$ids{$v}/gi; }
+    $s =~ s{(?:/Users/|/home/)[^/\s<>"'\\]+}{token($&)}ge;
+    $s =~ s{\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b}{token($&)}gei;
+    $s =~ s{\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b}{token($&)}gei;
+    $s =~ s{\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b}{token($&)}ge;
+    # Require either :: or at least 7 colons; timestamps are not IPv6.
+    $s =~ s{(?<![\w:])(?:[0-9a-f]{0,4}:){2,}[0-9a-f:.]*(?:%[\w.-]+)?}{my $v=$&; ($v =~ /::/ || $v =~ tr/:/:/ >= 7) ? token($v) : $v}gei;
+    $s =~ s{[\w.!+%-]+\@[\w.-]+\.[a-z]{2,}}{token($&)}gei;
+    return $s;
+}
+for my $p (sort keys %data) {
+    open my $f, '>:raw', $p or die "write failed\n";
+    my $s = $data{$p};
+    # Keep XML syntax (including DTD URLs) intact even when a discovered name
+    # happens to equal an XML tag or attribute. Only character data is private.
+    if ($s =~ /^\s*<\?xml/ || $s =~ /^\s*<plist[ >]/) {
+        my @parts = split /(<[^>]*>)/, $s;
+        for (my $i = 0; $i < @parts; $i += 2) { $parts[$i] = scrub($parts[$i]); }
+        $s = join '', @parts;
+    } else { $s = scrub($s); }
+    print {$f} $s or die "write failed\n";
+    close $f or die "close failed\n";
+}
+# Rename bottom-up, including hidden entries; strip extended metadata by rewriting
+# contents above and removing xattrs before packaging at the shell layer.
+my @paths;
+find({no_chdir => 1, wanted => sub {push @paths, $File::Find::name unless $File::Find::name eq $root}}, $root);
+for my $p (sort {length($b) <=> length($a)} @paths) {
+    my ($dir, $name) = $p =~ m{^(.*)/([^/]+)$};
+    my $safe = scrub($name);
+    next if $safe eq $name;
+    die "filename collision\n" if -e "$dir/$safe";
+    rename $p, "$dir/$safe" or die "rename failed\n";
+}
+
+MTK_REDACTOR
+    then
+        printf 'ERROR: redaction failed; no ZIP created. Staging is private and may contain raw data.\n' >&2
+        exit 1
+    fi
+    /bin/rm -f "$OUT/PRIVATE-STAGING.txt" || exit 1
+    printf 'Best-effort automatic redaction applied. Review before sharing; arbitrary private text may remain.\n' > "$OUT/PRIVACY.txt" || exit 1
 fi
-capture zip-result.txt 300 /usr/bin/ditto -c -k --keepParent "$OUT" "$ZIP_FILE"
-# A ZIP header alone is not success: test the whole archive before announcing it.
-capture zip-check.txt 180 /usr/bin/unzip -tq "$ZIP_FILE"
-zip_status=$(/usr/bin/awk -F '\t' '$4 == "zip-result.txt" { print $3 }' "$OUT/commands.tsv")
-check_status=$(/usr/bin/awk -F '\t' '$4 == "zip-check.txt" { print $3 }' "$OUT/commands.tsv")
-if [ "$zip_status" != 0 ] || [ "$check_status" != 0 ]; then
-    info "ERROR: ZIP failed or is incomplete. Keep the original folder: $OUT"; exit 1
+# Packaging diagnostics stay outside the bundle. Never feed ZIP stdout (absolute
+# paths) or command arguments back into sanitized files. No resource forks/xattrs.
+if ! (set -o noclobber; : > "$ZIP_FILE") 2>/dev/null; then
+    printf 'ERROR: Archive already exists.\n' >&2; exit 1
+fi
+/usr/bin/ditto -c -k --norsrc --noextattr --keepParent "$OUT" "$ZIP_FILE" >/dev/null 2>&1
+zip_status=$?
+/usr/bin/unzip -tq "$ZIP_FILE" >/dev/null 2>&1
+check_status=$?
+printf 'packaging\t0\t%s\tzip-result.txt\tditto\npackaging\t0\t%s\tzip-check.txt\tunzip\n' "$zip_status" "$check_status" >> "$OUT/commands.tsv"
+if [ "$zip_status" -ne 0 ] || [ "$check_status" -ne 0 ]; then
+    /bin/rm -f "$ZIP_FILE"
+    printf 'ERROR: ZIP failed or is incomplete; private folder retained.\n'; exit 1
 fi
 /bin/chmod 600 "$ZIP_FILE" || exit 1
 permissions
-info "Done. Send this ZIP for debugging: $ZIP_FILE"
-info 'The uncompressed folder is kept. Do not post the bundle publicly.'
-if [ "$EUID" -ne 0 ] && [ -t 1 ]; then
-    /usr/bin/open -R "$ZIP_FILE" 2>/dev/null || true
-fi
+printf 'Done. Send this ZIP for debugging: %s\n' "$ZIP_FILE"
+printf 'Review before sharing. The uncompressed folder is kept private.\n'

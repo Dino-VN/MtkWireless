@@ -30,6 +30,9 @@ for arguments in (
 ):
     result = subprocess.run(["/bin/bash", str(COLLECTOR), *arguments], capture_output=True, text=True)
     assert result.returncode == 2 and "Usage:" in result.stderr, (arguments, result)
+for option in ("--logarchive", "--include-hci", "--include-kexts"):
+    result = subprocess.run(["/bin/bash", str(COLLECTOR), option], capture_output=True)
+    assert result.returncode == 2 and b"--no-redact" in result.stderr
 for option in ("--last", "--output", "--notes", "--unknown"):
     result = subprocess.run(["/bin/bash", str(COLLECTOR), option], capture_output=True, text=True)
     assert result.returncode == 2, (option, result)
@@ -68,7 +71,7 @@ elif name == "stat":
         metadata = Path(args[-1]).stat()
         print(int(metadata.st_mtime), metadata.st_size)
     else:
-        print("tester")
+        print("0" if args[1] == "%u" else "-rwxr-xr-x" if args[1] == "%Sp" else "tester")
 elif name == "chown":
     pass  # Fixtures already belong to the real unprivileged test runner.
 elif name == "sudo":
@@ -80,6 +83,9 @@ elif name == "sudo":
 elif name == "ioreg":
     selector = args[args.index("-c") + 1] if "-c" in args else "IOResources"
     sys.stdout.buffer.write(plistlib.dumps([{"class": selector, "RustSelfTestFailed": 0,
+        "SSID": "SecretNetwork", "ComputerName": "PrivateComputer",
+        "IOPlatformSerialNumber": "PRIVATE_SERIAL_42", "email": "tester@example.com",
+        "Address": "aa:bb:cc:dd:ee:ff", "IP": "192.168.22.42", "IPv6": "fe80::1234:5678",
         "MTKAWDLInfraPSSleeps": 3, "BluetoothdVerifyHookState": 1}]))
 elif name == "system_profiler":
     if "-xml" in args:
@@ -114,7 +120,7 @@ elif name == "log":
         archive.mkdir(mode=0o700)
         (archive / "Info.plist").write_bytes(plistlib.dumps({"fixture": True}))
         (archive / "mock.tracev3").write_bytes(b"MOCK LOG ARCHIVE DATA")
-    print("mock persisted log event")
+    print("SecretNetwork PrivateComputer PRIVATE_SERIAL_42 tester@example.com aa:bb:cc:dd:ee:ff 192.168.22.42 fe80::1234:5678")
 elif name == "ditto":
     if "-c" in args and os.environ.get("MOCK_ZIP_FAIL"):
         print("simulated ZIP failure", file=sys.stderr)
@@ -156,6 +162,7 @@ def fixture(base):
             path.mkdir(parents=True)
     (base / "bluetoothd-fixture").write_bytes(b"MOCK bluetoothd binary\x00\x01\xff")
     (base / "system-crashes/bluetoothd-test report.ips").write_text("MOCK crash report")
+    (base / "system-crashes/bluetoothd-binary.ips").write_bytes(plistlib.dumps({"SSID": "SecretNetwork"}, fmt=plistlib.FMT_BINARY))
     (base / "root-hci/trace with spaces.pklg").write_bytes(b"MOCK HCI TRACE")
     (base / "system-logs/Lilu_test.txt").write_text("MOCK Lilu load log")
     for suffix in ("Library/Logs/DiagnosticReports", "Library/Logs/Bluetooth", "Desktop"):
@@ -202,6 +209,8 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
         home, script, env = fixture(base)
         if switches:
             env.update(switches)
+        if env.get("MOCK_REDACT_FAIL"):
+            script.write_text(script.read_text().replace('/usr/bin/perl -', '/usr/bin/false -'))
         if timeout_tool:
             text = script.read_text().replace("capture hardware/wifi.txt 75", "capture hardware/wifi.txt 1")
             script.write_text(text)
@@ -233,6 +242,12 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
                 assert args[0] in ("showloaded", "inspect", "dumpstate", "path-for-identifier", "log"), call
             if name == "log":
                 assert args[0] in ("show", "collect"), call
+        if env.get("MOCK_REDACT_FAIL"):
+            assert result.returncode == 1 and "redaction failed" in result.stderr, result
+            assert not archive.exists()
+            assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+            print("PASS:", label)
+            return
         if env.get("MOCK_ZIP_FAIL") or env.get("MOCK_ZIP_CORRUPT"):
             assert result.returncode == 1 and "ERROR: ZIP" in result.stdout, result
             assert "Done. Send this ZIP" not in result.stdout
@@ -255,12 +270,17 @@ def run_case(label, options=(), switches=None, via_command=False, timeout_tool=F
                 assert any(name.endswith("trace with spaces.pklg") for name in names) == ("--include-hci" in options)
                 assert any(name.endswith("bluetoothd-test report.ips") for name in names)
                 assert any(name.endswith("Lilu_test.txt") for name in names)
+                crash = next(name for name in names if name.endswith("bluetoothd-binary.ips"))
+                assert plistlib.loads(zipped.read(crash))["SSID"] != "SecretNetwork" or "--no-redact" in options
                 assert any(name.endswith("MtkWirelessWifi.kext/Contents/Info.plist") for name in names) == ("--include-kexts" in options)
                 assert any(name.endswith("efi-1-Kernel.plist") for name in names)
                 assert not any(name.endswith("config.plist") for name in names)
                 for name in names:
                     if not name.endswith("/"):
                         data = zipped.read(name)
+                        if "--no-redact" not in options and not name.endswith("bluetooth/bluetoothd"):
+                            for private in (b"SecretNetwork", b"PrivateComputer", b"PRIVATE_SERIAL_42", b"tester@example.com", b"aa:bb:cc:dd:ee:ff", b"192.168.22.42", b"fe80::1234:5678", os.fsencode(home)):
+                                assert private not in data, (name, private)
                         assert b"DO_NOT_EXPORT_CONFIG_ID" not in data and b"DO_NOT_EXPORT_NVRAM_SECRET" not in data, name
                 has_archive = any("system.logarchive/" in name for name in names)
                 assert has_archive == ("--logarchive" in options and not env.get("MOCK_DENIED"))
@@ -472,14 +492,45 @@ log_show logs/sample.log 5m 'process == "bluetoothd"'
     print("PASS: native repeat summaries, output/input caps, enormous lines, producer reaping and exhausted-budget skips")
 
 
+def privacy_tests():
+    redactor = SOURCE.split("<<'MTK_REDACTOR'\n", 1)[1].split("\nMTK_REDACTOR", 1)[0]
+    with tempfile.TemporaryDirectory(prefix="mtk-redact-") as temporary:
+        root = Path(temporary)
+        secret = "Private Network & Friends"
+        xml_secret = "Private Network &amp; Friends"
+        (root / "snapshot.spx").write_bytes(plistlib.dumps({"SSID": secret, "IOPlatformSerialNumber": "SERIAL_PRIVATE", "chip": "MT7922", "counter": 42, "blob": b"PRIVATE_BLOB"}))
+        (root / ".SERIAL_PRIVATE.json").write_text(json.dumps({"SSID": secret, "repeat": secret, "date": "2026-11-16 12:34:56", "chip": "MT7922"}))
+        (root / "list.nul").write_bytes(b"/Users/alice/SERIAL_PRIVATE\0fe80::1234\0")
+        (root / "log.txt").write_text("SERIAL_PRIVATE " + secret + " " + xml_secret)
+        (root / "opaque.ips").write_bytes(b"binary\x00SERIAL_PRIVATE")
+        env = dict(os.environ, MTK_REDACT_HOME="/Users/alice", MTK_REDACT_USER="alice")
+        result = subprocess.run(["/usr/bin/perl", "-", str(root)], input=redactor, text=True, capture_output=True, env=env)
+        assert result.returncode == 0, result.stderr
+        snapshot = plistlib.loads((root / "snapshot.spx").read_bytes())
+        hidden = next(root.glob(".*.json"))
+        obj = json.loads(hidden.read_text())
+        assert obj["SSID"] == obj["repeat"] == snapshot["SSID"]
+        assert snapshot["blob"] == b""
+        assert obj["date"] == "2026-11-16 12:34:56" and snapshot["counter"] == 42
+        assert obj["chip"] == snapshot["chip"] == "MT7922"
+        assert (root / "list.nul").read_bytes().count(b"\0") == 2
+        for path in root.iterdir():
+            assert b"SERIAL_PRIVATE" not in path.read_bytes() and "SERIAL_PRIVATE" not in path.name
+            assert secret.encode() not in path.read_bytes()
+    print("PASS: structured XML/JSON, cross-file pseudonyms, hidden filenames, NUL lists, binary omission and timestamps/chip/counters")
+
+
 if __name__ == "__main__":
+    privacy_tests()
+
     cases = [
+        ("privacy-failure", "redaction failure creates no ZIP and keeps staging private", {"switches": {"MOCK_REDACT_FAIL": "1"}}),
         ("full", "sudo/bash -c, invoking user's Desktop, full bundle, native ZIP, private mode and EFI filtering",
          {"options": ("--notes", "AirDrop Mac to iPhone stalls"), "via_command": True}),
         ("reduced", "declined sudo, custom time window, no-logarchive and valid reduced bundle",
          {"options": ("--last", "7d", "--no-logarchive"), "switches": {"MOCK_EUID": "1000", "MOCK_DENIED": "1"}}),
         ("attachments", "archives, HCI traces, debug levels and kext copies are explicitly opt-in",
-         {"options": ("--verbose", "--logarchive", "--include-hci", "--include-kexts")}),
+         {"options": ("--no-redact", "--verbose", "--logarchive", "--include-hci", "--include-kexts")}),
         ("flood", "a flooded Bluetooth log is capped and the ZIP still completes", {"switches": {"MOCK_FLOOD": "1"}}),
         ("stream", "native stream limits", {}),
         ("copies", "native file-copy limits", {}),

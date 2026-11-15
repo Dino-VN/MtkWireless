@@ -1,0 +1,67 @@
+name: Feature request / Đề xuất tính năng
+description: Suggest a feature, hardware support or an improvement / Đề xuất tính năng, hỗ trợ phần cứng hoặc cải tiến.
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [supported features and limitations](https://github.com/Dino-VN/MtkWireless#what-works) and existing issues first. If an existing feature is broken, use the bug report form instead and include the exact macOS build and kext version.
+
+        Hãy xem [tính năng và giới hạn](https://github.com/Dino-VN/MtkWireless/blob/main/README.vi.md#những-gì-hoạt-động) cùng các issue hiện có trước. Nếu tính năng đã có bị lỗi, hãy dùng form báo lỗi và ghi đúng build macOS, phiên bản kext.
+
+        This issue is public. Do not include serial numbers, unique MAC addresses, account details or unredacted diagnostic archives.
+
+        Issue này công khai. Không đăng số sê-ri, địa chỉ MAC riêng của thiết bị, thông tin tài khoản hoặc gói log chưa ẩn thông tin cá nhân.
+        Collector redaction is automatic and best-effort. Review every file before sharing privately; it does not guarantee anonymity. `--no-redact` is PRIVATE RAW.
+
+        Công cụ tự ẩn dữ liệu theo best-effort. Kiểm tra từng tệp trước khi gửi riêng; không bảo đảm ẩn danh. `--no-redact` là PRIVATE RAW.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting / Trước khi gửi
+      options:
+        - label: I checked the documentation and searched existing issues / Tôi đã đọc tài liệu và tìm trong các issue hiện có.
+          required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area / Phần liên quan
+      options:
+        - Wi-Fi / AWDL
+        - Bluetooth / BLE / audio
+        - Apple Continuity features
+        - Sleep / wake
+        - Hardware or macOS support
+        - Installer / diagnostics / documentation
+        - Other / Khác
+    validations:
+      required: true
+  - type: textarea
+    id: need
+    attributes:
+      label: Problem or use case / Nhu cầu hoặc vấn đề
+      description: What would this improve, and for whom? / Tính năng này giải quyết vấn đề gì và hữu ích cho ai?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change / Thay đổi đề xuất
+      description: Describe the behavior you would like / Mô tả cách bạn muốn tính năng hoạt động.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and workarounds / Phương án khác hoặc cách khắc phục tạm
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant hardware and macOS build / Phần cứng và build macOS liên quan
+      description: For support requests, include chip/PCI/USB IDs, macOS build and current kext version. Do not include device serial numbers / Với đề xuất hỗ trợ, ghi ID chip/PCI/USB, build macOS và phiên bản kext, không ghi số sê-ri.
+  - type: checkboxes
+    id: testing
+    attributes:
+      label: Testing / Thử nghiệm
+      options:
+        - label: I can test a development build on my hardware / Tôi có thể thử bản build phát triển trên phần cứng của mình.
