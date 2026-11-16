@@ -46,7 +46,7 @@ build. Check yours with `sw_vers -buildVersion`.
 | macOS | Wi-Fi, pairing, audio | AirDrop / Handoff (BLE advertising) | Wideband mic (HFP mSBC) | Instant Hotspot |
 |---|---|---|---|---|
 | 26.7.2 (25G332) | Works | Works | Works | Works |
-| 26.7.1 (25G241) | Works | Works | Works | No. The patch needs 25G332; update to 26.7.2 |
+| 26.7.1 (25G241) | Works | Works | Works | Untested |
 | 26.7.3 (25G342) | Untested | Untested | Untested | Untested |
 | Other 26.x | Untested | Untested | Untested | Untested |
 
