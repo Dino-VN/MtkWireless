@@ -371,8 +371,9 @@ IOReturn AirportMtkSkywalkInterface::beginWCLScan(apple80211ScanRequest *request
 // MtkWireless: while associated, a WCL scan aborts the AWDL ROC and holds
 // the one radio for seconds; an AirDrop to the iPhone then stalls (1.0.14,
 // ROCScanBlocked +70 in 2 s of transfer). Refuse it as busy while AWDL data
-// TX completed within the last 1.5 s, but let one through every 30 s so
-// airportd's roam/location view does not go stale. Joins and unassociated
+// moved within the last 1.5 s (TX completion or accepted RX), but let one
+// through every 30 s so airportd's roam/location view does not go stale;
+// that one runs in chunks (mt7921_mcu_hw_scan, amtk_scan_chunk). Joins and unassociated
 // scans are never deferred (that failed every join with -3905).
 // Boot-arg amtk_awdl_scan_defer=0 turns it off.
 bool AirportMtkSkywalkInterface::deferScanForAWDL(ieee80211com *ic)

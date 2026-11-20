@@ -133,3 +133,65 @@ The measured 1.0.3 Wi-Fi executable UUID is
 `83186215-4716-3EF4-8A60-8E06A7714B14`, rate ladder
 `05F53492-D98A-3450-9AD5-6AE0A30E59C5`) (the first 1.0.3 was
 `64CE37DA-B9A1-3BA0-A64E-9BB4A8E7AF53`).
+
+## ForbiddenItlwm comparison (2026-11-20, unverified on hardware)
+
+ForbiddenItlwm 0.6.0 (Intel AWDL for macOS) reaches 20-26 MB/s both ways.
+Its firmware time-shares a permanent second context, so it is not a design
+we can copy (ours is ROC per window), but three of its findings apply:
+
+- **TX packet pool.** A 128-packet `awdl0` TX pool (896 after Skywalk's
+  rounding) ran dry at FQ-CoDel's peak (672 per flow + submission +
+  completion); the flowswitch then drops the batch with ENOMEM ("failed to
+  allocate slab") without telling QUIC, which stays flow controlled.
+  Ours was 256 here; the 1.1.2 Skywalk work (docs/WIFI-SKYWALK-TEST.md,
+  not on this branch) already requests 2048 with `amtk_awdl_txpool`, so
+  this port leaves the pool alone.
+- **PHY.** Its Mac -> iPhone speed comes from VHT80 two-stream A-MPDUs
+  (`-itlawdlcoexbatx` + `-itlawdlcaps`); peer capabilities are assumed, not
+  parsed. Ours topped out at HT MCS 7, 20 MHz, one stream (65 Mbps PHY).
+  `amtk_awdl_phy` (default 1 since the 1.1.3 hardware test below):
+  - 0: the old ladder and 20 MHz ROC.
+  - 1: + VHT MCS 7/8 two-stream at 20 MHz (130/156 Mbps) in 5 GHz windows.
+  - 2 (opt-in): + 80 MHz ROC on 36-48 / 149-161 (non-DFS, every 20 MHz channel
+    enabled, VHT80 flag) and VHT MCS 4/7/9 two-stream at 80 MHz
+    (351/585/780 Mbps). Associated, the block may not hold the AP's
+    channel unless it is the AWDL channel at the AP's own 80 MHz.
+  2.4 GHz windows use a separate ladder (HT at most), so channel-6 losses
+  no longer demote the 5 GHz rate. Wide rungs match TXS by NSS and TXS
+  bandwidth (bits 29..30) too. The TX ladder follows the granted window
+  (`band2g`, `wide`). Linux's MT7921 ROC is always 20 MHz; three
+  FirmwareStatus refusals of an 80 MHz acquire before any wide grant turn
+  80 MHz off until AWDL is re-enabled. The peer WTBL gets WTBL_VHT for
+  phy >= 1. ioreg on the controller: `MTKAWDLPhy`,
+  `MTKAWDLROC{Wide,Narrow}Grants`, `MTKAWDLROCWideRejects`,
+  `MTKAWDLROCWideOff`, `MTKAWDLWindowWide`; per-peer
+  `MTKAWDLTXPeer*RateMbps` now reads up to 780. A/B: `amtk_awdl_phy=1`,
+  then `0`. 1.0.16's "11ac/80 broke AirDrop" was the infrastructure knob,
+  not AWDL; watch `MTKAWDLROCLatency*` for slower 80 MHz grants.
+- **Scans during transfers.** A firmware scan holds the radio for its
+  whole channel list and `awdlReserve` refuses every ROC meanwhile.
+  While AWDL data moved within the last 3 s (TX status or, new, accepted
+  RX: `MtkMwx::awdlNoteDataRx`), `mt7921_mcu_hw_scan` scans
+  `amtk_scan_chunk` channels (default 4, 0 = whole list) per firmware
+  request and leaves `amtk_scan_gap` ms (default 250) for AWDL between
+  them; SCAN_DONE of the last chunk ends the logical scan. Joins (WCL
+  channel or fallback) are never chunked. A fresh scan, stop/reset or the
+  scan ending during a gap drops the rest (generation check in
+  `mwx_scan_chunk_task`); a refused chunk ends the scan with what earlier
+  chunks found. `deferScanForAWDL` still holds associated WCL scans while
+  data flows (now in both directions); the one it lets through every 30 s
+  is chunked. ioreg `MTKScanChunked`, `MTKScanChunks`,
+  `MTKScanChunkAbandoned`, `MTKScanChunkSize`. Test:
+  `scripts/test-wifi-scan-chunk.py`.
+
+1.1.3 hardware (2026-11-20, AP "2.4 GHz ch 10", iPhone16,2, default
+`amtk_awdl_phy=2`): AirDrop stuck at "Waiting". sharingd's application
+service resolution timed out after 16 s. The firmware granted 91 80 MHz
+ROCs on 149 (no refusal), yet every AWDL data frame received came on
+channel 6, none on 149; only 5 unicast frames were queued and all expired
+behind the peer gate (2336 NotReady). 1.1.4 makes 20 MHz the default and,
+under `amtk_awdl_phy=2`, turns 80 MHz off for the AWDL session after 16
+wide grants without one received AWDL frame. ioreg `MTKAWDLRxWide` /
+`MTKAWDLRxNarrow5` count AWDL frames received inside 80 / 20 MHz 5 GHz
+grants, `MTKAWDLWideAutoOff` the fallbacks.

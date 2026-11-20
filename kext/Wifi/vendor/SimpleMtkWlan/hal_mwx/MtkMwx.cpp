@@ -554,6 +554,13 @@ struct mwx_softc {
     uint64_t sc_awdl_roc_command_result_us;
     uint32_t sc_awdl_roc_command_status;
     uint64_t sc_awdl_roc_grant_delay_us, sc_awdl_roc_max_grant_delay_us;
+    // MtkWireless: 80 MHz AWDL windows (amtk_awdl_phy=2, mwx_awdl_center80).
+    bool sc_awdl_roc_wide;        // the pending/granted ROC asked for 80 MHz
+    bool sc_awdl_wide_off;        // firmware refused 80 MHz: 20 MHz until re-enable
+    uint64_t sc_awdl_wide_grants, sc_awdl_wide_rejects, sc_awdl_narrow_grants;
+    // AWDL frames received inside the current 5 GHz grant, by its width.
+    uint64_t sc_awdl_rx_wide, sc_awdl_rx_narrow5, sc_awdl_wide_auto_off;
+    uint64_t sc_awdl_wide_grants_session; // since this AWDL enable
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
     uint64_t sc_awdl_roc_timeouts;
@@ -660,6 +667,18 @@ struct mwx_softc {
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
+	/* MtkWireless: chunked scan while AWDL is on (mt7921_mcu_hw_scan). */
+	CTimeout		*sc_scan_chunk_to;
+	struct task		sc_scan_chunk_task;
+	uint32_t		sc_scan_chunk_size;	/* channels per firmware scan, 0 = whole */
+	uint32_t		sc_scan_chunk_next;	/* ic_channels index to resume at, 0 = done */
+	uint32_t		sc_scan_chunk_gen;	/* bumped by every fresh scan */
+	uint32_t		sc_scan_chunk_armed_gen;
+	bool			sc_scan_chunk_bgscan;
+	bool			sc_scan_chunk_resume;
+	uint64_t		sc_scan_chunked;	/* scans split into chunks */
+	uint64_t		sc_scan_chunks;		/* firmware scans issued as chunks */
+	uint64_t		sc_scan_chunk_abandoned;
 	struct task		sc_fullreset_task;
 	uint32_t		sc_bgscan_dwell;	/* ms per channel while associated */
 #define MWX_BGSCAN_DWELL_AUTO	0xffffffffU	/* from WCL away time, else firmware */
@@ -1059,6 +1078,8 @@ void		mt7921_mcu_beacon_loss_event(struct mwx_softc *, struct mbuf *);
 void		mt7921_mcu_tx_done_event(struct mwx_softc *, struct mbuf *);
 void		mwx_end_scan_task(void *);
 void		mwx_scan_timeo(void *);
+void		mwx_scan_chunk_timeo(void *);
+void		mwx_scan_chunk_task(void *);
 void		mwx_dma_timeo(void *);
 void		mwx_fullreset_task(void *);
 void		mwx_edca_task(void *);
@@ -1452,8 +1473,12 @@ mwx_stop(struct ifnet *ifp)
 		task_del(sc->sc_nswq, &sc->sc_reset_task);
 		task_del(sc->sc_nswq, &sc->sc_ba_task);
 		task_del(sc->sc_nswq, &sc->sc_scan_task);
+		task_del(sc->sc_nswq, &sc->sc_scan_chunk_task);
 		task_del(sc->sc_nswq, &sc->sc_fullreset_task);
 	}
+	timeout_del(&sc->sc_scan_chunk_to);
+	sc->sc_scan_chunk_next = 0;
+	sc->sc_scan_chunk_gen++;
 	sc->sc_ba_cur = sc->sc_ba_tail = 0;
 	/* MtkWireless: queued keys point into this BSS's node and ic_nw_keys;
 	 * never install them for the next join (as iwx does). */
@@ -2449,6 +2474,12 @@ mwx_rx(struct mwx_softc *sc, struct mbuf *m, struct mbuf_list *ml)
     }
     if (sc->sc_awdl_enabled && sc->sc_awdl_receive &&
         mbuf_len(m) >= 24 && !memcmp(mtod(m, uint8_t *)+16, mtkawdl::bssid, 6)) {
+        /* MtkWireless: which 5 GHz window width actually hears peers. */
+        if (rxi.rxi_chan > 14 && sc->sc_awdl_roc.granted &&
+            rxi.rxi_chan == sc->sc_awdl_roc.channel) {
+            if (sc->sc_awdl_tx_status.wide) ++sc->sc_awdl_rx_wide;
+            else ++sc->sc_awdl_rx_narrow5;
+        }
         sc->sc_awdl_receive(sc->sc_awdl_context, mtod(m, const uint8_t *),
             mbuf_len(m), rxi.rxi_chan, rxi.rxi_rssi);
         m_freem(m);
@@ -3028,6 +3059,8 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	task_set(&sc->sc_scan_task, mwx_end_scan_task, sc, "mwx_scan");
 	timeout_set(&sc->sc_reset_to, mwx_reset_timeo, sc);
 	timeout_set(&sc->sc_scan_to, mwx_scan_timeo, sc);
+	timeout_set(&sc->sc_scan_chunk_to, mwx_scan_chunk_timeo, sc);
+	task_set(&sc->sc_scan_chunk_task, mwx_scan_chunk_task, sc, "mwx_scanchunk");
 	timeout_set(&sc->sc_dma_to, mwx_dma_timeo, sc);
 	/*
 	 * MtkWireless 1.0.17: 11n / 20 MHz only (0x1022 = DATA_RA|NO_40|NO_HE).
@@ -4818,12 +4851,32 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
     sc->sc_awdl_roc_last_response_us=sc->sc_awdl_roc.pending && now>=sc->sc_awdl_roc.requestedAt ?
         now-sc->sc_awdl_roc.requestedAt : 0;
     bool enabled=sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching;
+    const bool askedWide=sc->sc_awdl_roc.pending && sc->sc_awdl_roc_wide;
     mtkawdl::RocResult result=mtkawdl::receiveRocGrant(sc->sc_awdl_roc,p,n,
         sc->sc_awdl_vif.idx,enabled,now,sc->sc_awdl_roc_last_event);
     sc->sc_awdl_roc_last_result=result;
     ++sc->sc_awdl_roc_reasons[static_cast<unsigned>(result)];
+    if(askedWide && result==mtkawdl::RocResult::FirmwareStatus) {
+        // MT7921's Linux ROC is always 20 MHz; if this firmware refuses an
+        // 80 MHz acquire, stay at 20 MHz for this AWDL session.
+        ++sc->sc_awdl_wide_rejects;
+        if(!sc->sc_awdl_wide_grants && sc->sc_awdl_wide_rejects>=3) sc->sc_awdl_wide_off=true;
+    }
     if(result==mtkawdl::RocResult::Accepted) {
         ++sc->sc_awdl_roc_grants;
+        // The TX ladder follows the granted window (band and width).
+        sc->sc_awdl_tx_status.band2g=sc->sc_awdl_roc.channel<=14;
+        sc->sc_awdl_tx_status.wide=askedWide;
+        if(askedWide) {
+            ++sc->sc_awdl_wide_grants;
+            // 80 MHz that hears nothing is worse than 20 MHz: the peer's
+            // 5 GHz slots are lost both ways. Fall back for this session.
+            if(++sc->sc_awdl_wide_grants_session>=16 && !sc->sc_awdl_rx_wide &&
+               !sc->sc_awdl_wide_off) {
+                sc->sc_awdl_wide_off=true;
+                ++sc->sc_awdl_wide_auto_off;
+            }
+        } else ++sc->sc_awdl_narrow_grants;
         auto &timing=sc->sc_awdl_roc_timing;
         if(timing.session==sc->sc_awdl_native_session && timing.epoch==sc->sc_awdl_epoch &&
            timing.token==sc->sc_awdl_roc.token && timing.channel==sc->sc_awdl_roc.channel &&
@@ -6163,6 +6216,32 @@ mt7921_mac_add_txs(struct mwx_softc *sc, const uint32_t *txs_data)
 		    mode, mcs, nss, (txs >> 29) & 0x3);
 }
 
+static unsigned
+mwx_scan_chunk_channels(void)
+{
+	static int value = -1;
+	if (value < 0) {
+		uint32_t v = 4;
+		if (!PE_parse_boot_argn("amtk_scan_chunk", &v, sizeof(v)))
+			v = 4;
+		value = (int)MIN(v, 64U);
+	}
+	return (unsigned)value;
+}
+
+static int
+mwx_scan_chunk_gap_ms(void)
+{
+	static int value = -1;
+	if (value < 0) {
+		uint32_t v = 250;
+		if (!PE_parse_boot_argn("amtk_scan_gap", &v, sizeof(v)))
+			v = 250;
+		value = (int)MAX(MIN(v, 1000U), 20U);
+	}
+	return value;
+}
+
 int
 mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 {
@@ -6188,7 +6267,15 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
     bool requestedScan=false;
     requestedScan=ic->ic_wcl_scan_requested ||
         (ic->ic_wcl_join_requested && sc->sc_ns_state==IEEE80211_S_SCAN);
-    if(sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN && !requestedScan) {
+    const bool resume=sc->sc_scan_chunk_resume;
+    if(!resume) {
+        // A fresh scan supersedes a chunked one waiting in its gap.
+        sc->sc_scan_chunk_gen++;
+        sc->sc_scan_chunk_next=0;
+        sc->sc_scan_chunk_size=0;
+        timeout_del(&sc->sc_scan_chunk_to);
+    }
+    if(!resume && sc->sc_awdl_enabled && sc->sc_ic.ic_state==IEEE80211_S_RUN && !requestedScan) {
         if (ic->ic_join_diag.Active) ++ic->ic_join_diag.ScanSuspendedAWDL;
         sc->sc_awdl_scan_suspended=true;
         return 0;
@@ -6283,7 +6370,32 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	    ic->ic_channels[ic->ic_wcl_join_chan].ic_flags)
 		join_chan = ic->ic_wcl_join_chan;
 	ic->ic_wcl_join_chan = 0;
-	for (nchan = 0, c = &ic->ic_channels[1];
+	/*
+	 * MtkWireless: one firmware scan holds the only radio for its whole
+	 * channel list (seconds), and awdlReserve refuses every ROC meanwhile,
+	 * so an AirDrop transfer stalls for the whole scan. While AWDL data
+	 * moved within the last 3 s (ic_awdl_data_at: TX status or accepted
+	 * RX), scan amtk_scan_chunk channels (default 4, 0 = whole list) per
+	 * firmware request and give AWDL amtk_scan_gap ms (default 250: an
+	 * off-channel ROC grant takes 80-160 ms) between them; the logical
+	 * scan ends after the last chunk. Idle AWDL keeps one whole scan.
+	 * Joins (single channel or a join's fallback scan) are never chunked:
+	 * airportd's join budget is ~10 s.
+	 */
+	unsigned start = 1;
+	if (resume) {
+		start = sc->sc_scan_chunk_next;
+	} else if (sc->sc_awdl_enabled && !join_chan &&
+	    !ic->ic_wcl_join_requested && ic->ic_awdl_data_at &&
+	    mtk_join_now() >= ic->ic_awdl_data_at &&
+	    mtk_join_now() - ic->ic_awdl_data_at < 3000000ull) {
+		sc->sc_scan_chunk_size = mwx_scan_chunk_channels();
+		sc->sc_scan_chunk_bgscan = bgscan != 0;
+	}
+	if (start < 1 || start > IEEE80211_CHAN_MAX)
+		start = 1;
+	sc->sc_scan_chunk_next = 0;
+	for (nchan = 0, c = &ic->ic_channels[start];
 	    c <= &ic->ic_channels[IEEE80211_CHAN_MAX] &&
 	    nchan < 64; c++) {
 		struct mt76_connac_mcu_scan_channel *chan;
@@ -6307,6 +6419,11 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			 * of 6 GHz only (14 + 27 + 15 fit the 64 the firmware
 			 * takes); WCL asks for others by channel list. */
 			continue;
+		}
+		if (sc->sc_scan_chunk_size && nchan >= sc->sc_scan_chunk_size) {
+			/* The next chunk starts at this (eligible) channel. */
+			sc->sc_scan_chunk_next = (uint32_t)(c - ic->ic_channels);
+			break;
 		}
 
 		if (nchan < 32)
@@ -6392,6 +6509,12 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	if (rv != 0) {
 		sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
 		ic->ic_wcl_scan_inflight = false;
+		sc->sc_scan_chunk_next = 0;
+	} else if (sc->sc_scan_chunk_size &&
+	    (resume || sc->sc_scan_chunk_next)) {
+		if (!resume)
+			sc->sc_scan_chunked++;
+		sc->sc_scan_chunks++;
 	}
 
 	return rv;
@@ -6426,6 +6549,7 @@ mwx_scan_timeo(void *arg)
 	if ((sc->sc_flags & MWX_FLAG_SCANNING) == 0)
 		return;
 	sc->sc_scan_watchdog_fired++;
+	sc->sc_scan_chunk_next = 0;	/* a lost chunk ends the logical scan */
 	MWX_DEV_LOG(sc, "scan watchdog: no SCAN_DONE, ending scan (fired=%u)\n",
 	    sc->sc_scan_watchdog_fired);
 	mt7921_mcu_hw_scan_cancel(sc);
@@ -6604,7 +6728,71 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 
 	if (mt7921_mcu_hw_scan_cancel(sc) != 0)
 		return;
+	if (sc->sc_scan_chunk_next) {
+		/* MtkWireless: hand the radio to AWDL, then scan the next chunk. */
+		sc->sc_scan_chunk_armed_gen = sc->sc_scan_chunk_gen;
+		timeout_add_msec(&sc->sc_scan_chunk_to, mwx_scan_chunk_gap_ms());
+		return;
+	}
 	task_add(sc->sc_nswq, &sc->sc_scan_task);
+}
+
+void
+mwx_scan_chunk_timeo(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+
+	if (sc->sc_scan_chunk_next && !sc->sc_detaching)
+		task_add(sc->sc_nswq, &sc->sc_scan_chunk_task);
+}
+
+/*
+ * Next chunk of a scan split for AWDL. Runs on the newstate queue like
+ * every other scan start. Anything that superseded the scan (a fresh scan,
+ * stop/reset, the state leaving SCAN or the background scan ending) bumps
+ * the generation or changes the state; then nothing is sent. A chunk that
+ * cannot start ends the logical scan with what earlier chunks found.
+ */
+void
+mwx_scan_chunk_task(void *arg)
+{
+	struct mwx_softc *sc = (struct mwx_softc *)arg;
+	struct ieee80211com *ic = &sc->sc_ic;
+	int s = splnet();
+
+	if (!sc->sc_scan_chunk_next ||
+	    sc->sc_scan_chunk_armed_gen != sc->sc_scan_chunk_gen ||
+	    sc->sc_detaching || sc->sc_resetting ||
+	    !(ic->ic_if.if_flags & IFF_RUNNING) ||
+	    (sc->sc_flags & MWX_FLAG_SCANNING)) {
+		splx(s);
+		return;
+	}
+	bool bg = sc->sc_scan_chunk_bgscan;
+	bool wanted = bg ?
+	    ic->ic_state == IEEE80211_S_RUN && (ic->ic_flags & IEEE80211_F_BGSCAN) :
+	    ic->ic_state == IEEE80211_S_SCAN;
+	if (!wanted) {
+		sc->sc_scan_chunk_next = 0;
+		sc->sc_scan_chunk_abandoned++;
+		splx(s);
+		return;
+	}
+	sc->sc_scan_chunk_resume = true;
+	int rv = mt7921_mcu_hw_scan(sc, bg);
+	sc->sc_scan_chunk_resume = false;
+	if (rv) {
+		MWX_DEV_LOG(sc, "scan chunk at %u failed rv=%d, ending scan\n",
+		    sc->sc_scan_chunk_next, rv);
+		sc->sc_scan_chunk_next = 0;
+		sc->sc_scan_chunk_abandoned++;
+		task_add(sc->sc_nswq, &sc->sc_scan_task);
+	} else {
+		if (bg)
+			sc->sc_flags |= MWX_FLAG_BGSCAN;
+		timeout_add_sec(&sc->sc_scan_to, 12);
+	}
+	splx(s);
 }
 
 int
@@ -7594,6 +7782,8 @@ static void mwx_awdl_reset_rate(struct mwx_softc *sc, unsigned index)
 {
     sc->sc_awdl_tx_status.rates[index]={};
     sc->sc_awdl_tx_status.rates[index].index=static_cast<uint8_t>(mwx_awdl_rate_start());
+    sc->sc_awdl_tx_status.rates2g[index]={};
+    sc->sc_awdl_tx_status.rates2g[index].index=static_cast<uint8_t>(mwx_awdl_rate_start());
 }
 
 static uint16_t mwx_awdl_fixed_rate_value(int index)
@@ -7713,6 +7903,9 @@ mt7921_mac_write_txwi_80211(struct mwx_softc *sc, struct mbuf *m,
         } else rate = mt7921_mac_tx_rate_val(sc);
 
 		val6 = MT_TXD6_FIXED_BW;
+		/* MtkWireless: AWDL ladder rungs carry their width in bits
+		 * 14..15 (mtkawdl TX_RATES); 0 for every other rate. */
+		val6 |= (rate >> 14) & MT_TXD6_BW;
 		val6 |= (rate << MT_TXD6_TX_RATE_SHIFT) & MT_TXD6_TX_RATE_MASK;
 		txp->txwi[6] |= htole32(val6);
 		txp->txwi[3] |= htole32(MT_TXD3_BA_DISABLE);
@@ -8922,6 +9115,7 @@ MtkMwx::detach(IOPCIDevice *device)
     mwx_awdl_quiesce(com);
     timeout_del(&com->sc_reset_to);
     timeout_del(&com->sc_scan_to);
+    timeout_del(&com->sc_scan_chunk_to);
     timeout_del(&com->sc_dma_to);
     /* Keep interrupts alive while in-flight MCU requests finish. */
     taskq_quiesce(com->sc_nswq);
@@ -8929,6 +9123,7 @@ MtkMwx::detach(IOPCIDevice *device)
     if (ifp->if_flags & IFF_RUNNING) mwx_stop(ifp);
     timeout_free(&com->sc_reset_to);
     timeout_free(&com->sc_scan_to);
+    timeout_free(&com->sc_scan_chunk_to);
     timeout_free(&com->sc_dma_to);
     /* No interrupt callback may access buffers during their destruction. */
     if (com->sc_ih) {
@@ -10357,6 +10552,56 @@ static bool mwx_awdl_ht_enabled()
     return value != 0;
 }
 
+// MtkWireless: AWDL PHY ceiling, boot-arg amtk_awdl_phy (default 1).
+// 0: the 1.0.x ladder (HT MCS 7, 20 MHz, one stream) and 20 MHz windows.
+// 1: + VHT MCS 7/8 on two streams at 20 MHz in 5 GHz windows.
+// 2: + 80 MHz windows on 36-48 / 149-161 and VHT80 two-stream rungs
+//    (351/585/780 Mbps). Apple's 5 GHz AWDL is VHT80 2x2; ForbiddenItlwm
+//    reaches 20-26 MB/s there with firmware rate control.
+// 1.1.3 hardware (2026-11-20, AP on 2.4 GHz ch 10, iPhone16,2): 91 80 MHz
+// grants on 149, zero AWDL frames received on 149, every peer frame on 6,
+// unicast never released, AirDrop stuck at "Waiting" (resolver timeout).
+// So 2 is opt-in, and turns itself off (mwx_awdl_roc_event) when 16 wide
+// grants of one AWDL session receive no AWDL frame.
+static uint8_t mwx_awdl_phy()
+{
+    static int value=-1;
+    if(value<0) {
+        uint32_t parsed=1;
+        if(!PE_parse_boot_argn("amtk_awdl_phy",&parsed,sizeof(parsed))) parsed=1;
+        value=parsed>2 ? 2 : (int)parsed;
+    }
+    return (uint8_t)value;
+}
+
+// Center of the non-DFS 80 MHz block holding a 5 GHz AWDL channel, or 0 to
+// stay at 20 MHz. Associated, never overlap the AP's block with another
+// primary channel, and on the AP's own channel only at the AP's 80 MHz
+// (one tuning for both; ForbiddenItlwm #26 saw losses otherwise).
+static uint8_t mwx_awdl_center80(mwx_softc *sc,uint8_t channel)
+{
+    if(mwx_awdl_phy()<2 || sc->sc_awdl_wide_off || sc->sc_awdl_tx_status.ofdmOnly) return 0;
+    uint8_t first;
+    if(channel>=36 && channel<=48) first=36;
+    else if(channel>=149 && channel<=161) first=149;
+    else return 0;
+    for(unsigned c=first;c<first+16u;c+=4) {
+        uint32_t flags=sc->sc_ic.ic_channels[c].ic_flags;
+        if(!flags || !(flags&IEEE80211_CHAN_VHT80) || mwx_chan_is_dfs((uint8_t)c)) return 0;
+    }
+    uint8_t center=first+6;
+    struct ieee80211com *ic=&sc->sc_ic;
+    if(ic->ic_state>=IEEE80211_S_AUTH && ic->ic_bss && ic->ic_bss->ni_chan &&
+       ic->ic_bss->ni_chan!=IEEE80211_CHAN_ANYC &&
+       IEEE80211_IS_CHAN_5GHZ(ic->ic_bss->ni_chan)) {
+        unsigned ap=ieee80211_chan2ieee(ic,ic->ic_bss->ni_chan);
+        if(ap>=first && ap<first+16u &&
+           (ap!=channel || sc->sc_bss_bw!=CMD_CBW_80MHZ || sc->sc_bss_center!=center))
+            return 0;
+    }
+    return center;
+}
+
 // MtkWireless: boot-arg amtk_awdl_dense=0 keeps awdld's sparse AWDL
 // sequence during transfers. Dense presence never pulls the radio off an AP
 // on another channel (that would cost a PM handshake per EAW).
@@ -10513,6 +10758,11 @@ static int mwx_awdl_abort(mwx_softc *sc)
     if(rv && (failures<=8 || !(failures&(failures-1))))
         MWX_DEV_LOG(sc,"AWDL ROC abort token=%u result=%d failures=%llu\n",token,rv,failures);
     return rv;
+}
+
+void MtkMwx::awdlNoteDataRx()
+{
+    if(com) com->sc_ic.ic_awdl_data_at=mtk_join_now();
 }
 
 void MtkMwx::awdlAbort()
@@ -10721,6 +10971,13 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable, const AwdlSyncG
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
     for(unsigned i=0;i<3;++i) mwx_awdl_reset_rate(sc,i);
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
+    sc->sc_awdl_tx_status.phy=mwx_awdl_phy();
+    sc->sc_awdl_tx_status.band2g=false;
+    sc->sc_awdl_tx_status.wide=false;
+    sc->sc_awdl_roc_wide=false;
+    sc->sc_awdl_wide_off=false;
+    sc->sc_awdl_wide_grants_session=0;
+    sc->sc_awdl_rx_wide=0;
     sc->sc_awdl_native_session=mwx_awdl_native_new_session();
     sc->sc_awdl_enabled=true;
     IOLockUnlock(sc->sc_awdl_lock);
@@ -10810,6 +11067,13 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     request[8]=com->sc_awdl_vif.idx; request[9]=token;
     request[10]=channel; request[12]=channel<=14 ? 1 : 2;
     request[14]=channel; request[17]=channel; request[19]=1;
+    // roc_acquire_tlv: sco 11, bw 13, center 14, bw_from_ap 16, center_from_ap 17.
+    const uint8_t center80=mwx_awdl_center80(com,channel);
+    if(center80) {
+        request[11]=channel<center80 ? 1 : 3; // SCA / SCB
+        request[13]=CMD_CBW_80MHZ; request[14]=center80;
+        request[16]=CMD_CBW_80MHZ; request[17]=center80;
+    }
     com->sc_awdl_vif.vif_mn.ni.ni_chan=&com->sc_ic.ic_channels[channel];
     mtkawdl::put32(request+20,durationMs); request[24]=0xff;
     IOLockLock(com->sc_awdl_lock);
@@ -10818,6 +11082,7 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     }
     com->sc_awdl_token_used[token]=now ? now : 1;
     com->sc_awdl_roc.request(token,channel,now);
+    com->sc_awdl_roc_wide=center80!=0;
     com->sc_awdl_roc_timing={};
     com->sc_awdl_roc_timing.session=com->sc_awdl_native_session;
     com->sc_awdl_roc_timing.epoch=operation.epoch;
@@ -10953,7 +11218,22 @@ void MtkMwx::awdlPublishDiagnostics()
         if(p.state==mwx_awdl_native_tx_pending::Terminal) ++nativeTerminal;
         else if(p.state!=mwx_awdl_native_tx_pending::Free) ++nativeActive;
     }
+    uint64_t wideGrants=com->sc_awdl_wide_grants, wideRejects=com->sc_awdl_wide_rejects,
+             narrowGrants=com->sc_awdl_narrow_grants;
+    bool wideOff=com->sc_awdl_wide_off, wideNow=com->sc_awdl_tx_status.wide;
+    uint64_t rxWide=com->sc_awdl_rx_wide, rxNarrow5=com->sc_awdl_rx_narrow5,
+             wideAutoOff=com->sc_awdl_wide_auto_off;
+    uint8_t phy=com->sc_awdl_tx_status.phy;
     IOLockUnlock(com->sc_awdl_lock);
+    mwxController()->setProperty("MTKAWDLPhy",phy,8);
+    mwxController()->setProperty("MTKAWDLROCWideGrants",wideGrants,64);
+    mwxController()->setProperty("MTKAWDLROCNarrowGrants",narrowGrants,64);
+    mwxController()->setProperty("MTKAWDLROCWideRejects",wideRejects,64);
+    mwxController()->setProperty("MTKAWDLROCWideOff",wideOff);
+    mwxController()->setProperty("MTKAWDLWindowWide",wideNow);
+    mwxController()->setProperty("MTKAWDLRxWide",rxWide,64);
+    mwxController()->setProperty("MTKAWDLRxNarrow5",rxNarrow5,64);
+    mwxController()->setProperty("MTKAWDLWideAutoOff",wideAutoOff,64);
     mwxController()->setProperty("MTKAWDLUMIActive",nativeActive,64);
     mwxController()->setProperty("MTKAWDLUMITerminal",nativeTerminal,64);
     mwxController()->setProperty("MTKAWDLUMITimeouts",nativeTimeouts,64);
@@ -11053,6 +11333,10 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLROCScanBlocked",com->sc_awdl_roc_scan_blocked,64);
     mwxController()->setProperty("MTKAWDLScanSuspended",com->sc_awdl_scan_suspended);
     mwxController()->setProperty("MTKAWDLScanPreempted",com->sc_awdl_scan_preempted,64);
+    mwxController()->setProperty("MTKScanChunked",com->sc_scan_chunked,64);
+    mwxController()->setProperty("MTKScanChunks",com->sc_scan_chunks,64);
+    mwxController()->setProperty("MTKScanChunkAbandoned",com->sc_scan_chunk_abandoned,64);
+    mwxController()->setProperty("MTKScanChunkSize",com->sc_scan_chunk_size,32);
     mwxController()->setProperty("MTKAWDLScanDeferred",com->sc_ic.ic_awdl_scan_deferred,64);
     mwxController()->setProperty("MTKAWDLROCJoinBlocked",com->sc_awdl_roc_join_blocked,64);
     {
@@ -11421,6 +11705,13 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
             auto ht=(wtbl_ht *)mwx_append_tlv(m,&wcount,WTBL_HT,sizeof(wtbl_ht));
             ht->ht=1; ht->af=3; ht->mm=0;
             wlen+=sizeof(*ht);
+            // MtkWireless: VHT rungs (amtk_awdl_phy >= 1) are aggregated
+            // as VHT A-MPDUs; the MAC needs the peer marked VHT for that.
+            if(mwx_awdl_phy()>=1) {
+                auto vht=(wtbl_vht *)mwx_append_tlv(m,&wcount,WTBL_VHT,sizeof(wtbl_vht));
+                vht->vht=1;
+                wlen+=sizeof(*vht);
+            }
         }
     }
     wtbl->tlv_num=htole16(wcount); wtbl->len=htole16(wlen);

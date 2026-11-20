@@ -369,7 +369,8 @@ static LAYOUT: &[usize] = layout! {
         acquisition_parent, acquisition_root, acquisition_root_known, controls_deferred, pending_controls }
     TxRate { index, successes, failed, probing, backoff, stale, probe_after }
     TxStatusCounters { data_acked, data_failed, multicast_completed, multicast_failed, action_completed,
-        action_failed, last_status, last_sequence, last_wcid, last_pid, rates, ofdm_only }
+        action_failed, last_status, last_sequence, last_wcid, last_pid, rates, ofdm_only, phy, band_2g, wide,
+        rates_2g }
     Reservation { deadline, grant_observed_at, requested_at, token, channel, pending, granted, response_delay_us }
     RocGrant { bss, token, status, channel, request_type, duration_ms }
     DataView { destination, source, payload, length, sequence }

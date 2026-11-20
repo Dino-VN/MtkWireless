@@ -117,6 +117,8 @@ struct mwx_softc {
     int sc_ns_state=IEEE80211_S_RUN;
     unsigned sc_flags=0, sc_scan_requests=0; int sc_scan_to=0;
     unsigned sc_awdl_scan_preempted=0;
+    int sc_scan_chunk_to=0; unsigned sc_scan_chunk_size=0,sc_scan_chunk_next=0,sc_scan_chunk_gen=0;
+    bool sc_scan_chunk_resume=false;
 };
 // The operation's admission/lifetime is modeled here; its real implementation
 // is exercised separately by test-awdl-sync-recovery.py.
@@ -127,6 +129,7 @@ struct MwxAwdlInfraOperation {
 };
 void mwx_awdl_abort(mwx_softc*){assert(admissionOwners);++aborts;}
 void timeout_add_sec(int*,int){}
+void timeout_del(int*){}
 ''' + admission + function(hal, 'int\nmwx_bgscan(') + r'''
 int main(){
     AirportMtkSkywalkInterface d; current=&d; auto&ic=d.radio.ic;

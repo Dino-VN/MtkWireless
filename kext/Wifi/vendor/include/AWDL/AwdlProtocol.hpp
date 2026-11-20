@@ -293,8 +293,13 @@ struct TxStatusCounters {
     uint32_t lastStatus=0;
     uint16_t lastSequence=0, lastWcid=0;
     uint8_t lastPid=0;
-    TxRate rates[3]={};
+    TxRate rates[3]={};  // 5 GHz windows
     bool ofdmOnly=false; // boot-arg amtk_awdl_ht=0
+    // Boot-arg amtk_awdl_phy: 0 HT MCS 7 top, 1 + VHT20 2SS, 2 + VHT80 2SS.
+    uint8_t phy=0;
+    bool band2g=false;   // current window on 2.4 GHz: rates2g, HT at most
+    bool wide=false;     // current 5 GHz window granted at 80 MHz
+    TxRate rates2g[3]={};
     bool observe(const uint8_t *p,size_t n) { return mtk_awdl_tx_status_observe(this,p,n); }
     uint16_t rate(uint16_t wcid) const { return mtk_awdl_tx_rate(this,wcid); }
     uint16_t rateMbps(size_t peer) const { return mtk_awdl_tx_rate_mbps(this,peer); }

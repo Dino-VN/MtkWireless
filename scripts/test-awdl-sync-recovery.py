@@ -238,7 +238,9 @@ def generate(ex):
   mwx_vif sc_awdl_vif{}; mwx_node sc_awdl_peers[3]{};
   bool sc_awdl_peer_used[3]{},sc_awdl_station_pending[4]{};
   TraceBoundary *sc_awdl_tx_trace=nullptr;
-  struct { bool ofdmOnly=false; } sc_awdl_tx_status;
+  struct { bool ofdmOnly=false; uint8_t phy=0; bool band2g=false,wide=false; } sc_awdl_tx_status;
+  bool sc_awdl_roc_wide=false,sc_awdl_wide_off=false;
+  uint64_t sc_awdl_wide_grants_session=0,sc_awdl_rx_wide=0;
   taskq modelQueue; taskq *sc_nswq=&modelQueue; task sc_newstate_task,sc_scan_task; int sc_ns_arg=0;
 ''')
     text = one(text, "  bool take(AwdlTxResult &out)", "  void cancel() { assert(heldHalLocks); injected.clear(); }\n  bool take(AwdlTxResult &out)")
@@ -258,7 +260,7 @@ def generate(ex):
     actual += definition(ex, "MwxAwdlInfraOperation")+definition(ex, "MwxAwdlCall")+definition(ex, "MwxAwdlOperation")
     for name in ["mwx_awdl_current", "mwx_append_len", "mwx_append_tlv", "mwx_fill_sta_req_hdr",
                  "mwx_awdl_restore_filter", "mwx_awdl_quiesce", "mwx_awdl_remove_station", "mwx_awdl_remove_context",
-                 "mwx_awdl_ht_enabled", "MtkMwx::awdlEnable", "MtkMwx::awdlIsEnabled", "MtkMwx::awdlGrantSnapshot"]:
+                 "mwx_awdl_ht_enabled", "mwx_awdl_phy", "MtkMwx::awdlEnable", "MtkMwx::awdlIsEnabled", "MtkMwx::awdlGrantSnapshot"]:
         actual += function(ex, name)
     # Replace the modeled HAL while retaining the native message boundary.
     # No statement in the production extraction is rewritten.

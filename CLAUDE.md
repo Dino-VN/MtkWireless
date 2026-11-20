@@ -106,6 +106,16 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   to the next off-channel window instead of a ROC per window. ioreg
   `MTKAWDLROCLatency{Unassoc,APChannel,OffChannel}` histograms grant latency
   (<5/10/20/40/80/160/>=160 ms).
+- 1.1.x ForbiddenItlwm port (docs/AIRDROP-PERFORMANCE.md, unverified on
+  hardware; the TX pool part is the 1.1.2 `amtk_awdl_txpool`): AWDL TX ladder up to
+  VHT80 2SS with 80 MHz ROC on 36-48/149-161 (`amtk_awdl_phy` 0/1/2,
+  default 1: on 1.1.3 hardware 80 MHz windows on 149 received nothing and
+  AirDrop hung at "Waiting"; under 2, three refused wide ROCs or 16 wide
+  grants without RX fall back to 20 MHz, ioreg `MTKAWDLRxWide`), separate
+  2.4 GHz ladder; scans while AWDL data flows run in 4-channel chunks with
+  250 ms for AWDL between them (`amtk_scan_chunk`, `amtk_scan_gap`), joins
+  never. `TxStatusCounters` gained `phy`/`band2g`/`wide`/`rates2g` (both
+  layout tables).
 - `sudo dmesg` is useless for driver printf: system IOMemoryDescriptor
   backtrace spam overwrites the buffer within seconds. Publish diagnostics
   to ioreg.

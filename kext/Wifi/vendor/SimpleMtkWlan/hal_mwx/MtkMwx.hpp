@@ -113,6 +113,9 @@ public:
     bool awdlInterfaceReady();
     void awdlPublishDiagnostics();
     void awdlAbort();
+    // AWDL data was received now: WCL scans are deferred while data flows
+    // in either direction (deferScanForAWDL); TX is noted from TXS.
+    void awdlNoteDataRx();
     IOReturn awdlTransmit(mbuf_t frame, uint8_t channel);
     // Queue API: leave *frame owned by the caller on a transient failure;
     // clear it after successful submission or permanent rejection.

@@ -18,7 +18,7 @@ wcl = (vendor / 'AirportMtkWlan/WCL/WCL.cpp').read_text()
 start = wcl.index('    joinBssidSpecified = AirportWCL::validUnicastAddress(join.bssid);')
 join_bssid = wcl[start:wcl.index('    // Same-ESS roaming', start)]
 start = hal.index('\t/* MtkWireless: WCL lists carry Instant Hotspot')
-firmware_targets = hal[start:hal.index('\n\tfor (nchan', start)]
+firmware_targets = hal[start:hal.index('\n\t/*\n\t * MtkWireless: one firmware scan holds', start)]
 code = r'''
 #include <cassert>
 #include <cstdint>

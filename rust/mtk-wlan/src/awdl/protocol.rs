@@ -1889,13 +1889,30 @@ pub const TX_PID_UNICAST: u8 = 125;
 pub const TX_PID_MULTICAST: u8 = 126;
 pub const TX_PID_ACTION: u8 = 127;
 
-/// ACK-driven unicast rate ladder, 20 MHz long GI, single stream:
-/// OFDM 6/12/24/36/48/54 Mbps, then HT MCS 7 (65 Mbps). Every AWDL peer is
-/// an 802.11n device; a rung it cannot receive fails, which steps back down.
-/// MT7921 TX_RATE: mode at bit 6 (OFDM 1, HT 2), rate/MCS index below.
-pub const TX_RATES: [u16; 7] = [0x4b, 0x4a, 0x49, 0x4d, 0x48, 0x4c, 0x87];
-pub const TX_RATE_MBPS: [u16; 7] = [6, 12, 24, 36, 48, 54, 65];
+/// ACK-driven unicast rate ladder, long GI: OFDM 6/12/24/36/48/54 Mbps,
+/// HT MCS 7 (65 Mbps, 20 MHz, one stream), then on 5 GHz only (`phy` >= 1)
+/// VHT MCS 7/8 at 20 MHz on two streams (130/156 Mbps) and (`phy` 2, the
+/// window is 80 MHz) VHT MCS 4/7/9 at 80 MHz on two streams (351/585/780).
+/// Every AWDL peer is an 802.11n device and Apple's 5 GHz AWDL runs VHT80
+/// 2x2 (ForbiddenItlwm 0.6.0: firmware rate control settles there at
+/// 20-26 MB/s); a rung the peer cannot receive fails and steps back down.
+/// MT7921 TX_RATE (bits 0..13): index 0..5, mode 6..9 (OFDM 1, HT 2, VHT 4),
+/// NSS-1 at 10..12. Bits 14..15 carry the TXD6 bandwidth (2 = 80 MHz) for
+/// the C++ TXWI builder; they are not part of the firmware's rate field.
+pub const TX_RATES: [u16; 12] = [
+    0x4b, 0x4a, 0x49, 0x4d, 0x48, 0x4c, 0x87,
+    0x507, 0x508,
+    0x8504, 0x8507, 0x8509,
+];
+pub const TX_RATE_MBPS: [u16; 12] = [6, 12, 24, 36, 48, 54, 65, 130, 156, 351, 585, 780];
 const TX_RATE_OFDM_TOP: usize = 5;
+const TX_RATE_HT_TOP: usize = 6;
+const TX_RATE_VHT20_TOP: usize = 8;
+
+/// Bandwidth code carried in bits 14..15 of a TX_RATES entry.
+pub fn tx_rate_bw(rate: u16) -> u8 {
+    (rate >> 14) as u8 & 3
+}
 // 1.0.51: with the 1.0.49 counters the ladder sat at 6 Mbps while
 // MTKAWDLTXDataFailed/DataAcked was 277/105621 (0.26%). One loss sets
 // failed=true and needs 128 clean ACKs to clear, then probe_after starts at
@@ -1927,20 +1944,31 @@ pub struct TxRate {
 }
 
 impl TxRate {
-    fn top(ofdm_only: bool) -> usize {
-        if ofdm_only { TX_RATE_OFDM_TOP } else { TX_RATES.len() - 1 }
+    pub fn current(&self, top: usize) -> usize {
+        (self.index as usize).min(top).min(TX_RATES.len() - 1)
     }
 
-    pub fn current(&self, ofdm_only: bool) -> usize {
-        (self.index as usize).min(Self::top(ofdm_only))
+    pub fn rate(&self, top: usize) -> u16 {
+        TX_RATES[self.current(top)]
     }
 
-    pub fn rate(&self, ofdm_only: bool) -> u16 {
-        TX_RATES[self.current(ofdm_only)]
+    /// Whether a TXS rate field is this rung. Mode and index always; NSS
+    /// only for multi-stream rungs and the TXS bandwidth (bits 29..30) only
+    /// for wide rungs, so legacy rungs keep their 1.0.x matching.
+    fn matches(rate: u16, status: u32) -> bool {
+        let mut mask = 0x3ffu32;
+        if rate & 0x1c00 != 0 {
+            mask |= 0x1c00;
+        }
+        if status & mask != rate as u32 & mask {
+            return false;
+        }
+        let bw = tx_rate_bw(rate) as u32;
+        bw == 0 || (status >> 29) & 3 == bw
     }
 
-    fn step_down(&mut self, ofdm_only: bool) {
-        self.index = self.current(ofdm_only).saturating_sub(1) as u8;
+    fn step_down(&mut self, top: usize) {
+        self.index = self.current(top).saturating_sub(1) as u8;
         self.successes = 0;
         self.failed = false;
         self.probing = false;
@@ -1948,15 +1976,15 @@ impl TxRate {
         self.probe_after = TX_HOLD << self.backoff;
     }
 
-    pub fn observe(&mut self, status: u32, ofdm_only: bool) {
+    pub fn observe(&mut self, status: u32, top: usize) {
         // Queued completions at the previous rate cannot promote or demote
-        // the new one. Compare mode and index only (not NSS/STBC/BW bits).
-        // If nothing matches for long, the firmware is not reporting this
-        // rung as sent: step down rather than fly blind.
-        if status & 0x3ff != self.rate(ofdm_only) as u32 & 0x3ff {
+        // the new one (see `matches`). If nothing matches for long, the
+        // firmware is not reporting this rung as sent: step down rather
+        // than fly blind.
+        if !Self::matches(self.rate(top), status) {
             self.stale = self.stale.saturating_add(1);
-            if self.stale >= TX_STALE_LIMIT && self.current(ofdm_only) > 0 {
-                self.step_down(ofdm_only);
+            if self.stale >= TX_STALE_LIMIT && self.current(top) > 0 {
+                self.step_down(top);
             }
             return;
         }
@@ -1966,7 +1994,7 @@ impl TxRate {
                 if self.probing {
                     self.backoff = (self.backoff + 1).min(4);
                 }
-                self.step_down(ofdm_only);
+                self.step_down(top);
             } else {
                 self.failed = true;
                 self.successes = 0;
@@ -1984,8 +2012,8 @@ impl TxRate {
         if self.probe_after != 0 {
             self.probe_after -= 1;
         } else if !self.failed && self.successes >= TX_PROBE_ACKS
-            && self.current(ofdm_only) < Self::top(ofdm_only) {
-            self.index = self.current(ofdm_only) as u8 + 1;
+            && self.current(top) < top {
+            self.index = self.current(top) as u8 + 1;
             self.successes = 0;
             self.probing = true;
         }
@@ -2005,19 +2033,46 @@ pub struct TxStatusCounters {
     pub last_sequence: u16,
     pub last_wcid: u16,
     pub last_pid: u8,
-    pub rates: [TxRate; 3], // unicast WCIDs 15..17
+    pub rates: [TxRate; 3], // unicast WCIDs 15..17, 5 GHz windows
     /// Boot-arg amtk_awdl_ht=0: stop the ladder at 54 Mbps OFDM.
     pub ofdm_only: bool,
+    /// Boot-arg amtk_awdl_phy: 0 stops at HT MCS 7, 1 adds the VHT 20 MHz
+    /// two-stream rungs, 2 also the 80 MHz rungs while `wide`.
+    pub phy: u8,
+    /// The current AWDL window is on 2.4 GHz: `rates_2g` and HT at most.
+    pub band_2g: bool,
+    /// The current 5 GHz window was granted at 80 MHz.
+    pub wide: bool,
+    pub rates_2g: [TxRate; 3], // unicast WCIDs 15..17, 2.4 GHz windows
 }
 
 impl TxStatusCounters {
+    /// Highest rung for a band under the current settings.
+    pub fn top(&self, band_2g: bool) -> usize {
+        if self.ofdm_only {
+            TX_RATE_OFDM_TOP
+        } else if band_2g || self.phy == 0 {
+            TX_RATE_HT_TOP
+        } else if self.phy >= 2 && self.wide {
+            TX_RATES.len() - 1
+        } else {
+            TX_RATE_VHT20_TOP
+        }
+    }
+
+    fn ladder(&self, band_2g: bool) -> &[TxRate; 3] {
+        if band_2g { &self.rates_2g } else { &self.rates }
+    }
+
     pub fn rate(&self, wcid: u16) -> u16 {
-        wcid.checked_sub(15).and_then(|i| self.rates.get(i as usize))
-            .map_or(TX_RATES[0], |r| r.rate(self.ofdm_only))
+        let top = self.top(self.band_2g);
+        wcid.checked_sub(15).and_then(|i| self.ladder(self.band_2g).get(i as usize))
+            .map_or(TX_RATES[0], |r| r.rate(top))
     }
 
     pub fn rate_mbps(&self, peer: usize) -> u16 {
-        self.rates.get(peer).map_or(0, |r| TX_RATE_MBPS[r.current(self.ofdm_only)])
+        let top = self.top(self.band_2g);
+        self.ladder(self.band_2g).get(peer).map_or(0, |r| TX_RATE_MBPS[r.current(top)])
     }
 
     /// Consumes a 32-byte TXS record when it belongs to an AWDL WCID
@@ -2042,7 +2097,12 @@ impl TxStatusCounters {
         self.last_wcid = wcid as u16;
         self.last_pid = pid;
         if pid == TX_PID_UNICAST && wcid < 18 {
-            self.rates[(wcid - 15) as usize].observe(status, self.ofdm_only);
+            // VHT is only ever sent in 5 GHz windows; anything else belongs
+            // to the band of the window it completes in.
+            let band_2g = self.band_2g && (status >> 6) & 0xf != 4;
+            let top = self.top(band_2g);
+            let ladder = if band_2g { &mut self.rates_2g } else { &mut self.rates };
+            ladder[(wcid - 15) as usize].observe(status, top);
         }
         let counter = match (pid, failed) {
             (TX_PID_UNICAST, true) => &mut self.data_failed,
@@ -2813,7 +2873,8 @@ mod tests {
 
     fn txs(rate: u16, failed: bool, wcid: u16, pid: u8) -> [u8; 32] {
         let mut data = [0u8; 32];
-        let status = 0x8000_8000 | rate as u32 | if failed { 0x10000 } else { 0 };
+        let status = 0x8000_8000 | (rate as u32 & 0x3fff) | ((tx_rate_bw(rate) as u32) << 29)
+            | if failed { 0x10000 } else { 0 };
         data[..4].copy_from_slice(&status.to_le_bytes());
         data[8..12].copy_from_slice(&((wcid as u32) << 16).to_le_bytes());
         data[12..16].copy_from_slice(&((pid as u32) << 24).to_le_bytes());
@@ -2850,6 +2911,60 @@ mod tests {
         c.observe(&txs(0x87, true, 15, TX_PID_UNICAST));
         assert_eq!(c.rate(15), 0x4c); // 54 Mbps
         assert_eq!(c.rates[0].probe_after, TX_HOLD);
+    }
+
+    #[test]
+    fn unicast_rates_climb_to_vht80_two_streams_per_band() {
+        let mut c = TxStatusCounters { phy: 2, wide: true, ..Default::default() };
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 11);
+        assert_eq!(c.rate(15), 0x8509); // VHT MCS 9, 2 streams, 80 MHz
+        assert_eq!(tx_rate_bw(c.rate(15)), 2);
+        assert_eq!(c.rate_mbps(0), 780);
+        // A 20 MHz window caps the same ladder at VHT20 MCS 8.
+        c.wide = false;
+        assert_eq!(c.rate(15), 0x508);
+        c.wide = true;
+        // 2.4 GHz windows use their own ladder, HT at most, and leave the
+        // 5 GHz history alone.
+        let five = c.rates[0];
+        c.band_2g = true;
+        assert_eq!(c.rate(15), 0x4b);
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 12);
+        assert_eq!(c.rate(15), 0x87);
+        assert_eq!(c.rates[0], five);
+        // A VHT completion arriving after the switch still credits 5 GHz
+        // (the top rung, just promoted and unconfirmed, steps down).
+        c.observe(&txs(0x8509, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rates[0].index, 10);
+        c.band_2g = false;
+        assert_eq!(c.rate(15), 0x8507);
+        // The failed probe doubled the hold; afterwards it climbs again.
+        acks(&mut c, 15, (TX_HOLD << 1) as usize + TX_PROBE_ACKS as usize * 2);
+        assert_eq!(c.rate(15), 0x8509);
+        // phy 0 keeps the 1.0.x top; phy 1 never goes wide.
+        let mut old = TxStatusCounters { wide: true, ..Default::default() };
+        acks(&mut old, 15, 4096);
+        assert_eq!(old.rate(15), 0x87);
+        let mut narrow = TxStatusCounters { phy: 1, wide: true, ..Default::default() };
+        acks(&mut narrow, 15, 4096);
+        assert_eq!(narrow.rate(15), 0x508);
+    }
+
+    #[test]
+    fn wide_rungs_match_nss_and_bandwidth() {
+        let mut c = TxStatusCounters { phy: 2, wide: true, ..Default::default() };
+        acks(&mut c, 15, TX_PROBE_ACKS as usize * 9);
+        assert_eq!(c.rate(15), 0x8504);
+        let before = c.rates[0];
+        // The same MCS reported at 20 MHz or on one stream is not this rung.
+        c.observe(&txs(0x504, true, 15, TX_PID_UNICAST));
+        c.observe(&txs(0x8104, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rates[0].index, before.index);
+        assert!(!c.rates[0].failed);
+        assert_eq!(c.rates[0].stale, 2);
+        // The real rung still counts: an unconfirmed probe steps down.
+        c.observe(&txs(0x8504, true, 15, TX_PID_UNICAST));
+        assert_eq!(c.rate(15), 0x508);
     }
 
     #[test]

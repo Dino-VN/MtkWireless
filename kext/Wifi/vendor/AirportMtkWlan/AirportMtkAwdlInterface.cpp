@@ -512,6 +512,7 @@ bool AirportMtkAwdlInterface::admitDataRx(int peer,unsigned stream,const uint8_t
 #ifdef KERNEL
     uint16_t mask=dataPeers.entries[peer].windows[stream].sequenceBits==12 ? 0xfff : 0xffff;
     recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted,mask);
+    if(accepted && hal) hal->awdlNoteDataRx();
 #endif
     if(accepted) ++dataRxDecoded; else ++dataRxReplay;
     return accepted;
