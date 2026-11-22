@@ -602,6 +602,7 @@ bool AirportMtkAwdlInterface::initWithController(AirportMtkWlan *controller,ethe
     int forwardMode=1;
     PE_parse_boot_argn("amtk_awdl_forward",&forwardMode,sizeof(forwardMode));
     forwardEnabled=forwardMode!=0; // 0 restores the greedy scheduler and legacy lead aging.
+    neighbors.init(); // amtk_awdl_ndp=0 leaves it off
     // Configuration is tracked by the native peer manager; this backend keeps
     // the firmware context ready once registration succeeds.
     requestedChannel=grantedChannel=0; nextAction=requestDeadline=0;
@@ -730,6 +731,8 @@ void AirportMtkAwdlInterface::shutdownInGate()
 void AirportMtkAwdlInterface::stop(IOService *provider)
 {
     retain();
+    // Blocking route-socket cleanup; never needs the gate.
+    neighbors.stop();
     if(_fCommandGate && _fCommandGate->getWorkLoop())
         _fCommandGate->runAction(stopGated,this,provider);
     else stopInGate(provider); // unshared partial init/final teardown
@@ -756,6 +759,7 @@ void AirportMtkAwdlInterface::stopInGate(IOService *provider)
 void AirportMtkAwdlInterface::free()
 {
     shutdown(); releaseDataPath(); OSSafeReleaseNULL(timer);
+    neighbors.release();
     if(nativeBaseInitialized) super::free();
     else {
         // Never enter IO80211SkywalkInterface::free on an object whose base
@@ -1755,10 +1759,44 @@ void AirportMtkAwdlInterface::publishRocDiagnostics()
     auto *last=rocTrace.find(rocTrace.count);
     if(last) setProperty("MTKAWDLROCTraceLast",last,sizeof(*last));
 }
+// Issue #10: hand the live unicast data peers to AwdlNeighbors (gate, once
+// per second while AWDL runs). It installs fe80::%awdl0/64 and a static
+// neighbour per peer off the gate; no update for 5 s removes them.
+void AirportMtkAwdlInterface::updateNeighbors()
+{
+    ifnet_t ifp=getBSDInterface();
+    if(enabled && dataPathEnabled && !stopping && ifp && ifnet_name(ifp)) {
+        char name[IFNAMSIZ]={};
+        snprintf(name,sizeof(name),"%s%u",ifnet_name(ifp),ifnet_unit(ifp));
+        uint8_t lladdr[6]={};
+        if(ifnet_lladdr_copy_bytes(ifp,lladdr,sizeof(lladdr))) memcpy(lladdr,state.mac,6);
+        const uint64_t now=awdlNow();
+        AwdlNeighbors::Peer peers[mtkawdl::maxPeers]={};
+        unsigned count=0;
+        for(const auto &entry:dataPeers.entries) {
+            if(!dataPeers.live(entry,now) || !mtkawdl::unicast(entry.replayState.mac)) continue;
+            memcpy(peers[count].mac,entry.replayState.mac,6);
+            peers[count].cached=entry.cached;
+            ++count;
+        }
+        neighbors.update(name,lladdr,peers,count);
+    }
+    const auto c=neighbors.counters();
+    setProperty("MTKAWDLNdpEnabled",c.enabled);
+    setProperty("MTKAWDLNdpRouteOwned",c.routeOwned);
+    setProperty("MTKAWDLNdpNeighbors",static_cast<uint64_t>(c.neighbors),32);
+    setProperty("MTKAWDLNdpRouteAdds",c.routeAdds,64);
+    setProperty("MTKAWDLNdpNeighborAdds",c.neighborAdds,64);
+    setProperty("MTKAWDLNdpNeighborDeletes",c.neighborDeletes,64);
+    setProperty("MTKAWDLNdpErrors",c.errors,64);
+    setProperty("MTKAWDLNdpLastErrno",static_cast<uint64_t>(c.lastErrno),32);
+    setProperty("MTKAWDLNdpPasses",c.passes,64);
+}
 void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
 {
     if(lastDiagnostic && now-lastDiagnostic<1000000) return;
     lastDiagnostic=now;
+    updateNeighbors();
     publishRocDiagnostics();
     hal->awdlPublishDiagnostics();
     setProperty("MTKAWDLNativeRxPackets",nativeRx,64);

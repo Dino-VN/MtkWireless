@@ -195,6 +195,7 @@ WIFI_VENDOR_SOURCES=(
     $V/SimpleMtkWlan/MtkPCIe.cpp $V/AirportMtkWlan/AirportMtkWlan.cpp $V/AirportMtkWlan/AirportMtkSkywalkInterface.cpp
     $V/AirportMtkWlan/AirportMtkEthernetInterface.cpp $V/AirportMtkWlan/AirportMtkAwdlInterface.cpp
     $V/AirportMtkWlan/MtkPCIEDeviceWrapper.cpp $V/AirportMtkWlan/WCL/WCL.cpp
+    $V/AirportMtkWlan/AwdlNeighbors.cpp
 )
 # Xcode resolves "header.h" through a header map of all project headers;
 # these are the directories it covers.

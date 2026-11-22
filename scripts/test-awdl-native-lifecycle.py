@@ -65,7 +65,7 @@ INTERFACE_GROUPS = {
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
     "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics publishScheduler serviceInGate receive",
+    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics updateNeighbors publishScheduler serviceInGate receive",
     "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES getPEER_CACHE_MAXIMUM_SIZE getAWDL_DEVICE_CAPABILITIES setAWDL_OOB_REQUEST oobRequestGated setOobRequestInGate setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
@@ -373,6 +373,22 @@ unsigned ifnet_offload(ifnet_t p) { return p->offload; }
 unsigned ifnet_capabilities_enabled(ifnet_t p) { return p->enabled; }
 unsigned ifnet_capabilities_supported(ifnet_t p) { return p->supported; }
 int ifnet_set_lladdr(ifnet_t p,const void *mac,unsigned n) { assert(n==6); ++bsdBoundary.lladdrCalls; memcpy(p->mac,mac,n); return 0; }
+const char *ifnet_name(ifnet_t) { return "awdl"; }
+unsigned ifnet_unit(ifnet_t) { return 0; }
+int ifnet_lladdr_copy_bytes(ifnet_t p,void *out,size_t n) { assert(n==6); memcpy(out,p->mac,n); return 0; }
+// Model of AwdlNeighbors (issue #10). The production class (route socket,
+// thread call) is tested by scripts/test-awdl-ndp.py; this only records the
+// calls the interface makes.
+struct AwdlNeighbors {
+ struct Peer { uint8_t mac[6]; bool cached; };
+ struct Counters { uint64_t routeAdds,neighborAdds,neighborDeletes,errors,passes; int32_t lastErrno; uint32_t neighbors; bool routeOwned,enabled; };
+ unsigned inits=0,updates=0,stops=0,releases=0,lastCount=0; std::string lastName;
+ bool init() { ++inits; return true; }
+ void update(const char *name,const uint8_t *,const Peer *,unsigned count) { ++updates; lastName=name; lastCount=count; }
+ void stop() { ++stops; }
+ void release() { ++releases; }
+ Counters counters() { return Counters{}; }
+};
 struct Packet { std::vector<uint8_t> bytes; unsigned flags=1; };
 using mbuf_t=Packet *;
 constexpr unsigned MBUF_DONTWAIT=0,MBUF_PKTHDR=1,MBUF_WAITOK=2;

@@ -13,6 +13,7 @@
 #include <AWDL/AwdlRocTrace.hpp>
 #include <IOKit/IOTimerEventSource.h>
 #include "MtkMwx.hpp"
+#include "AwdlNeighbors.hpp"
 class AirportMtkWlan;
 class AirportMtkAwdlInterface : public IO80211AWDLProtocol {
     OSDeclareDefaultStructors(AirportMtkAwdlInterface)
@@ -174,6 +175,9 @@ private:
     static IOReturn oobRequestGated(OSObject*,void*,void*,void*,void*);
     IOReturn setOobRequestInGate(apple80211_awdl_oob_request*);
     void publishScheduler(uint64_t);
+    // Issue #10: awdl0 fe80::/64 route and peer neighbours (AwdlNeighbors.hpp).
+    AwdlNeighbors neighbors;
+    void updateNeighbors();
     void publishRocDiagnostics();
     mtkawdl::RocTrace rocTrace;
     IOReturn recordCacheControlResult(IOReturn,uint64_t);

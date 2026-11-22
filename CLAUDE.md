@@ -116,6 +116,14 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   250 ms for AWDL between them (`amtk_scan_chunk`, `amtk_scan_gap`), joins
   never. `TxStatusCounters` gained `phy`/`band2g`/`wide`/`rates2g` (both
   layout tables).
+- IPv6 to AWDL peers (issue #10, docs/AWDL-IPV6.md): macOS 26 gave awdl0
+  neither `fe80::%awdl0/64` nor peer neighbours with this driver, so unicast
+  died in the stack (EHOSTUNREACH, `TXDataAcked` 0) while discovery worked.
+  `AwdlNeighbors` adds both through a kernel PF_ROUTE socket from a thread
+  call (never in the gate), deletes only what its own RTM_ADD created, and
+  removes everything when AWDL is down (no update for 5 s) or stopped.
+  `amtk_awdl_ndp=0` off; ioreg `MTKAWDLNdp*`. The reporter's equivalent
+  patch was verified on hardware; this implementation is not yet.
 - `sudo dmesg` is useless for driver printf: system IOMemoryDescriptor
   backtrace spam overwrites the buffer within seconds. Publish diagnostics
   to ioreg.
