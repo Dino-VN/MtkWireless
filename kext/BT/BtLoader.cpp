@@ -149,6 +149,9 @@ mtk_bt_transport makeTransport(USBDeviceController *controller)
  * up power-off for HCI_INIT_TIMEOUT. */
 constexpr uint32_t kShutdownCommandTimeout = 1000;
 
+/* Read by AppleUSBXHCIPort::powerOn (see disablePortConnectWake). */
+constexpr const char *kPortWakeSourcesPolicy = "UsbHostControllerPortWakeSourcesPolicy";
+
 /* Open watchdog (see armOpenWatchdog). */
 constexpr uint64_t kWatchdogMinUptimeSec = 180;
 constexpr uint32_t kWatchdogDelayMs = 20000;
@@ -197,6 +200,9 @@ bool MtkWirelessBTLoader::start(IOService *provider)
     mtk_rust_set_log(rustLog);
     BTLog("start, Rust core %s\n", mtk_rust_version());
 
+    if (!checkKernelArgument("-mtkbtportwake"))
+        disablePortConnectWake();
+
     char firmware[64] {};
     bool ok = bringUp(firmware, sizeof(firmware));
     publish(ok, ok ? firmware : nullptr);
@@ -232,6 +238,88 @@ bool MtkWirelessBTLoader::bringUp(char *firmware, size_t len)
     strlcpy(firmware, info.firmware, len);
     BTLog("MediaTek 0x%04x ready, firmware %s\n", info.dev_id, firmware);
     return true;
+}
+
+// System sleep (2026-11-23, B550, MT7922 card whose USB Bluetooth goes to
+// the chipset xHCI PTXH): S3 cuts the card's power, so the Bluetooth device
+// drops off its port right after ACPI SLEEP. The port is a standard one
+// (USBPortType 0) and AppleUSBXHCIPort::powerOn armed PORTSC wake on
+// connect/disconnect/over-current for it: every S3 woke 0.5-2 s later (PTXH
+// PMCSR 0x8108, wake reason "?"), the patch was gone afterwards
+// (PatchUndone) and only unplugging the card let the Mac sleep. Remote wake
+// was not it: still waking with kUSBRemoteWakeOverride false.
+// powerOn leaves the wake bits alone when UsbHostControllerPortWakeSourcesPolicy
+// (looked up from the port up through its parents) is 1. Apple sets no
+// disconnect wake on internal ports either. powerOn runs at controller start
+// (before we match) and again on every wake, so the bits armed at boot are
+// cleared in PORTSC directly. -mtkbtportwake: leave the port alone.
+void MtkWirelessBTLoader::disablePortConnectWake()
+{
+    IOService *port = m_device->getProvider();
+    OSNumber *policy = OSNumber::withNumber(1ULL, 32);
+    if (!port || !policy) {
+        OSSafeReleaseNULL(policy);
+        return;
+    }
+    port->setProperty(kPortWakeSourcesPolicy, policy);
+    policy->release();
+    // The bits powerOn already set stay until the next power-on: clear them
+    // now, so the first sleep after boot is covered too.
+    clearPortWakeBits(port);
+}
+
+// Root port only (the port's provider is the xHCI controller, whose provider
+// is the PCI device). Same neutral write as Linux xhci_set_remote_wake_mask:
+// read-only and RWS bits kept, RW1C/RW1S bits (PED, change bits, PR, WPR)
+// written as 0, PLS ignored without LWS. Checks the PORTSC first (connected,
+// powered, high speed like our device), so a wrong port number is never
+// written.
+void MtkWirelessBTLoader::clearPortWakeBits(IOService *port)
+{
+    constexpr uint32_t kPortCCS = 1u << 0, kPortOCA = 1u << 3, kPortPLS = 0xfu << 5, kPortPP = 1u << 9,
+                       kPortSpeed = 0xfu << 10, kPortPIC = 3u << 14, kPortCAS = 1u << 24, kPortWCE = 1u << 25,
+                       kPortWDE = 1u << 26, kPortWOE = 1u << 27, kPortDR = 1u << 30;
+    constexpr uint32_t kPortRO = kPortCCS | kPortOCA | kPortSpeed | kPortCAS | kPortDR;
+    constexpr uint32_t kPortRWS = kPortPLS | kPortPP | kPortPIC | kPortWCE | kPortWDE | kPortWOE;
+    constexpr uint32_t kPortWake = kPortWCE | kPortWDE | kPortWOE;
+    constexpr uint32_t kSpeedHigh = 3u << 10;
+
+    IOService *controller = port->getProvider();
+    IOService *pci = controller ? controller->getProvider() : nullptr;
+    OSData *number = OSDynamicCast(OSData, port->getProperty("usb-port-number"));
+    if (!pci || !pci->metaCast("IOPCIDevice") || !number || number->getLength() != sizeof(uint32_t)) {
+        BTLog("port wake: not a root port, cleared from next power-on\n");
+        return;
+    }
+    uint32_t portNum = 0;
+    memcpy(&portNum, number->getBytesNoCopy(), sizeof(portNum));
+    IOMemoryMap *map = pci->mapDeviceMemoryWithIndex(0);
+    if (!map) {
+        BTLog("port wake: BAR0 not mapped, cleared from next power-on\n");
+        return;
+    }
+    const auto base = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
+    const uint32_t capLength = base[0];
+    const uint32_t maxPorts = *reinterpret_cast<volatile uint32_t *>(base + 0x04) >> 24; // HCSPARAMS1
+    const uint64_t portscOff = capLength + 0x400 + 0x10ULL * (portNum - 1);
+    if (portNum == 0 || portNum > maxPorts || portscOff + 4 > map->getLength()) {
+        BTLog("port wake: port %u outside %u ports, cleared from next power-on\n", portNum, maxPorts);
+        map->release();
+        return;
+    }
+    auto portsc = reinterpret_cast<volatile uint32_t *>(base + portscOff);
+    const uint32_t before = *portsc;
+    if (before == 0xffffffff || (before & (kPortCCS | kPortPP)) != (kPortCCS | kPortPP) ||
+        (before & kPortSpeed) != kSpeedHigh) {
+        BTLog("port wake: PORTSC %u = 0x%08x unexpected, cleared from next power-on\n", portNum, before);
+    } else if (before & kPortWake) {
+        *portsc = (before & kPortRO) | (before & kPortRWS & ~kPortWake);
+        BTLog("port wake: PORTSC %u 0x%08x -> 0x%08x, no wake on connect/disconnect\n", portNum, before,
+              static_cast<uint32_t>(*portsc));
+    } else {
+        BTLog("port wake: PORTSC %u = 0x%08x, already off\n", portNum, before);
+    }
+    map->release();
 }
 
 void MtkWirelessBTLoader::publish(bool loaded, const char *firmware)

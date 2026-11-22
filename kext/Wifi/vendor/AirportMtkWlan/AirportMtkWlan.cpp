@@ -1329,8 +1329,9 @@ IOReturn AirportMtkWlan::setPowerState(unsigned long powerStateOrdinal, IOServic
                 retain();
                 if (thread_call_enter(powerOnThreadCall))
                     release();
-                // System resume (<= 3 s) + HAL start (<= 4 s).
-                result = 10000000;
+                // System resume (<= 6 s, firmware reload after power
+                // loss) + HAL start (<= 4 s).
+                result = 12000000;
             }
             break;
 
@@ -1427,14 +1428,14 @@ void AirportMtkWlan::setPowerStateOff()
 
 void AirportMtkWlan::publishSystemPowerStats(MtkMwx *hal)
 {
-    uint32_t stats[8];
+    uint32_t stats[9];
     hal->systemPowerStats(stats);
-    static const char *const keys[8] = {
+    static const char *const keys[9] = {
         "MTKSysPMSuspends", "MTKSysPMResumes", "MTKSysPMFailures",
         "MTKSysPMLastError", "MTKSysPMLastStep", "MTKSysPMDmaBusy",
-        "MTKSysPMDmaReinit", "MTKSysPMSuspended",
+        "MTKSysPMDmaReinit", "MTKSysPMSuspended", "MTKSysPMFwReloads",
     };
-    for (unsigned i = 0; i < 8; i++)
+    for (unsigned i = 0; i < 9; i++)
         setProperty(keys[i], static_cast<uint64_t>(stats[i]), 32);
 }
 

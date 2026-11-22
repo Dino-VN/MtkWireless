@@ -32,6 +32,8 @@ private:
     bool bringUp(char *firmware, size_t len);
     void publish(bool loaded, const char *firmware);
     void releaseUsbSession();
+    void disablePortConnectWake();
+    static void clearPortWakeBits(IOService *port);
     void powerOffController(IOOptionBits specifier);
     void armOpenWatchdog();
     static void openWatchdogFired(thread_call_param_t self, thread_call_param_t);
