@@ -360,6 +360,23 @@ private:
     uint8_t remapInfraSlot(uint8_t channel);
     uint8_t sequenceInfra = 0; uint64_t infraSlotRemaps = 0;
     void updatePresence(uint64_t);
+    // MtkWireless (issue #11): while associated, with awdld's sparse Idle /
+    // Low Power sequence and no AWDL data, leave the AP channel at most once
+    // per amtk_awdl_idle_gap ms (default 1000, 0 off), alternating channels.
+    // Every off-channel visit pauses the AP link ~200 ms (PM=1 at the ROC
+    // request, ~156 ms lead, the window, PM=0).
+    uint64_t idleCapGapUS = 0; bool idleCapActive = false;
+    uint64_t idleCapActiveSince = 0, idleCapActiveUS = 0, idleCapTransitions = 0;
+    uint64_t idleCapOffAt = 0, idleCapVisits = 0, idleCapBlocked = 0;
+    uint8_t idleCapOffChannel = 0, idleCapOffToken = 0, idleCapBlockedChannel = 0;
+    uint64_t idleCapBlockedWindow = 0;
+    void updateIdleCap(uint64_t now);
+    bool idleCapAllows(uint8_t channel, uint64_t now);
+    // hal->awdlChannelReachable plus the idle cap. Use this, not the HAL's.
+    bool channelReachable(uint8_t channel);
+    // planRadio's onlyChannel: the static amtk_awdl_offchan=0 channel, or the
+    // AP channel while the idle cap blocks every off-channel window.
+    uint8_t planOnlyChannel(uint64_t now);
     struct AddbaDecline { uint8_t request[24+9]; bool valid; } addbaPending[4] = {};
     uint64_t addbaRequests = 0, addbaQueued = 0, addbaSubmitted = 0, addbaFailed = 0, addbaAccepted = 0;
     uint64_t addbaExpired = 0, addbaDeferred = 0, addbaDropped = 0, delbaReceived = 0;

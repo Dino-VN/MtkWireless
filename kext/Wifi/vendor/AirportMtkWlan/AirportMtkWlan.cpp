@@ -143,7 +143,7 @@ IOReturn AirportMtkWlan::publishJoinDiagnosticsGated(OSObject *owner, void *, vo
     if (dict) { self->setProperty("MTKWiFiJoinLastFailed", dict); dict->release(); }
     dict = mtkJoinDictionary(ic->ic_join_assoc_failed);
     if (dict) { self->setProperty("MTKWiFiJoinLastAssocFailed", dict); dict->release(); }
-    self->setProperty("MTKWiFiJoinDiagnosticVersion", uint64_t(3), 32);
+    self->setProperty("MTKWiFiJoinDiagnosticVersion", uint64_t(4), 32);
     self->setProperty("MTKWiFiQueryDiagnosticVersion", uint64_t(1), 32);
 #define MTK_WIFI_QUERY_PROPERTY(name, field) \
     self->setProperty(name, uint64_t(__atomic_load_n(&self->field, __ATOMIC_RELAXED)), 32)

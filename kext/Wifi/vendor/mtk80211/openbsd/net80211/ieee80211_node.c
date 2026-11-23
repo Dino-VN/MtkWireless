@@ -1335,6 +1335,63 @@ ieee80211_node_join_bss(struct ieee80211com *ic, struct ieee80211_node *selbs, i
     }
 }
 
+/*
+ * MtkWireless (issue #11): why a WCL join's scan pass selected nothing.
+ * The target is the BSSID WCL named, or else the strongest node of the
+ * requested SSID. Key-free: counts, channel, RSSI and match-failure bits.
+ */
+static int
+ieee80211_join_diag_ssid(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+    return ic->ic_des_esslen != 0 && ni->ni_esslen == ic->ic_des_esslen &&
+        memcmp(ni->ni_essid, ic->ic_des_essid, ic->ic_des_esslen) == 0;
+}
+
+static struct ieee80211_node *
+ieee80211_join_diag_target(struct ieee80211com *ic)
+{
+    struct ieee80211_node *ni, *best = NULL;
+
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (ic->ic_flags & IEEE80211_F_DESBSSID) {
+            if (IEEE80211_ADDR_EQ(ni->ni_bssid, ic->ic_des_bssid))
+                return ni;
+        } else if (ieee80211_join_diag_ssid(ic, ni) &&
+            (best == NULL || ni->ni_rssi > best->ni_rssi))
+            best = ni;
+    }
+    return best;
+}
+
+static void
+ieee80211_join_diag_scan_pass(struct ieee80211com *ic)
+{
+    struct mtk_join_diag *d = &ic->ic_join_diag;
+    struct ieee80211_node *ni;
+    uint64_t nodes = 0, ssid = 0;
+
+    if (!d->Active || !ic->ic_wcl_join_requested)
+        return;
+    ++d->ScanPasses;
+    if (!d->ScanFirstDoneAtUS)
+        d->ScanFirstDoneAtUS = mtk_join_now();
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        ++nodes;
+        if (ieee80211_join_diag_ssid(ic, ni))
+            ++ssid;
+    }
+    d->ScanNodes = nodes;
+    d->ScanSsidNodes = ssid;
+    ni = ieee80211_join_diag_target(ic);
+    d->ScanTargetSeen = ni != NULL;
+    d->ScanTargetChannel = ni && ni->ni_chan && ni->ni_chan != IEEE80211_CHAN_ANYC ?
+        ieee80211_chan2ieee(ic, ni->ni_chan) : 0;
+    d->ScanTargetRssi = ni ? ni->ni_rssi : 0;
+    d->ScanTargetFail = 0;
+    if (ni)
+        ++d->ScanTargetSeenPasses;
+}
+
 struct ieee80211_node *
 ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
                           struct ieee80211_node **curbs)
@@ -1344,11 +1401,17 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
     *selbs2 = NULL, *selbs5 = NULL;
     uint8_t min_5ghz_rssi;
     
+    struct ieee80211_node *diag = !bgscan && ic->ic_join_diag.Active &&
+        ic->ic_wcl_join_requested ? ieee80211_join_diag_target(ic) : NULL;
     ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
     
     for (; ni != NULL; ni = nextbs) {
         nextbs = RB_NEXT(ieee80211_tree, &ic->ic_tree, ni);
         if (ni->ni_fails) {
+            if (ni == diag) {
+                ++ic->ic_join_diag.ScanTargetFailSkips;
+                diag = NULL;
+            }
             /*
              * The configuration of the access points may change
              * during my scan.  So delete the entry for the AP
@@ -1364,6 +1427,8 @@ ieee80211_node_choose_bss(struct ieee80211com *ic, int bgscan,
             *curbs = ni;
         
         int fail = ieee80211_match_bss(ic, ni, bgscan);
+        if (ni == diag)
+            ic->ic_join_diag.ScanTargetFail = (uint32_t)fail;
         if (fail != 0) {
             DPRINTF(("%s ieee80211_match_bss==FALSE, ssid=%s, bssid=%s, %d\n", __FUNCTION__, ni->ni_essid, ether_sprintf(ni->ni_bssid), fail));
             continue;
@@ -1448,6 +1513,8 @@ ieee80211_end_scan(struct _ifnet *ifp)
     }
 
     ni = RB_MIN(ieee80211_tree, &ic->ic_tree);
+    if (!bgscan)
+        ieee80211_join_diag_scan_pass(ic);
     
 #ifndef IEEE80211_STA_ONLY
     if (ic->ic_opmode == IEEE80211_M_HOSTAP) {

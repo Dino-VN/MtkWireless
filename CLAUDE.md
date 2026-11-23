@@ -93,6 +93,31 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   only mode (`awdlOnlyChannel`, `planRadio`'s `onlyChannel`). Unverified on
   hardware for AirDrop; 0.1.3 ran 81 handshakes with the AP link intact.
   ioreg `MTKAWDLInfraPS*` counts the handshakes.
+- Infra throughput with AWDL idle (issue #11, unverified on hardware):
+  1.1.2 report (2026-11-23, MT7922, AP 36 VHT80 at -75 dBm, AirDrop
+  "Everyone"): 37/8 Mbps vs 75/19 on Windows. awdld sat in Low Power
+  `[36 0 44 0 0 0 0 0 6 0 44 ...]` / Idle; 2742 PM handshakes in 34 min
+  (1.3/s, ~200 ms of AP power save each: PM=1 at the ROC request, ~156 ms
+  lead, window, PM=0), and all 1911 AP-channel ROCs asked for 20 MHz.
+  `AirportMtkAwdlInterface::updateIdleCap`: while associated, with awdld's
+  sequence <= 6/16 active slots and no AWDL data (`updatePresence` busy or
+  5 s since), `channelReachable` / `planOnlyChannel` allow one off-channel
+  visit per `amtk_awdl_idle_gap` ms (default 1000, max 1500 so each of two
+  channels is seen within the 3 s peer lifetime), alternating channels; a
+  pending/granted ROC is never stranded. Always use `channelReachable`, not
+  `hal->awdlChannelReachable`, in the interface; `forwardRadioContext`
+  keeps the static `awdlOnlyChannel()`. ioreg `MTKAWDLIdleCap*`.
+  `mwx_awdl_infra_tuning`: a ROC on the AP's own channel uses the BSS's
+  40/80 MHz width/center (TX ladder stays 20 MHz, `sc_awdl_roc_wide`
+  false); 3 refusals without a grant fall back to 20 MHz for the session.
+  `amtk_awdl_infra_bw=0` off; ioreg `MTKAWDLROCInfraWide*`. The same
+  report's "cannot reconnect after disconnecting" joins ended in SCAN when
+  airportd gave up after 10 s (`Outcome` 0xe00002eb, never AUTH); join
+  diag version 4 adds `Scan{Passes,FirstDoneAtUS,Nodes,SsidNodes,
+  TargetSeen,TargetSeenPasses,TargetChannel,TargetRssi,TargetFail,
+  TargetFailSkips}` (`ieee80211_join_diag_scan_pass`; target = WCL's BSSID
+  or the strongest node of the SSID; `TargetFail` =
+  `IEEE80211_NODE_ASSOCFAIL_*`; `TargetFailSkips` = skipped for `ni_fails`).
 - Unassociated, Wi-Fi scans and joins win over AWDL: `mt7921_mcu_hw_scan`
   suspends scans for AWDL only while associated (RUN), otherwise it aborts
   the AWDL ROC and scans; `awdlReserve` refuses ROC during a scan and while

@@ -195,7 +195,17 @@
     X(InfraPSWakes) \
     X(InfraPSRefused) \
     X(InfraPSAtUS) \
-    X(InfraPSAtStart)
+    X(InfraPSAtStart) \
+    X(ScanPasses) \
+    X(ScanFirstDoneAtUS) \
+    X(ScanNodes) \
+    X(ScanSsidNodes) \
+    X(ScanTargetSeen) \
+    X(ScanTargetSeenPasses) \
+    X(ScanTargetChannel) \
+    X(ScanTargetRssi) \
+    X(ScanTargetFail) \
+    X(ScanTargetFailSkips)
 struct mtk_join_diag {
 #define MTK_JOIN_FIELD(name) uint64_t name;
     MTK_JOIN_DIAG_FIELDS(MTK_JOIN_FIELD)

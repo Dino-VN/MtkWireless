@@ -561,6 +561,12 @@ struct mwx_softc {
     // AWDL frames received inside the current 5 GHz grant, by its width.
     uint64_t sc_awdl_rx_wide, sc_awdl_rx_narrow5, sc_awdl_wide_auto_off;
     uint64_t sc_awdl_wide_grants_session; // since this AWDL enable
+    // MtkWireless (issue #11): a ROC on the AP's own channel keeps the
+    // BSS's 40/80 MHz tuning (mwx_awdl_infra_tuning); AWDL TX stays 20 MHz.
+    bool sc_awdl_roc_infra_wide;  // the pending/granted ROC uses the BSS width
+    bool sc_awdl_infra_wide_off;  // refused 3x without a grant: 20 MHz this session
+    uint64_t sc_awdl_infra_wide_grants, sc_awdl_infra_wide_rejects;
+    uint64_t sc_awdl_infra_wide_grants_session;
     uint64_t sc_awdl_roc_submitted, sc_awdl_roc_send_failed;
     uint64_t sc_awdl_roc_scan_blocked, sc_awdl_roc_busy_blocked;
     uint64_t sc_awdl_roc_timeouts;
@@ -4852,6 +4858,7 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
         now-sc->sc_awdl_roc.requestedAt : 0;
     bool enabled=sc->sc_awdl_enabled && !sc->sc_awdl_stopping && !sc->sc_resetting && !sc->sc_detaching;
     const bool askedWide=sc->sc_awdl_roc.pending && sc->sc_awdl_roc_wide;
+    const bool askedInfraWide=sc->sc_awdl_roc.pending && sc->sc_awdl_roc_infra_wide;
     mtkawdl::RocResult result=mtkawdl::receiveRocGrant(sc->sc_awdl_roc,p,n,
         sc->sc_awdl_vif.idx,enabled,now,sc->sc_awdl_roc_last_event);
     sc->sc_awdl_roc_last_result=result;
@@ -4862,8 +4869,16 @@ static void mwx_awdl_roc_event(mwx_softc *sc,const uint8_t *p,size_t n,uint64_t 
         ++sc->sc_awdl_wide_rejects;
         if(!sc->sc_awdl_wide_grants && sc->sc_awdl_wide_rejects>=3) sc->sc_awdl_wide_off=true;
     }
+    if(askedInfraWide && result==mtkawdl::RocResult::FirmwareStatus) {
+        // Same fallback for the AP-channel tuning: a refused ROC is a missed
+        // AWDL window, so give up on the BSS width after three refusals.
+        ++sc->sc_awdl_infra_wide_rejects;
+        if(!sc->sc_awdl_infra_wide_grants_session && sc->sc_awdl_infra_wide_rejects>=3)
+            sc->sc_awdl_infra_wide_off=true;
+    }
     if(result==mtkawdl::RocResult::Accepted) {
         ++sc->sc_awdl_roc_grants;
+        if(askedInfraWide) { ++sc->sc_awdl_infra_wide_grants; ++sc->sc_awdl_infra_wide_grants_session; }
         // The TX ladder follows the granted window (band and width).
         sc->sc_awdl_tx_status.band2g=sc->sc_awdl_roc.channel<=14;
         sc->sc_awdl_tx_status.wide=askedWide;
@@ -10602,6 +10617,42 @@ static uint8_t mwx_awdl_center80(mwx_softc *sc,uint8_t channel)
     return center;
 }
 
+// MtkWireless (issue #11): boot-arg amtk_awdl_infra_bw=0 requests AP-channel
+// AWDL ROCs at 20 MHz again (1.1.2 behaviour).
+static bool mwx_awdl_infra_bw_enabled()
+{
+    static int enabled=-1;
+    if(enabled<0) {
+        int value=1;
+        if(!PE_parse_boot_argn("amtk_awdl_infra_bw",&value,sizeof(value))) value=1;
+        enabled=value!=0;
+    }
+    return enabled;
+}
+
+// The width/center to request for an AWDL ROC on the AP's own channel, or
+// false for a plain 20 MHz ROC. Up to 1.1.2 every such ROC asked for 20 MHz
+// although the BSS ran at 40/80 MHz (1.1.2 hardware, 2026-11-23: AP on 36
+// VHT80, macOS's Low Power schedule puts slot 0 on 36, 1911 AP-channel
+// grants in 34 min, all narrow). That retunes the radio away from the AP's
+// width for each grant, which mwx_awdl_center80 already avoids under
+// amtk_awdl_phy=2 ("one tuning for both"). Here only the tuning follows the
+// BSS: sc_awdl_roc_wide stays false, so AWDL TX keeps its 20 MHz ladder.
+static bool mwx_awdl_infra_tuning(mwx_softc *sc,uint8_t channel,uint8_t &bw,uint8_t &center)
+{
+    struct ieee80211com *ic=&sc->sc_ic;
+    if(!mwx_awdl_infra_bw_enabled() || sc->sc_awdl_infra_wide_off) return false;
+    if(ic->ic_opmode!=IEEE80211_M_STA || ic->ic_state!=IEEE80211_S_RUN || !ic->ic_bss ||
+       !ic->ic_bss->ni_chan || ic->ic_bss->ni_chan==IEEE80211_CHAN_ANYC ||
+       IEEE80211_IS_CHAN_6GHZ(ic->ic_bss->ni_chan) ||
+       ieee80211_chan2ieee(ic,ic->ic_bss->ni_chan)!=channel)
+        return false;
+    if(sc->sc_bss_bw!=CMD_CBW_40MHZ && sc->sc_bss_bw!=CMD_CBW_80MHZ) return false;
+    if(!sc->sc_bss_center || sc->sc_bss_center==channel) return false;
+    bw=sc->sc_bss_bw; center=sc->sc_bss_center;
+    return true;
+}
+
 // MtkWireless: boot-arg amtk_awdl_dense=0 keeps awdld's sparse AWDL
 // sequence during transfers. Dense presence never pulls the radio off an AP
 // on another channel (that would cost a PM handshake per EAW).
@@ -10977,6 +11028,10 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable, const AwdlSyncG
     sc->sc_awdl_roc_wide=false;
     sc->sc_awdl_wide_off=false;
     sc->sc_awdl_wide_grants_session=0;
+    sc->sc_awdl_roc_infra_wide=false;
+    sc->sc_awdl_infra_wide_off=false;
+    sc->sc_awdl_infra_wide_rejects=0;
+    sc->sc_awdl_infra_wide_grants_session=0;
     sc->sc_awdl_rx_wide=0;
     sc->sc_awdl_native_session=mwx_awdl_native_new_session();
     sc->sc_awdl_enabled=true;
@@ -11069,10 +11124,16 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     request[14]=channel; request[17]=channel; request[19]=1;
     // roc_acquire_tlv: sco 11, bw 13, center 14, bw_from_ap 16, center_from_ap 17.
     const uint8_t center80=mwx_awdl_center80(com,channel);
+    uint8_t infraBw=CMD_CBW_20MHZ, infraCenter=0;
+    const bool infraWide=!center80 && mwx_awdl_infra_tuning(com,channel,infraBw,infraCenter);
     if(center80) {
         request[11]=channel<center80 ? 1 : 3; // SCA / SCB
         request[13]=CMD_CBW_80MHZ; request[14]=center80;
         request[16]=CMD_CBW_80MHZ; request[17]=center80;
+    } else if(infraWide) {
+        request[11]=channel<infraCenter ? 1 : 3; // SCA / SCB
+        request[13]=infraBw; request[14]=infraCenter;
+        request[16]=infraBw; request[17]=infraCenter;
     }
     com->sc_awdl_vif.vif_mn.ni.ni_chan=&com->sc_ic.ic_channels[channel];
     mtkawdl::put32(request+20,durationMs); request[24]=0xff;
@@ -11083,6 +11144,7 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     com->sc_awdl_token_used[token]=now ? now : 1;
     com->sc_awdl_roc.request(token,channel,now);
     com->sc_awdl_roc_wide=center80!=0;
+    com->sc_awdl_roc_infra_wide=infraWide;
     com->sc_awdl_roc_timing={};
     com->sc_awdl_roc_timing.session=com->sc_awdl_native_session;
     com->sc_awdl_roc_timing.epoch=operation.epoch;
@@ -11223,6 +11285,9 @@ void MtkMwx::awdlPublishDiagnostics()
     bool wideOff=com->sc_awdl_wide_off, wideNow=com->sc_awdl_tx_status.wide;
     uint64_t rxWide=com->sc_awdl_rx_wide, rxNarrow5=com->sc_awdl_rx_narrow5,
              wideAutoOff=com->sc_awdl_wide_auto_off;
+    uint64_t infraWideGrants=com->sc_awdl_infra_wide_grants,
+             infraWideRejects=com->sc_awdl_infra_wide_rejects;
+    bool infraWideOff=com->sc_awdl_infra_wide_off;
     uint8_t phy=com->sc_awdl_tx_status.phy;
     IOLockUnlock(com->sc_awdl_lock);
     mwxController()->setProperty("MTKAWDLPhy",phy,8);
@@ -11234,6 +11299,9 @@ void MtkMwx::awdlPublishDiagnostics()
     mwxController()->setProperty("MTKAWDLRxWide",rxWide,64);
     mwxController()->setProperty("MTKAWDLRxNarrow5",rxNarrow5,64);
     mwxController()->setProperty("MTKAWDLWideAutoOff",wideAutoOff,64);
+    mwxController()->setProperty("MTKAWDLROCInfraWideGrants",infraWideGrants,64);
+    mwxController()->setProperty("MTKAWDLROCInfraWideRejects",infraWideRejects,64);
+    mwxController()->setProperty("MTKAWDLROCInfraWideOff",infraWideOff);
     mwxController()->setProperty("MTKAWDLUMIActive",nativeActive,64);
     mwxController()->setProperty("MTKAWDLUMITerminal",nativeTerminal,64);
     mwxController()->setProperty("MTKAWDLUMITimeouts",nativeTimeouts,64);

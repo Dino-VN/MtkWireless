@@ -1953,6 +1953,13 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLTrafficActive",trafficActive);
     setProperty("MTKAWDLDensePresence",densePresence);
     setProperty("MTKAWDLDensePresenceTransitions",presenceTransitions,64);
+    setProperty("MTKAWDLIdleCapActive",idleCapActive);
+    setProperty("MTKAWDLIdleCapGapMS",idleCapGapUS/1000,32);
+    setProperty("MTKAWDLIdleCapActiveMS",(idleCapActiveUS+(idleCapActive && idleCapActiveSince &&
+        awdlNow()>idleCapActiveSince ? awdlNow()-idleCapActiveSince : 0))/1000,64);
+    setProperty("MTKAWDLIdleCapTransitions",idleCapTransitions,64);
+    setProperty("MTKAWDLIdleCapVisits",idleCapVisits,64);
+    setProperty("MTKAWDLIdleCapBlocked",idleCapBlocked,64);
     setProperty("MTKAWDLHostRole",static_cast<uint64_t>(state.syncRole),32);
     unsigned peers=0;
     for(unsigned i=0;i<mtkawdl::maxPeers;++i) if(state.peers[i].used) ++peers;
@@ -2017,6 +2024,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     if(!radioServiceCurrent(serviceSession)) return;
     // Change our sequence only between AWs: the open AW keeps its snapshot.
     if(!awTimeline.open) updatePresence(now);
+    updateIdleCap(now);
     if(awTimeline.due(now)) {
         // The timestamp is the recorded radio/schedule edge, even if this
         // timer runs late. Administrative cancellation uses its observed time.
@@ -2034,7 +2042,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         // Use the native 10-TU end tolerance after accounting for this
         // start's lateness. The prior 8ms cap left usable switching time idle.
         uint64_t early=awTimeline.switchLeadUS();
-        if(snapshot && nextValid && next.channel && hal->awdlChannelReachable(next.channel) &&
+        if(snapshot && nextValid && next.channel && channelReachable(next.channel) &&
            !mtkawdl::grantCoversWindow(next,live,next.start) &&
            !mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,live,now) &&
            early && awTimeline.active.end-now<=early) {
@@ -2200,7 +2208,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     // still terminate it, rather than manufacturing a short AW-end.
     if(awTimeline.open && awTimeline.matchesSchedule(state)) window=awTimeline.active;
     uint8_t channel=window.channel;
-    if(!channel || !hal->awdlChannelReachable(channel)) {
+    if(!channel || !channelReachable(channel)) {
         if(awTimeline.open) notifyAvailabilityWindowEnd(now);
         if(!radioServiceCurrent(serviceSession)) return;
         // An idle slot may already be preparing the following channel.
@@ -2272,7 +2280,7 @@ void AirportMtkAwdlInterface::serviceInGate()
         grantReady=hal->awdlGrantSnapshot(grant) && grant.canTransmit(channel,now);
         uint8_t reachable[mtkawdl::slots]={};
         for(unsigned i=0;i<state.sequence.count && i<mtkawdl::slots;++i)
-            reachable[i]=state.sequence.channels[i] && hal->awdlChannelReachable(state.sequence.channels[i]);
+            reachable[i]=state.sequence.channels[i] && channelReachable(state.sequence.channels[i]);
         forward.update(state,now,forwardRadioContext(),forwardTiming,reachable,awTimeline,grant,
                        requestedWindow,requestedChannel,&reserveChannelTiming);
     }
@@ -2302,7 +2310,8 @@ void AirportMtkAwdlInterface::serviceInGate()
             // channel while associated. If no window is on it, back off
             // instead of polling every 2ms.
             // A grant on the AP's channel also spans idle slots (planRadio).
-            uint8_t onlyChannel=hal->awdlOnlyChannel();
+            // The idle cap (issue #11) masks off-channel windows the same way.
+            uint8_t onlyChannel=planOnlyChannel(now);
             bool greedy=mtkawdl::planRadio(state,now,plan,reserveLeadUS,skipCurrent,&reserveChannelTiming,
                                           onlyChannel,hal->awdlInfraChannel());
             bool recovery=forwardEnabled && forward.active &&
@@ -2316,7 +2325,15 @@ void AirportMtkAwdlInterface::serviceInGate()
             mtkawdl::ForwardSchedule issueSchedule{};
             if(forwardEnabled) issueSchedule.capture(state);
             mtkawdl::Window target=plan.window;
-            if(!target.channel || !hal->awdlChannelReachable(target.channel)) {
+            if(!target.channel || !channelReachable(target.channel)) {
+                // The idle cap gave the channel that just had its turn no
+                // new one yet: skip this window instead of a 1 ms poll loop.
+                if(target.channel && hal->awdlChannelReachable(target.channel) &&
+                   target.end>now) {
+                    uint64_t wait=target.end-now;
+                    timer->setTimeoutUS(static_cast<uint32_t>(wait<50000 ? wait : 50000));
+                    return;
+                }
                 timer->setTimeoutMS(1); return;
             }
             if(target.start>now && mtkawdl::grantCoversWindow(target,grant,target.start)) {
@@ -2468,7 +2485,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     }
     // A grant prepared for the next slot cannot produce TX or a native AW
     // during a slot whose channel is unavailable.
-    if(!channel || !hal->awdlChannelReachable(channel)) { timer->setTimeoutMS(1); return; }
+    if(!channel || !channelReachable(channel)) { timer->setTimeoutMS(1); return; }
     if(grantedChannel!=channel) ++grantObservations;
     uint8_t nativeRole=state.syncRole;
     const auto nativeContext=forwardEnabled ? forwardRadioContext() : mtkawdl::ForwardRadioContext{};
@@ -2674,7 +2691,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             // of the original future grant. A consumed edge has no open AW;
             // a preserved grant must not turn an old edge into a 1us poll loop.
             if(early && mtkawdl::currentWindow(state,awTimeline.active.end,next) &&
-               next.channel && hal->awdlChannelReachable(next.channel) &&
+               next.channel && channelReachable(next.channel) &&
                !mtkawdl::grantCoversWindow(next,live,next.start) &&
                !mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,live,now)) {
                 uint64_t remaining=prepareAt>now ? prepareAt-now : 1;
@@ -3414,6 +3431,93 @@ void AirportMtkAwdlInterface::updatePresence(uint64_t now)
     }
     densePresence=want; ++presenceTransitions;
     applySequence(now);
+}
+// MtkWireless (issue #11, 1.1.2 hardware 2026-11-23): AP on 36 VHT80, awdld in
+// Low Power/Idle ([36 0 44 0 0 0 0 0 6 0 44 ...]) the whole time, AirDrop
+// discovery "Everyone": 2742 PM handshakes in 34 min (1.3/s, ~200 ms of AP
+// power save each) and half the Windows throughput. Only awdld's sparse idle
+// sequences are capped; Discovery/Data sequences, traffic registration and
+// AWDL data (updatePresence) get every window, as before.
+void AirportMtkAwdlInterface::updateIdleCap(uint64_t now)
+{
+    static int64_t gap=-1;
+    if(gap<0) {
+        uint32_t ms=1000;
+        if(!PE_parse_boot_argn("amtk_awdl_idle_gap",&ms,sizeof(ms))) ms=1000;
+        // Upstream drops a peer after 3 s unheard (PEER_LIFETIME_US); with two
+        // off channels alternating, each is visited about every 2 gaps.
+        if(ms>1500) ms=1500;
+        gap=static_cast<int64_t>(ms)*1000;
+    }
+    idleCapGapUS=static_cast<uint64_t>(gap);
+    const uint8_t infra=hal->awdlInfraChannel();
+    mtkawdl::Reservation live={};
+    if(infra && hal->awdlGrantSnapshot(live) && (live.pending || live.granted) &&
+       now<live.deadline && live.channel && live.channel!=infra) {
+        if(!idleCapOffAt || live.token!=idleCapOffToken || live.channel!=idleCapOffChannel) {
+            if(idleCapActive) ++idleCapVisits;
+            idleCapOffToken=live.token; idleCapOffChannel=live.channel;
+        }
+        idleCapOffAt=now;
+    }
+    bool sparse=false;
+    if(hostSequenceValid && hostSequence.count) {
+        unsigned active=0;
+        for(unsigned i=0;i<hostSequence.count && i<16;++i) if(hostSequence.channels[i]) ++active;
+        sparse=active*16<=6u*hostSequence.count;
+    }
+    const bool busy=trafficActive || densePresence ||
+        (presenceActiveAt && now-presenceActiveAt<5000000);
+    const bool want=idleCapGapUS && infra && !hal->awdlOnlyChannel() && sparse && !busy;
+    if(want==idleCapActive) return;
+    if(idleCapActive && idleCapActiveSince && now>idleCapActiveSince)
+        idleCapActiveUS+=now-idleCapActiveSince;
+    idleCapActive=want; idleCapActiveSince=want ? now : 0; ++idleCapTransitions;
+}
+bool AirportMtkAwdlInterface::idleCapAllows(uint8_t channel, uint64_t now)
+{
+    if(!idleCapActive || !channel) return true;
+    const uint8_t infra=hal->awdlInfraChannel();
+    if(!infra || channel==infra) return true;
+    // Never strand a request or grant already made for this channel: the
+    // planner sent PM=1 for it and the native window may be open.
+    mtkawdl::Reservation live={};
+    if(hal->awdlGrantSnapshot(live) && (live.pending || live.granted) && now<live.deadline &&
+       live.channel==channel)
+        return true;
+    if(!idleCapOffAt) return true;
+    const uint64_t elapsed=now>idleCapOffAt ? now-idleCapOffAt : 0;
+    bool allowed=elapsed>=idleCapGapUS &&
+        (channel!=idleCapOffChannel || elapsed>=2*idleCapGapUS);
+    if(!allowed) {
+        // Count each blocked window once, not every 1-50 ms poll.
+        mtkawdl::Window w={};
+        uint64_t start=mtkawdl::currentWindow(state,now,w) ? w.start : 0;
+        if(channel!=idleCapBlockedChannel || start!=idleCapBlockedWindow) {
+            ++idleCapBlocked; idleCapBlockedChannel=channel; idleCapBlockedWindow=start;
+        }
+    }
+    return allowed;
+}
+bool AirportMtkAwdlInterface::channelReachable(uint8_t channel)
+{
+    return hal->awdlChannelReachable(channel) && idleCapAllows(channel,awdlNow());
+}
+uint8_t AirportMtkAwdlInterface::planOnlyChannel(uint64_t now)
+{
+    uint8_t only=hal->awdlOnlyChannel();
+    if(only || !idleCapActive) return only;
+    const uint8_t infra=hal->awdlInfraChannel();
+    if(!infra) return only;
+    // Still allowed for some channel: let planRadio pick; channelReachable
+    // rejects the target if it is the one that just had its turn.
+    if(!idleCapOffAt) return 0;
+    const uint64_t elapsed=now>idleCapOffAt ? now-idleCapOffAt : 0;
+    mtkawdl::Reservation live={};
+    if(hal->awdlGrantSnapshot(live) && (live.pending || live.granted) && now<live.deadline &&
+       live.channel && live.channel!=infra)
+        return 0;
+    return elapsed>=idleCapGapUS ? 0 : infra;
 }
 IOReturn AirportMtkAwdlInterface::setAWDL_PEER_TRAFFIC_REGISTRATION(apple80211_awdl_peer_traffic_registration *d)
 {

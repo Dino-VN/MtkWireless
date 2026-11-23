@@ -241,6 +241,8 @@ def generate(ex):
   struct { bool ofdmOnly=false; uint8_t phy=0; bool band2g=false,wide=false; } sc_awdl_tx_status;
   bool sc_awdl_roc_wide=false,sc_awdl_wide_off=false;
   uint64_t sc_awdl_wide_grants_session=0,sc_awdl_rx_wide=0;
+  bool sc_awdl_roc_infra_wide=false,sc_awdl_infra_wide_off=false;
+  uint64_t sc_awdl_infra_wide_rejects=0,sc_awdl_infra_wide_grants_session=0;
   taskq modelQueue; taskq *sc_nswq=&modelQueue; task sc_newstate_task,sc_scan_task; int sc_ns_arg=0;
 ''')
     text = one(text, "  bool take(AwdlTxResult &out)", "  void cancel() { assert(heldHalLocks); injected.clear(); }\n  bool take(AwdlTxResult &out)")

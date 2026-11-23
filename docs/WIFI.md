@@ -58,6 +58,8 @@ other unsigned kexts are still loaded afterwards.
 | `amtk_6ghz=1` | scan and report 6 GHz on chips that have it (MT7922, MT7921K); off by default: 6 GHz joins need SAE hash-to-element or OWE, not implemented ([WIFI-6GHZ.md](WIFI-6GHZ.md)) |
 | `amtk_roam=0` | no in-driver roaming: stay on the joined BSSID until the link drops ([ROAMING.md](ROAMING.md)) |
 | `amtk_awdl_offchan=0` | keep AWDL on the AP channel while associated (no PM handshake; AirDrop to phones on other channels fails) |
+| `amtk_awdl_idle_gap=MS` | while associated and AWDL is idle (macOS's Idle/Low Power AWDL schedule, no AirDrop/AWDL data), leave the AP channel for AWDL at most once per `MS` ms, alternating channels (default 1000, max 1500, `0` = every window as in 1.1.2). Each visit pauses the AP link ~200 ms ([issue #11](https://github.com/Dino-VN/MtkWireless/issues/11)) |
+| `amtk_awdl_infra_bw=0` | request AWDL windows on the AP's own channel at 20 MHz again (1.1.2); by default they keep the AP's 40/80 MHz tuning, AWDL frames still go out at 20 MHz |
 | `amtk_pmf=0` | no 802.11w PMF and therefore no WPA3-SAE: WPA3-transition networks are shown to macOS as WPA2-PSK again, WPA3-only and PMF-required networks cannot be joined (the 1.0.0 behaviour) |
 
 ## Country code and Location
