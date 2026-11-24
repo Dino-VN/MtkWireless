@@ -78,6 +78,9 @@ pub fn data_queue_lifetime_us(s: &State, destination: &[u8; 6]) -> u32 {
 /// Lead before an EAW edge for the BSS and off-channel arbitration.
 pub const ROC_LEAD_US: u32 = 55_000;
 
+// Leave one TU of the native 10-TU tolerance for the early close.
+pub const AW_START_LATE_US: u64 = 9 * 1024;
+
 /// Prepare the AP's PM notification before the request deadline. The HAL
 /// still independently requires 2ms after successful submission; the extra
 /// 1ms is timer slack, not proof of an AP ACK or a substitute for a grant.
@@ -287,7 +290,7 @@ pub fn plan_radio(
         })
     };
     let mut target = window(now)?;
-    if skip_current || target.channel == 0 || now - target.start > 8000 {
+    if skip_current || target.channel == 0 || now - target.start > AW_START_LATE_US {
         for _ in 0..s.sequence.count {
             target = window(target.end)?;
             if target.channel != 0 {
@@ -459,7 +462,7 @@ impl Timeline {
             || w.channel == 0
             || now < w.start
             || now >= w.end
-            || now - w.start > 8000
+            || now - w.start > AW_START_LATE_US
             || !grant.can_transmit(w.channel, now)
             || grant.grant_observed_at == 0
             || grant.grant_observed_at > now
@@ -624,6 +627,23 @@ mod plan_tests {
         seq.channels[1] = 6;
         assert!(s.set_sequence(&seq, 10_000_000));
         s
+    }
+
+    #[test]
+    fn nine_tu_edge_agrees_in_planner_and_notification() {
+        let s = state();
+        let w = current_window(&s, s.epoch).unwrap();
+        let at = w.start + AW_START_LATE_US;
+        let plan = |now| plan_radio(&s, now, ROC_LEAD_US, false, None, 0, 0).unwrap();
+        assert_eq!(plan(at).window, w);
+        assert_eq!(plan(at + 1).window.start, w.end);
+        let mut grant = Reservation::default();
+        grant.request(1, w.channel, w.start);
+        assert!(grant.grant(1, w.channel, 70, at));
+        let mut timeline = Timeline::default();
+        assert!(!timeline.begin(&w, &grant, at + 1, &s.mac, &s.mac, 1, None));
+        assert!(timeline.begin(&w, &grant, at, &s.mac, &s.mac, 1, None));
+        assert_eq!(timeline.switch_lead_us(), 1024);
     }
 
     #[test]

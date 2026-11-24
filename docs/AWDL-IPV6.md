@@ -88,13 +88,33 @@ implementation. The reporter's patch, which sends the same messages, was
 verified (TXDataAcked 401-630, transfers in both directions, survives
 reboots).
 
-## Not taken from the issue's patch
+## AWDL scheduler in 1.1.6
 
-The patch also changed the AWDL scheduler. Those changes need their own
-review and A/B testing, so they are not included here:
+The driver enables these changes on startup without extra boot arguments.
 
-- `liveGrantServesNext`, which keeps a same-channel grant;
-- clock re-acquisition after 3 rejected parent samples;
-- mDNS replies on the query channel (`amtk_awdl_mdns_query_channel`);
-- an AW start tolerance of 9 TU instead of 8000 µs;
-- diagnostic counters.
+- Keep a live same-channel ROC when it covers an unserved window the greedy
+  planner skipped. Forward recovery and the HAL's channel restrictions still
+  apply. `MTKAWDLLiveGrantKept` counts retained grants and
+  `MTKAWDLKeptGrantStarts` counts window starts those grants served.
+- After three consecutive phase rejections, re-acquire the selected parent
+  and root between windows and with no pending or live ROC. If three more
+  samples fail within one second, double the two-second retry interval. Four
+  such failures disable re-acquisition until the clock tree changes. See
+  `MTKAWDLClockRejectStreak`, `MTKAWDLClockReacquires` and
+  `MTKAWDLClockReacquireFailed`.
+- Prefer the receive channel for a multicast IPv6 mDNS reply queued within
+  350 ms of an admitted peer's query. The ordinary multicast schedule
+  resumes when the override expires after 1.1 s or the peer is no longer
+  live. This applies to existing granted windows. See
+  `MTKAWDLMdnsQueriesObserved` and `MTKAWDLMdnsRepliesOnQueryChannel`.
+- Allow an AW start up to 9 TU (9216 µs) after its scheduled edge. Native AW
+  duration and grant coverage still use the 10 TU tolerance.
+
+`MTKAWDLAbortBy` is seven little-endian `uint32_t` counters for explicit ROC
+aborts, in order: switch lead, idle-expired request, schedule change,
+forward recovery, reservation invalidation, advertiser parent change, sync
+state change. ROC issuance and grant timing remain in `MTKAWDLROCTrace`.
+
+Test on macOS 26 with the Wi-Fi Release kext. Try AirDrop in both directions
+with the iPhone unplugged and the Mac associated, and compare the ioreg
+counters before and after. Hardware verification of this build is pending.

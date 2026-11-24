@@ -53,7 +53,7 @@ static const size_t kLayout[] = {
     MTK_AWDL_AT(State, nativeClockAcquisitions), MTK_AWDL_AT(State, clockParent), MTK_AWDL_AT(State, clockRoot),
     MTK_AWDL_AT(State, acquisitionParent), MTK_AWDL_AT(State, acquisitionRoot),
     MTK_AWDL_AT(State, acquisitionRootKnown), MTK_AWDL_AT(State, controlsDeferred),
-    MTK_AWDL_AT(State, pendingControls),
+    MTK_AWDL_AT(State, pendingControls), MTK_AWDL_AT(State, clockRejectStreak),
     MTK_AWDL_TYPE(TxRate), MTK_AWDL_AT(TxRate, index), MTK_AWDL_AT(TxRate, successes),
     MTK_AWDL_AT(TxRate, failed), MTK_AWDL_AT(TxRate, probing), MTK_AWDL_AT(TxRate, backoff),
     MTK_AWDL_AT(TxRate, stale), MTK_AWDL_AT(TxRate, probeAfter),

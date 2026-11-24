@@ -23,6 +23,8 @@ bool mtk_awdl_valid_presence(uint32_t presence);
 bool mtk_awdl_valid_sequence(const mtkawdl::Sequence *s);
 bool mtk_awdl_parse_sequence(const uint8_t *p, size_t n, mtkawdl::Sequence *out);
 bool mtk_awdl_valid_action_envelope(const uint8_t *f, size_t n);
+bool mtk_awdl_is_mdns(const uint8_t *payload, size_t n, bool response);
+bool mtk_awdl_reacquire_native_clock(mtkawdl::State *s, uint64_t now);
 bool mtk_awdl_parse_action(const uint8_t *f, size_t n, mtkawdl::Advertisement *out);
 uint8_t mtk_awdl_peer_channel(const mtkawdl::Peer *p, uint64_t now);
 void mtk_awdl_data_peers_reset(mtkawdl::DataPeers *d);
@@ -190,6 +192,7 @@ struct State {
         uint8_t presence, role, forced[6], parent[6];
         bool parentSelected;
     } pendingControls;
+    uint32_t clockRejectStreak;
     void holdControls() { mtk_awdl_state_hold_controls(this); }
     void discardControls() { controlsHeld=controlsDirty=false; }
     uint8_t requestedRole() const { return controlsHeld ? pendingControls.role : syncRole; }

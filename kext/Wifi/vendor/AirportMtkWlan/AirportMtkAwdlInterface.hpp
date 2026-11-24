@@ -175,6 +175,19 @@ private:
     static IOReturn oobRequestGated(OSObject*,void*,void*,void*,void*);
     IOReturn setOobRequestInGate(apple80211_awdl_oob_request*);
     void publishScheduler(uint64_t);
+    bool liveGrantServesNext(const mtkawdl::Reservation &,const mtkawdl::Window &,uint64_t);
+    uint64_t liveGrantKept=0, liveGrantKeptAt=0, keptGrantStarts=0;
+    void serviceClockReacquisition(uint64_t);
+    struct ClockReacquisition {
+        uint8_t parent[6]={}, root[6]={};
+        uint64_t lastAt=0;
+        unsigned failures=0;
+        bool watching=false;
+    } clockReacquisition;
+    uint64_t clockReacquires=0, clockReacquireFailed=0;
+    uint8_t mdnsQueryChannel=0, mdnsQueryPeer[6]={};
+    uint64_t mdnsQueryAt=0, mdnsQueriesObserved=0, mdnsRepliesOnQueryChannel=0;
+    bool mdnsReplyUsesQueryChannel(mbuf_t,uint64_t,uint64_t);
     // Issue #10: awdl0 fe80::/64 route and peer neighbours (AwdlNeighbors.hpp).
     AwdlNeighbors neighbors;
     void updateNeighbors();
@@ -222,10 +235,13 @@ private:
         // rearm over a replacement frontend session's timer or teardown.
         timer->setTimeoutMS(1); return false;
     }
-    bool abortRadioForService(uint64_t session) {
+    enum AbortSite : unsigned { AbortSwitchLead, AbortIdleExpired, AbortScheduleChanged,
+        AbortForwardPreempt, AbortReserveInvalid, AbortAdvertisersParent, AbortSyncState, AbortSiteCount };
+    uint32_t abortBy[AbortSiteCount]={};
+    bool abortRadioForService(uint64_t session, AbortSite site) {
         const uint64_t call=forwardEnabled ? forward.beginCall(session) : 0;
         if(forwardEnabled && !call) { timer->setTimeoutMS(1); return false; }
-        hal->awdlAbort();
+        ++abortBy[site]; hal->awdlAbort();
         const bool completed=!forwardEnabled || forward.completeCall(call);
         if(!radioServiceCurrent(session) || !completed) return false;
         requestedChannel=grantedChannel=0; requestDeadline=0;

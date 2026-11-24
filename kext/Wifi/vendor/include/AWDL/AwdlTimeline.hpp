@@ -57,6 +57,8 @@ inline uint32_t dataQueueLifetimeUs(const State &s,const uint8_t *destination) {
 // arbitration before the next EAW. A live EAW is still closed only within
 // native's duration tolerance; this lead never fabricates an early AW-start.
 constexpr uint32_t rocLeadUs=55000;
+// Keep in sync with AW_START_LATE_US in the Rust timeline.
+constexpr uint64_t awStartLateUs=9*1024;
 // Preparation has its own edge, so a 2ms poll cannot step over its 3ms
 // lead. The HAL still enforces PM age and all radio admission rules.
 inline uint64_t rocPrepareAt(uint64_t requestAt) { return mtk_awdl_roc_prepare_at(requestAt); }

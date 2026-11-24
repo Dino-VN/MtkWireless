@@ -35,6 +35,7 @@ void AirportMtkAwdlInterface::invalidateDataRxAdmission()
 void AirportMtkAwdlInterface::resetDataPeers()
 {
     invalidateDataRxAdmission(); dataPeers.reset();
+    mdnsQueryAt=0; mdnsQueryChannel=0;
 }
 int AirportMtkAwdlInterface::observeDataPeer(const uint8_t *address,uint64_t now)
 {
@@ -504,7 +505,7 @@ bool AirportMtkAwdlInterface::admitDataRx(int peer,unsigned stream,const uint8_t
     uint16_t previous=dataPeers.entries[peer].windows[stream].sequence;
     uint64_t bitmap=dataPeers.entries[peer].windows[stream].bitmap;
 #else
-    (void)f; (void)channel; (void)rssi;
+    (void)f; (void)rssi;
 #endif
     // Rejections mutate lastRx too, so EVERY authoritative decision above
     // invalidates an older nested allocation before touching the Rust table.
@@ -514,6 +515,12 @@ bool AirportMtkAwdlInterface::admitDataRx(int peer,unsigned stream,const uint8_t
     recordDataRx(f,view,now,channel,rssi,previous,bitmap,accepted,mask);
     if(accepted && hal) hal->awdlNoteDataRx();
 #endif
+    if(accepted && channel && (view.destination[0]&1) &&
+       !state.nativeClockHoldover && mtk_awdl_is_mdns(view.payload,view.length,false)) {
+        mdnsQueryAt=now; mdnsQueryChannel=channel;
+        memcpy(mdnsQueryPeer,view.source,6);
+        ++mdnsQueriesObserved;
+    }
     if(accepted) ++dataRxDecoded; else ++dataRxReplay;
     return accepted;
 }
@@ -1889,7 +1896,17 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     setProperty("MTKAWDLNativeDroppedPackets",nativeDrops,64);
     setProperty("MTKAWDLServiceTicks",serviceTicks,64);
     setProperty("MTKAWDLReserveAttempts",reserveAttempts,64);
+    setProperty("MTKAWDLAbortBy",abortBy,sizeof(abortBy));
+    setProperty("MTKAWDLLiveGrantKept",liveGrantKept,64);
+    setProperty("MTKAWDLKeptGrantStarts",keptGrantStarts,64);
+    setProperty("MTKAWDLMdnsQueriesObserved",mdnsQueriesObserved,64);
+    setProperty("MTKAWDLMdnsQueryChannel",static_cast<uint64_t>(mdnsQueryChannel),32);
+    setProperty("MTKAWDLMdnsRepliesOnQueryChannel",mdnsRepliesOnQueryChannel,64);
     setProperty("MTKAWDLClockCorrections",state.clockCorrections,64);
+    setProperty("MTKAWDLClockRejectStreak",static_cast<uint64_t>(state.clockRejectStreak),32);
+    setProperty("MTKAWDLClockReacquires",clockReacquires,64);
+    setProperty("MTKAWDLClockReacquireFailed",clockReacquireFailed,64);
+    setProperty("MTKAWDLClockReacquireDisabled",clockReacquisition.failures>=4);
     setProperty("MTKAWDLClockRejected",state.clockRejected,64);
     setProperty("MTKAWDLClockDeferred",state.clockDeferred,64);
     setProperty("MTKAWDLClockHoldUntilUS",state.clockHoldUntil,64);
@@ -1968,6 +1985,73 @@ void AirportMtkAwdlInterface::publishScheduler(uint64_t now)
     for(unsigned i=0;i<mtkawdl::maxPeers;++i) if(dataPeers.live(dataPeers.entries[i],now)) ++dataMembers;
     setProperty("MTKAWDLDataPeerCount",static_cast<uint64_t>(dataMembers),32);
 }
+bool AirportMtkAwdlInterface::liveGrantServesNext(const mtkawdl::Reservation &grant,
+    const mtkawdl::Window &target,uint64_t now)
+{
+    if(!grant.granted || grant.channel!=target.channel || !grant.grantObservedAt ||
+       grant.grantObservedAt>now || now>=grant.deadline) return false;
+
+    // The response lead may make the greedy planner skip an otherwise usable
+    // window. Check windows before its replacement target on the same channel.
+    uint64_t cursor=now;
+    for(unsigned i=0;i<mtkawdl::slots;++i) {
+        mtkawdl::Window w={};
+        if(!mtkawdl::currentWindow(state,cursor,w) || w.end<=cursor || w.start>=target.start) break;
+        const uint64_t last=awTimeline.lastWindowStart;
+        const uint64_t distance=w.start>last ? w.start-last : last-w.start;
+        const bool served=awTimeline.emitted && distance<mtkawdl::awUs;
+        const bool tooLate=now>=w.start && now-w.start>mtkawdl::awStartLateUs;
+        if(w.channel==grant.channel && !served && !tooLate)
+            return mtkawdl::grantCoversWindow(w,grant,now);
+        cursor=w.end;
+    }
+    return false;
+}
+
+void AirportMtkAwdlInterface::serviceClockReacquisition(uint64_t now)
+{
+    auto &recovery=clockReacquisition;
+    if(!state.nativeParentSelected || memcmp(recovery.parent,state.nativeParent,6) ||
+       memcmp(recovery.root,state.clockRoot,6)) {
+        recovery={};
+        memcpy(recovery.parent,state.nativeParent,6);
+        memcpy(recovery.root,state.clockRoot,6);
+    }
+    if(recovery.watching) {
+        if(now-recovery.lastAt>1000000) recovery.watching=false;
+        else if(state.clockRejectStreak>=3) {
+            recovery.watching=false;
+            ++recovery.failures;
+            ++clockReacquireFailed;
+        }
+    }
+    if(state.clockRejectStreak<3 || recovery.failures>=4 || awTimeline.open ||
+       (recovery.lastAt && now-recovery.lastAt<(2000000ull<<recovery.failures))) return;
+
+    // A C++ snapshot guards RF ownership; Rust checks the clock hold, native
+    // controls and the latest sample's parent/root before moving the clock.
+    mtkawdl::Reservation live={};
+    if(hal->awdlGrantSnapshot(live) && !((live.pending || live.granted) && now<live.deadline) &&
+       mtk_awdl_reacquire_native_clock(&state,now)) {
+        recovery.lastAt=now;
+        recovery.watching=true;
+        ++clockReacquires;
+    }
+}
+
+bool AirportMtkAwdlInterface::mdnsReplyUsesQueryChannel(mbuf_t m,uint64_t queuedAt,uint64_t now)
+{
+    if(state.nativeClockHoldover || !mdnsQueryAt || queuedAt<mdnsQueryAt ||
+       queuedAt-mdnsQueryAt>350000 || now<queuedAt || now-queuedAt>1100000 ||
+       dataPeers.find(mdnsQueryPeer,now)<0) return false;
+
+    const auto *f=static_cast<const uint8_t *>(mbuf_data(m));
+    const size_t n=mbuf_pkthdr_len(m);
+    mtkawdl::DataView view={};
+    return n==mbuf_len(m) && n>=24 && f[0]==8 && (f[4]&1) &&
+        mtkawdl::dataView(f,n,24,view) && mtk_awdl_is_mdns(view.payload,view.length,true);
+}
+
 void AirportMtkAwdlInterface::serviceInGate()
 {
     if(!enabled || stopping) return;
@@ -2050,7 +2134,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             // in actual AW duration, including lateness of this window's start.
             // Close before abort so callbacks never observe an unpaired start.
             notifyAvailabilityWindowEnd(now);
-            if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession)) return;
+            if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession,AbortSwitchLead)) return;
             now=awdlNow();
         }
     }
@@ -2118,8 +2202,11 @@ void AirportMtkAwdlInterface::serviceInGate()
         queueDeadline[tail]=now+mtkawdl::dataQueueLifetimeUs(state,peer); ++queueCount; ++addbaQueued;
     }
     serviceTxBlockAck(now);
-    if(stopping || !enabled) return;
-    state.elect(now); publishScheduler(now);
+    if(!radioServiceCurrent(serviceSession)) return;
+    now=awdlNow();
+    state.elect(now);
+    serviceClockReacquisition(now);
+    publishScheduler(now);
     // Service discovery sends unicast (e.g. resolver replies) before native
     // traffic/cache registration. Install only destinations observed in valid
     // AWDL advertisements; the bounded membership lifetime also owns cleanup.
@@ -2227,14 +2314,14 @@ void AirportMtkAwdlInterface::serviceInGate()
                    forwardTimingContext==forwardRadioContext())
                     forward.observeReservation(state,pending,now);
                 state.holdClock(0);
-                if(!abortRadioForService(serviceSession)) return;
+                if(!abortRadioForService(serviceSession,AbortIdleExpired)) return;
                 now=awdlNow();
             }
         }
     }
     if(awTimeline.open && !awTimeline.matchesSchedule(state)) {
         notifyAvailabilityWindowEnd(now);
-        if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession)) return;
+        if(!radioServiceCurrent(serviceSession) || !abortRadioForService(serviceSession,AbortScheduleChanged)) return;
         now=awdlNow();
     }
     mtkawdl::Reservation grant={};
@@ -2285,13 +2372,16 @@ void AirportMtkAwdlInterface::serviceInGate()
                        requestedWindow,requestedChannel,&reserveChannelTiming);
     }
     const bool forwardBlocks=forwardEnabled && forward.blocks(window,awTimeline.open,now);
-    if(forwardBlocks || !grantReady || (!awTimeline.open && now-window.start<=8000 &&
-                       !mtkawdl::grantCoversWindow(window,grant,now))) {
+    // Keep the short-grant retry cutoff separate from native AW start
+    // tolerance. A short grant can still carry data after this cutoff.
+    constexpr uint64_t shortGrantRetryUS=8000;
+    const bool shortGrant=grantReady && now-window.start<=shortGrantRetryUS &&
+        !mtkawdl::grantCoversWindow(window,grant,now);
+    if(forwardBlocks || !grantReady || (!awTimeline.open && shortGrant)) {
         // Do not replace the last 2ms TX guard of a live grant with another
         // short ROC. Prepare the next EAW after closing this one.
         if(awTimeline.open) { timer->setTimeoutMS(1); return; }
-        if(grantReady && now-window.start<=8000 &&
-           !mtkawdl::grantCoversWindow(window,grant,now)) ++awTimeline.shortGrants;
+        if(shortGrant) ++awTimeline.shortGrants;
         bool pending=grant.pending && now<grant.deadline;
         if(!pending) {
             if(mtkawdl::grantCoversReservedWindow(state,requestedWindow,requestedChannel,grant,now)) {
@@ -2341,12 +2431,19 @@ void AirportMtkAwdlInterface::serviceInGate()
                 // abort/reacquire it just because the current EAW is late/idle.
                 timer->setTimeoutMS(1); return;
             }
+            if(!forwardBlocks && !recovery && liveGrantServesNext(grant,target,now)) {
+                if(grant.grantObservedAt!=liveGrantKeptAt) {
+                    liveGrantKeptAt=grant.grantObservedAt;
+                    ++liveGrantKept;
+                }
+                timer->setTimeoutMS(1); return;
+            }
             if(recovery && forward.canPreempt(awTimeline,grant,now,requestedWindow,requestedChannel)) {
                 // Only surplus airtime, after the ORIGINAL target ended. This
                 // does not weaken the short/future grant preservation below.
                 const uint64_t call=forward.beginCall(serviceSession);
                 if(!call) { timer->setTimeoutMS(1); return; }
-                hal->awdlAbort(); now=awdlNow();
+                ++abortBy[AbortForwardPreempt]; hal->awdlAbort(); now=awdlNow();
                 const bool completed=forward.completeCall(call);
                 if(!radioServiceCurrent(serviceSession) || !completed) return;
                 if(forward.intentId!=intent || !forward.valid(state,forwardRadioContext(),now)) {
@@ -2474,7 +2571,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             if(auto *sample=rocTrace.find(traceId)) sample->invalidReason=reserveInvalidReason;
             if(reserveInvalidReason) {
                 ++reserveInvalidations; state.holdClock(0);
-                if(!abortRadioForService(serviceSession)) return;
+                if(!abortRadioForService(serviceSession,AbortReserveInvalid)) return;
                 timer->setTimeoutMS(1); return;
             }
             if(status==kIOReturnSuccess) {
@@ -2490,6 +2587,7 @@ void AirportMtkAwdlInterface::serviceInGate()
     uint8_t nativeRole=state.syncRole;
     const auto nativeContext=forwardEnabled ? forwardRadioContext() : mtkawdl::ForwardRadioContext{};
     if(!forwardBlocks && !awTimeline.open && awTimeline.begin(window,grant,now,state.sync,state.master,nativeRole,&state.sequence)) {
+        if(grant.grantObservedAt==liveGrantKeptAt) ++keptGrantStarts;
         state.nativeTimelineStarted=true;
         state.holdClock(window.end);
         state.holdControls();
@@ -2572,6 +2670,8 @@ void AirportMtkAwdlInterface::serviceInGate()
             // it; strict mode 1 keeps the old behaviour.
             ready=true;
         }
+        const bool mdnsReply=(f[4]&1) && mdnsReplyUsesQueryChannel(m,time,now);
+        if(mdnsReply) ready=channel==mdnsQueryChannel;
         // Block Ack responses are sent as built; only native MIs are rebuilt.
         bool blockAck=f[0]==0xd0 && f[24]==mtkawdl::blockAckCategory;
         bool unicastMI=f[0]==0xd0 && !blockAck;
@@ -2658,6 +2758,7 @@ void AirportMtkAwdlInterface::serviceInGate()
             }
             if(txStatus==kIOReturnSuccess) {
                 ++submitted;
+                if(mdnsReply) ++mdnsRepliesOnQueryChannel;
                 if(amsduCount) {
                     ++amsduFrames;
                     amsduSubframes+=amsduCount;
@@ -3102,7 +3203,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_AWDL_ADVERTISERS(awdl_peer_advert_add 
                     }
                     state.selectNativeParent(sample.peer,a.master); state.elect(now);
                     if(changed && enabled && !state.controlsHeld) {
-                        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+                        ++abortBy[AbortAdvertisersParent]; hal->awdlAbort(); requestedChannel=grantedChannel=0;
                         // No announced AW remains. The aborted reservation's
                         // future edge must not hold acquisition of this parent.
                         state.holdClock(0); state.elect(awdlNow());
@@ -3157,7 +3258,7 @@ IOReturn AirportMtkAwdlInterface::setAWDL_SYNC_STATE(apple80211_awdl_sync_state 
     syncState=*d; state.elect(awdlNow());
     setProperty("MTKAWDLSyncRole",d->state,32);
     if(enabled && !state.controlsHeld) {
-        hal->awdlAbort(); requestedChannel=grantedChannel=0;
+        ++abortBy[AbortSyncState]; hal->awdlAbort(); requestedChannel=grantedChannel=0;
         // No announced AW remains after abort. Its pending reservation must
         // not keep the explicitly authorized warmup clock held in the future.
         state.holdClock(0); state.elect(awdlNow());
@@ -3469,10 +3570,21 @@ void AirportMtkAwdlInterface::updateIdleCap(uint64_t now)
     const bool busy=trafficActive || densePresence ||
         (presenceActiveAt && now-presenceActiveAt<5000000);
     const bool want=idleCapGapUS && infra && !hal->awdlOnlyChannel() && sparse && !busy;
-    if(want==idleCapActive) return;
-    if(idleCapActive && idleCapActiveSince && now>idleCapActiveSince)
-        idleCapActiveUS+=now-idleCapActiveSince;
-    idleCapActive=want; idleCapActiveSince=want ? now : 0; ++idleCapTransitions;
+    if(want!=idleCapActive) {
+        if(idleCapActive && idleCapActiveSince && now>idleCapActiveSince)
+            idleCapActiveUS+=now-idleCapActiveSince;
+        idleCapActive=want; idleCapActiveSince=want ? now : 0; ++idleCapTransitions;
+    }
+    // Count a blocked current window once. The planner also queries
+    // reachability for future windows and channels that it never schedules.
+    mtkawdl::Window window={};
+    if(idleCapActive && mtkawdl::currentWindow(state,now,window) &&
+       (window.channel!=idleCapBlockedChannel || window.start!=idleCapBlockedWindow) &&
+       hal->awdlChannelReachable(window.channel) && !idleCapAllows(window.channel,now)) {
+        ++idleCapBlocked;
+        idleCapBlockedChannel=window.channel;
+        idleCapBlockedWindow=window.start;
+    }
 }
 bool AirportMtkAwdlInterface::idleCapAllows(uint8_t channel, uint64_t now)
 {
@@ -3487,17 +3599,8 @@ bool AirportMtkAwdlInterface::idleCapAllows(uint8_t channel, uint64_t now)
         return true;
     if(!idleCapOffAt) return true;
     const uint64_t elapsed=now>idleCapOffAt ? now-idleCapOffAt : 0;
-    bool allowed=elapsed>=idleCapGapUS &&
+    return elapsed>=idleCapGapUS &&
         (channel!=idleCapOffChannel || elapsed>=2*idleCapGapUS);
-    if(!allowed) {
-        // Count each blocked window once, not every 1-50 ms poll.
-        mtkawdl::Window w={};
-        uint64_t start=mtkawdl::currentWindow(state,now,w) ? w.start : 0;
-        if(channel!=idleCapBlockedChannel || start!=idleCapBlockedWindow) {
-            ++idleCapBlocked; idleCapBlockedChannel=channel; idleCapBlockedWindow=start;
-        }
-    }
-    return allowed;
 }
 bool AirportMtkAwdlInterface::channelReachable(uint8_t channel)
 {

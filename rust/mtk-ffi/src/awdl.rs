@@ -58,6 +58,12 @@ export! {
     fn mtk_awdl_valid_action_envelope(f: *const u8, n: usize) -> bool {
         !f.is_null() && p::valid_action_envelope(bytes(f, n))
     }
+    fn mtk_awdl_is_mdns(payload: *const u8, n: usize, response: bool) -> bool {
+        p::is_mdns(bytes(payload, n), response)
+    }
+    fn mtk_awdl_reacquire_native_clock(s: *mut State, now: u64) -> bool {
+        s.as_mut().is_some_and(|s| s.reacquire_native_clock(now))
+    }
     fn mtk_awdl_parse_action(f: *const u8, n: usize, out: *mut Advertisement) -> bool {
         match (p::parse_action(bytes(f, n)), out.as_mut()) {
             (Some(a), Some(out)) => { *out = a; true }
@@ -366,7 +372,7 @@ static LAYOUT: &[usize] = layout! {
         clock_deferred_at, clock_deferred, native_clock_selected, native_timeline_started, controls_held,
         controls_dirty, native_clock_holdover, native_clock_validated, native_clock_acquisition_pending,
         clock_sample_rejected, native_holdover_transitions, native_clock_acquisitions, clock_parent, clock_root,
-        acquisition_parent, acquisition_root, acquisition_root_known, controls_deferred, pending_controls }
+        acquisition_parent, acquisition_root, acquisition_root_known, controls_deferred, pending_controls, clock_reject_streak }
     TxRate { index, successes, failed, probing, backoff, stale, probe_after }
     TxStatusCounters { data_acked, data_failed, multicast_completed, multicast_failed, action_completed,
         action_failed, last_status, last_sequence, last_wcid, last_pid, rates, ofdm_only, phy, band_2g, wide,

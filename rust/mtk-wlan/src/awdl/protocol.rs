@@ -624,6 +624,8 @@ pub struct State {
     pub acquisition_root_known: bool,
     pub controls_deferred: u64,
     pub pending_controls: Controls,
+    /// Consecutive fresh phase rejections from the selected parent and root.
+    pub clock_reject_streak: u32,
 }
 
 impl State {
@@ -726,6 +728,7 @@ impl State {
         self.native_clock_validated = false;
         self.native_clock_holdover = false;
         self.clock_sample_rejected = false;
+        self.clock_reject_streak = 0;
         self.synchronized = false;
         self.native_parent = [0; 6];
         self.clock_parent = [0; 6];
@@ -738,6 +741,34 @@ impl State {
         self.master_counter = self.self_counter;
         self.distance = 0;
         // Keep the physical AW counter/phase through local-master promotion.
+    }
+
+    /// Re-enter the selected clock's acquisition path at a radio-idle edge.
+    pub fn reacquire_native_clock(&mut self, now: u64) -> bool {
+        if self.clock_reject_streak < 3 || !self.native_election_managed
+            || !self.native_parent_selected || !self.native_clock_selected
+            || !self.native_clock_validated || self.native_clock_acquisition_pending
+            || self.controls_held || self.sync_role == 3 || now < self.clock_hold_until
+            || self.clock_parent != self.native_parent
+        {
+            return false;
+        }
+        let parent = self.clock_parent;
+        let root = self.clock_root;
+        let i = self.find(&parent);
+        if i < 0 {
+            return false;
+        }
+        let p = &self.peers[i as usize];
+        if p.seen != self.clock_sample_at || now < p.seen || now - p.seen > PEER_LIFETIME_US
+            || p.advertisement.master != root || root == self.mac
+            || p.advertisement.distance >= 10 || p.advertisement.sync == self.mac
+        {
+            return false;
+        }
+        self.select_native_parent(&parent, Some(&root), true);
+        self.elect(now);
+        true
     }
 
     pub fn release_controls(&mut self, now: u64) -> bool {
@@ -848,6 +879,7 @@ impl State {
         self.forced_sync = *address;
         self.synchronized = false;
         self.native_clock_holdover = false;
+        self.clock_reject_streak = 0;
         self.sequence = self.own_sequence;
         self.presence = self.own_presence;
         self.master = self.mac;
@@ -1003,6 +1035,7 @@ impl State {
             }
         }
         let Some(best) = best else {
+            self.clock_reject_streak = 0;
             // Native selected this clock and still owns the configured
             // sequence: hold over instead of promoting ourselves.
             if self.native_election_managed
@@ -1064,6 +1097,7 @@ impl State {
                 self.clock_sample_at = p.seen;
                 self.clock_rejected += 1;
             }
+            self.clock_reject_streak = 0;
             self.clock_sample_rejected = true;
             self.synchronized = false;
             if !self.native_clock_holdover {
@@ -1111,6 +1145,7 @@ impl State {
             self.epoch = p.epoch;
             self.base_counter = p.base_counter;
             self.clock_sample_at = p.seen;
+            self.clock_reject_streak = 0;
             if self.native_election_managed {
                 self.native_clock_validated = true;
                 self.native_clock_acquisition_pending = false;
@@ -1133,6 +1168,7 @@ impl State {
             if !(-5 * 1024..=5 * 1024).contains(&delta) {
                 self.clock_sample_at = p.seen;
                 self.clock_rejected += 1;
+                self.clock_reject_streak = self.clock_reject_streak.saturating_add(1);
                 self.clock_sample_rejected = true;
                 self.synchronized = false;
                 if !self.native_clock_holdover {
@@ -1141,6 +1177,7 @@ impl State {
                 self.native_clock_holdover = true;
                 return;
             }
+            self.clock_reject_streak = 0;
             if self.native_election_managed {
                 self.native_clock_validated = true;
                 self.clock_sample_rejected = false;
@@ -1643,6 +1680,34 @@ pub fn valid_ipv6(p: &[u8]) -> bool {
     let payload = p[4] as usize * 256 + p[5] as usize;
     // Ethernet MTU bounds this path; IPv6 jumbograms are unsupported.
     n == 40 + payload
+}
+
+/// Multicast IPv6 mDNS carried in a canonical AWDL MSDU.
+pub fn is_mdns(payload: &[u8], response: bool) -> bool {
+    const GROUP: [u8; 16] = [0xff, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb];
+    let mut awdl = Reader::new(payload);
+    if awdl.take(8).ok() != Some(&SNAP) || awdl.take(6).is_err()
+        || awdl.be16().ok() != Some(0x86dd)
+    {
+        return false;
+    }
+    let Ok(ip) = awdl.take(awdl.remaining()) else { return false };
+    if !valid_ipv6(ip) {
+        return false;
+    }
+    let mut r = Reader::new(ip);
+    if r.take(6).is_err() || r.u8().ok() != Some(17) || r.take(17).is_err()
+        || r.take(16).ok() != Some(&GROUP)
+        || r.be16().ok() != Some(5353) || r.be16().ok() != Some(5353)
+    {
+        return false;
+    }
+    let udp_len = r.remaining() + 4; // both ports were already read
+    if r.be16().ok().map(usize::from) != Some(udp_len) || r.take(2).is_err() {
+        return false;
+    }
+    let Ok(dns) = r.take(12) else { return false };
+    (dns[2] & 0x80 != 0) == response
 }
 
 /// Ethernet (IPv6 only) to AWDL data frame. Returns the frame length or 0.
@@ -2286,6 +2351,68 @@ pub fn receive_roc_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mdns_matches_only_complete_multicast_udp() {
+        let mut payload = [0; 76];
+        payload[..8].copy_from_slice(&SNAP);
+        payload[14..16].copy_from_slice(&0x86ddu16.to_be_bytes());
+        payload[16] = 0x60;
+        payload[20..22].copy_from_slice(&20u16.to_be_bytes());
+        payload[22] = 17;
+        payload[40..42].copy_from_slice(&[0xff, 2]);
+        payload[55] = 0xfb;
+        payload[56..62].copy_from_slice(&[0x14, 0xe9, 0x14, 0xe9, 0, 20]);
+        assert!(is_mdns(&payload, false));
+        assert!(!is_mdns(&payload, true));
+        payload[66] = 0x84;
+        assert!(is_mdns(&payload, true));
+        for len in 0..payload.len() {
+            assert!(!is_mdns(&payload[..len], true));
+        }
+        for offset in [14, 20, 22, 55, 57, 59, 61] {
+            let mut bad = payload;
+            bad[offset] ^= 1;
+            assert!(!is_mdns(&bad, true));
+        }
+    }
+
+    #[test]
+    fn native_clock_reacquires_after_three_distinct_selected_samples() {
+        let now = 1_000_000;
+        let local = [2, 0, 0, 0, 0, 1];
+        let parent = [2, 0, 0, 0, 0, 2];
+        let mut s = State::default();
+        s.init(&local, now);
+        s.peers[0].used = true;
+        s.peers[0].mac = parent;
+        s.peers[0].epoch = now;
+        s.peers[0].seen = now;
+        s.peers[0].advertisement.master = parent;
+        s.select_native_parent(&parent, Some(&parent), true);
+        s.elect(now);
+        assert_eq!(s.native_clock_acquisitions, 1);
+
+        s.peers[0].epoch = now + 8 * 1024;
+        for i in 1..=3 {
+            let seen = now + i * 20_000;
+            s.peers[0].seen = seen;
+            s.elect(seen);
+            s.elect(seen + 1);
+            assert_eq!(s.clock_reject_streak, i as u32);
+            if i < 3 {
+                assert!(!s.reacquire_native_clock(seen));
+            }
+        }
+        let at = s.peers[0].seen;
+        s.hold_clock(at + 1);
+        assert!(!s.reacquire_native_clock(at));
+        assert!(s.reacquire_native_clock(at + 1));
+        assert_eq!(s.native_clock_acquisitions, 2);
+        assert_eq!(s.clock_reject_streak, 0);
+        assert_eq!(s.epoch, now + 8 * 1024);
+        assert!(s.synchronized && !s.native_clock_holdover);
+    }
     use std::vec::Vec;
 
     /// Captured from an iPhone18,2 on iOS 27 (sync TLV kind 4, p[33..], 40

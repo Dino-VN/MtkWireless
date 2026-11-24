@@ -65,12 +65,12 @@ INTERFACE_GROUPS = {
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
     "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics updateNeighbors publishScheduler serviceInGate receive",
+    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics updateNeighbors publishScheduler liveGrantServesNext serviceClockReacquisition mdnsReplyUsesQueryChannel serviceInGate receive",
     "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES getPEER_CACHE_MAXIMUM_SIZE getAWDL_DEVICE_CAPABILITIES setAWDL_OOB_REQUEST oobRequestGated setOobRequestInGate setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence updateIdleCap idleCapAllows channelReachable planOnlyChannel setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
 STRUCT_NAMES = "apple80211_virt_if_create_data apple80211_awdl_sync_params apple80211_awdl_extension_state_machine_parameter apple80211_awdl_election_id apple80211_awdl_presence_mode apple80211_awdl_sync_state apple80211_awdl_election_rssi_thresholds apple80211_awdl_af_tx_mode apple80211_awdl_min_rate apple80211_awdl_sync_channel_sequence apple80211_awdl_sync_frame_template apple80211_awdl_cap apple80211_awdl_master_channel apple80211_awdl_secondary_master_channel apple80211_awdl_election_params apple80211_awdl_peer_traffic_registration apple80211_awdl_sync_enabled apple80211_peer_cache_maximum_size apple80211_awdl_device_capabilities apple80211_awdl_oob_request".split()
-CASES = ["init-start", "datapath", "sync", "origins", "module-poll", "bsd", "packed-sequence", "native-controls", "native-windows"]
+CASES = ["init-start", "datapath", "sync", "origins", "module-poll", "bsd", "packed-sequence", "issue10", "native-controls", "native-windows"]
 
 
 def digest(data: bytes) -> str:
@@ -1190,7 +1190,7 @@ PACKED_TEST_SUFFIX = r'''
 
 def generate(ex: Extractor) -> str:
     names = [n for group in INTERFACE_GROUPS.values() for n in group.split()]
-    if len(names) != len(set(names)) or len(names) > 120:
+    if len(names) != len(set(names)) or len(names) > 125:
         raise ValueError("invalid extraction inventory")
     header = ex.text(INTERFACE_HEADER)
     public = header[header.index("public:") + len("public:"):header.index("private:")]
@@ -1265,6 +1265,51 @@ def generate(ex: Extractor) -> str:
 HOST_MAIN = r'''
 #include "extracted.cpp"
 #line 1 "native-lifecycle-host-main"
+void checkIssue10() {
+ resetFaults(); NativeFixture d;
+ gate.enter([&]{
+  const uint64_t now=clockUS.load(), edge=now+mtkawdl::awUs;
+  mtkawdl::Sequence seq{{0,6,6,44},4,0};
+  assert(d.state.setSequence(seq,now));
+  mtkawdl::Window skipped{},target{};
+  assert(mtkawdl::currentWindow(d.state,edge,skipped) && skipped.channel==6);
+  assert(mtkawdl::currentWindow(d.state,skipped.end,target) && target.channel==6);
+  mtkawdl::Reservation live{}; live.request(1,6,now);
+  assert(live.grant(1,6,120,now));
+  assert(d.liveGrantServesNext(live,target,now));
+  auto other=target; other.channel=44;
+  assert(!d.liveGrantServesNext(live,other,now));
+  auto shortGrant=live; shortGrant.deadline=edge+1000;
+  assert(!d.liveGrantServesNext(shortGrant,target,now));
+  d.awTimeline.emitted=true; d.awTimeline.lastWindowStart=skipped.start;
+  assert(!d.liveGrantServesNext(live,target,now));
+  d.awTimeline.reset();
+
+  uint8_t eth[74]={0x33,0x33,0,0,0,0xfb,2,1,2,3,4,6};
+  eth[12]=0x86; eth[13]=0xdd; eth[14]=0x60; eth[19]=20; eth[20]=17;
+  eth[38]=0xff; eth[39]=2; eth[53]=0xfb;
+  eth[54]=eth[56]=0x14; eth[55]=eth[57]=0xe9; eth[59]=20;
+  uint8_t f[100]; mtkawdl::DataView view{};
+  assert(mtkawdl::encodeData(f,sizeof(f),eth,sizeof(eth),1)==sizeof(f));
+  assert(mtkawdl::dataView(f,sizeof(f),24,view));
+  int peer=d.dataPeers.observe(eth+6,now); assert(peer>=0);
+  assert(d.admitDataRx(peer,16,f,view,now,6,0));
+  assert(!d.admitDataRx(peer,16,f,view,now+1,44,0));
+  assert(d.mdnsQueriesObserved==1 && d.mdnsQueryChannel==6);
+  eth[64]=0x84;
+  assert(mtkawdl::encodeData(f,sizeof(f),eth,sizeof(eth),2)==sizeof(f));
+  mbuf_t reply=d.makeFrame(f,sizeof(f)); assert(reply);
+  const uint64_t queued=now+1;
+  assert(d.mdnsReplyUsesQueryChannel(reply,queued,queued));
+  assert(!d.mdnsReplyUsesQueryChannel(reply,now-1,queued));
+  assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued+1100001));
+  d.resetDataPeers();
+  assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued));
+  mbuf_freem(reply);
+  return 0;
+ });
+ puts("PASS issue #10: same-channel coverage, short/served grants, admitted mDNS query and bounded reply override");
+}
 int main(int argc,char **argv) {
  assert(argc==2);assert(mwx_awdl_native_history_init());
  std::string name=argv[1];
@@ -1272,6 +1317,7 @@ int main(int argc,char **argv) {
  else if(name=="sync")checkSync();else if(name=="origins")checkOrigins();
  else if(name=="module-poll")checkModulePoll();
  else if(name=="bsd")checkBSD();
+ else if(name=="issue10")checkIssue10();
  else if(name=="packed-sequence"||name=="old-packed-reference")checkPackedSequence(name=="old-packed-reference");
  else assert(false);
  noResources();assert(!gateDepth&&!heldHalLocks);return 0;
@@ -1293,7 +1339,13 @@ struct OriginalGateEntry {
 '''
     # WCL's external shared-gate entry is an OS dispatch boundary. Original
     # timer calls still execute tick/service and public wrappers recurse normally.
-    return prefix + "\n#define AirportMtkAwdlInterface " + fixture + "\n" + ex.assertions(VENDOR / ("tests/awdl/test-"+kind+".py"), marker) + "\n#undef AirportMtkAwdlInterface\n"
+    assertions = ex.assertions(VENDOR / ("tests/awdl/test-"+kind+".py"), marker)
+    if kind == "native-windows":
+        # Keep the late-observation case outside the current AW start tolerance.
+        old = "pending.radio.give(3,6,70);clockUS+=9000;"
+        assert assertions.count(old) == 1
+        assertions = assertions.replace(old, "pending.radio.give(3,6,70);clockUS+=mtkawdl::awStartLateUs+1;")
+    return prefix + "\n#define AirportMtkAwdlInterface " + fixture + "\n" + assertions + "\n#undef AirportMtkAwdlInterface\n"
 
 
 def rust_input_hashes() -> dict[str, str]:

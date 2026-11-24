@@ -2119,17 +2119,17 @@ mwx_bgscan_done_task(void *arg)
 	}
 
 	/*
-	 * The local net80211 port switches BSS from ni_unref_cb when the
-	 * current node's final reference is released. Install the same
-	 * callback after the driver has removed hardware keys.
+	 * mwx_start releases the node as soon as it submits to DMA. If the
+	 * deauth was already submitted, dropping this reference runs the
+	 * callback now. Otherwise the last queued frame runs it on release.
 	 */
+	ieee80211_ref_node(ni);
 	ni->ni_unref_arg = sc->sc_bgscan_arg;
 	ni->ni_unref_arg_size = sc->sc_bgscan_arg_size;
 	ni->ni_unref_cb = ieee80211_node_switch_bss;
 	sc->sc_bgscan_arg = NULL;
 	sc->sc_bgscan_arg_size = 0;
-	if (ni->ni_flags & IEEE80211_NODE_MFP)
-		ieee80211_node_switch_bss(ic, ni);
+	ieee80211_release_node(ic, ni);
 
  done:
 	if (err) {
@@ -10763,6 +10763,9 @@ void MtkMwx::awdlInfraSleep(uint8_t channel)
 {
     MwxAwdlCall call(com);
     if (!call.valid() || com->sc_resetting || mwx_infra_ps(com))
+        return;
+    // An active firmware scan owns the radio and awdlReserve will refuse it.
+    if (com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN))
         return;
     uint8_t infra = awdlInfraChannel();
     if (!infra || channel == infra)

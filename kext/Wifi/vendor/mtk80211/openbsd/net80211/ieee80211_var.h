@@ -568,6 +568,8 @@ struct ieee80211com {
 	int16_t			ic_txpower;	/* tx power setting (dBm) */
 	int			ic_bmissthres;	/* beacon miss threshold */
 	int			ic_mgt_timer;	/* mgmt timeout */
+	bool			ic_auth_comeback_pending;
+	bool			ic_auth_comeback_retried;
 #ifndef IEEE80211_STA_ONLY
 	CTimeout*		ic_inact_timeout; /* node inactivity timeout */
 	CTimeout*		ic_node_cache_timeout;

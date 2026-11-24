@@ -335,8 +335,10 @@ void grace_and_guards() {
     }
     for(unsigned scan : {MWX_FLAG_SCANNING,MWX_FLAG_BGSCAN}) {
         Fixture f; f.sc.sc_flags=scan;
+        f.hal->awdlInfraSleep(6); // Scheduler preparation happens before reserve.
         CHECK(f.hal->awdlReserve(6,400)==kIOReturnNotReady);
         CHECK(f.sc.sc_awdl_roc_scan_blocked==1 && !f.sc.sleepCalls && !f.sc.accepted);
+        CHECK(!f.sc.sc_awdl_infra_ps && !f.sc.sc_awdl_infra_ps_sleeps);
     }
     { Fixture f; f.sc.node.ni_port_valid=false; f.hal->awdlInfraSleep(6);
       CHECK(f.hal->awdlReserve(6,400)==kIOReturnNotReady);
