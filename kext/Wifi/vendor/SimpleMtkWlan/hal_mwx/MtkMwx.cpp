@@ -670,6 +670,7 @@ struct mwx_softc {
 	uint32_t		sc_syspm_last_step;
 	uint32_t		sc_syspm_dma_busy;	/* GLO_CFG busy bits at timeout */
 	uint32_t		sc_syspm_dma_reinit;	/* resumes that rebuilt rings */
+	uint32_t		sc_syspm_fw_reloads;	/* resumes that reloaded firmware */
 	CTimeout		*sc_reset_to;
 	CTimeout		*sc_scan_to;
 	CTimeout		*sc_dma_to;
@@ -3343,6 +3344,40 @@ mwx_sys_suspend(struct mwx_softc *sc)
 	return 0;
 }
 
+/*
+ * MtkWireless: wake reload. A desktop S3 (B550, 2026-11-23) cuts the card's
+ * power: WFDMA lost its context on every resume and HIF resume then waited
+ * the full MCU timeout (3 s) for a firmware that was gone, queued a plain
+ * reset, and AirportMtkWlan's resume and HAL start both timed out (~7.3 s
+ * SetState, 6 of 7 resumes failed with EWOULDBLOCK at the HIF step).
+ * mt7921_pci_resume answers a failed resume with mt792x_reset; do the same,
+ * here on the task queue: WFSYS/ring reset and a firmware download.
+ */
+static int
+mwx_sys_resume_reload(struct mwx_softc *sc, const char *why)
+{
+	struct ifnet *ifp = &sc->sc_ic.ic_if;
+
+	sc->sc_syspm_fw_reloads++;
+	MWX_DEV_LOG(sc, "syspm: %s, reloading firmware misc=0x%08x\n", why,
+	    mwx_read(sc, MT_CONN_ON_MISC));
+	/* A timed-out MCU wait queued a plain reset; this reload replaces it. */
+	task_del(sc->sc_nswq, &sc->sc_reset_task);
+	timeout_del(&sc->sc_reset_to);
+	mwx_fullreset_task(sc);
+	/* fullreset only brings the interface up when IFF_UP is still set;
+	 * otherwise the coming enable runs mwx_init on the new firmware. */
+	if ((mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY) !=
+	    MT_TOP_MISC2_FW_N9_RDY ||
+	    ((ifp->if_flags & IFF_UP) && !(ifp->if_flags & IFF_RUNNING))) {
+		MWX_DEV_LOG(sc, "syspm: firmware reload failed misc=0x%08x flags=0x%x\n",
+		    mwx_read(sc, MT_CONN_ON_MISC), ifp->if_flags);
+		return EIO;
+	}
+	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DONE;
+	return 0;
+}
+
 static int
 mwx_sys_resume(struct mwx_softc *sc)
 {
@@ -3352,6 +3387,14 @@ mwx_sys_resume(struct mwx_softc *sc)
 		return 0;
 	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DRV_OWN;
 	rv = mwx_mcu_drv_pmctrl(sc);
+	if (rv == 0 && (mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY) !=
+	    MT_TOP_MISC2_FW_N9_RDY) {
+		/* Power was lost: no firmware to answer HIF resume. */
+		mwx_syspm_run_gated(sc, mwx_syspm_unquiesce_gated);
+		sc->sc_sys_suspended = 0;
+		OSSynchronizeIO();
+		return mwx_sys_resume_reload(sc, "firmware lost in sleep");
+	}
 	if (rv == 0) {
 		sc->sc_syspm_last_step = MWX_SYSPM_STEP_REINIT;
 		if (!(mwx_read(sc, MT_WFDMA_DUMMY_CR) & MT_WFDMA_NEED_REINIT))
@@ -3364,14 +3407,19 @@ mwx_sys_resume(struct mwx_softc *sc)
 	mwx_syspm_run_gated(sc, mwx_syspm_unquiesce_gated);
 	sc->sc_sys_suspended = 0;
 	OSSynchronizeIO();
-	if (rv != 0)
-		return rv;
+	if (rv != 0) {
+		MWX_DEV_LOG(sc, "syspm: resume step %u failed error=%d\n",
+		    sc->sc_syspm_last_step, rv);
+		return mwx_sys_resume_reload(sc, "resume failed");
+	}
 	sc->sc_syspm_last_step = MWX_SYSPM_STEP_HIF;
 	rv2 = mwx_mcu_set_hif_suspend(sc, 0);
-	if (rv2 != 0)
+	if (rv2 != 0) {
 		MWX_DEV_LOG(sc, "syspm: HIF resume failed error=%d\n", rv2);
+		return mwx_sys_resume_reload(sc, "HIF resume failed");
+	}
 	sc->sc_syspm_last_step = MWX_SYSPM_STEP_DONE;
-	return rv2;
+	return 0;
 }
 
 void
@@ -9306,9 +9354,11 @@ MtkMwx::systemPower(bool suspend)
 	OSSynchronizeIO();
 	SInt32 requested = OSIncrementAtomic(&com->sc_syspm_req) + 1;
 	task_add(com->sc_nswq, &com->sc_syspm_task);
-	/* HIF control waits up to the MCU timeout; keep this below the PM
-	 * acknowledgement budget requested by AirportMtkWlan. */
-	for (unsigned i = 0; i < 300; i++) {
+	/* HIF control waits up to the MCU timeout (3 s); a wake that lost
+	 * power reloads the firmware instead (WFSYS reset + download). Keep
+	 * this below the PM acknowledgement budget requested by
+	 * AirportMtkWlan. */
+	for (unsigned i = 0; i < 600; i++) {
 		OSSynchronizeIO();
 		if (com->sc_syspm_done == requested)
 			return com->sc_syspm_result ? kIOReturnIOError : kIOReturnSuccess;
@@ -9320,9 +9370,9 @@ MtkMwx::systemPower(bool suspend)
 }
 
 void
-MtkMwx::systemPowerStats(uint32_t out[8])
+MtkMwx::systemPowerStats(uint32_t out[9])
 {
-	memset(out, 0, sizeof(uint32_t) * 8);
+	memset(out, 0, sizeof(uint32_t) * 9);
 	if (!com)
 		return;
 	out[0] = com->sc_syspm_suspends;
@@ -9333,6 +9383,7 @@ MtkMwx::systemPowerStats(uint32_t out[8])
 	out[5] = com->sc_syspm_dma_busy;
 	out[6] = com->sc_syspm_dma_reinit;
 	out[7] = (uint32_t)com->sc_sys_suspended;
+	out[8] = com->sc_syspm_fw_reloads;
 }
 
 const char *

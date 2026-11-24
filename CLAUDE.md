@@ -171,12 +171,32 @@ scripts/test-wifi-roam.py   # WCL roaming wire formats
   firmware own. `sc_sys_suspended` then refuses every MCU message except
   HIF control. Wake reverses it before the HAL start (driver own,
   `mwx_dma_reinit_cond`, interrupts + DMA on, HIF resume), also when Wi-Fi
-  stays off. PM budget 10 s each way. ioreg `MTKSleepSuspendStatus`,
+  stays off. ioreg `MTKSleepSuspendStatus`,
   `MTKWakeResumeStatus`, `MTKSysPM*`. Boot-arg `amtk_syspm=0` off. WoWLAN
   stays unsupported.
+- Desktop S3 can cut the card's power (B550, 2026-11-23: WFDMA context lost
+  on every resume, HIF resume waited 3 s for a firmware that was gone, 6 of
+  7 resumes failed with EWOULDBLOCK, ~7.3 s wake). Resume now checks
+  `MT_TOP_MISC2_FW_N9_RDY` after driver own and, when the firmware is gone
+  or any resume step fails, runs `mwx_fullreset_task` (WFSYS reset +
+  download) like `mt792x_reset` after a failed `mt7921_pci_resume`.
+  `MTKSysPMFwReloads` counts it. Budgets: resume wait 6 s, PM ack 12 s.
 - BT loader defers its open watchdog while the system sleeps (a USB reset
   during the host controller's suspend is unsafe; 2026-11-15 a user-space
   re-enumeration put PTXH into a reset loop until reboot).
+- Same S3 power cut drops the BT USB device off its xHCI port right after
+  ACPI SLEEP; a standard port has wake-on-disconnect armed, so every S3 woke
+  0.5-2 s later (2026-11-23, PTXH PMCSR 0x8108, wake reason "?", BT patch
+  `PatchUndone` after wake). Not remote wake: disabling it changed nothing.
+  The BT loader sets `UsbHostControllerPortWakeSourcesPolicy` = 1 on its
+  port; `AppleUSBXHCIPort::powerOn` then skips PORTSC WCE/WDE/WOE. powerOn
+  runs at controller start (before the loader matches) and after each
+  wake, so the loader also clears the bits armed at boot in PORTSC itself
+  (BAR0 of the controller's PCI device, Linux-style neutral write, only
+  when the PORTSC is connected + powered + high speed). Without the kext:
+  DeviceProperties `usb-port-wake-sources-policy` = `<01000000>` on the
+  controller, or boot-arg `usb-port-wake-sources-policy=1` (all
+  controllers). `-mtkbtportwake` off.
 - ASRock B450M-HDV (2026-11-15): every S3 woke ~1 s later with reason
   `GPP0..GP11` (shared PCIe GPE 0x08), 112 dark wakes in 2 h. Not our
   hardware: fixed in OpenCore with SSDT-GPRW (GPE 0x08 only; USB 0x19 kept).
