@@ -58,9 +58,24 @@ other unsigned kexts are still loaded afterwards.
 | `amtk_6ghz=1` | scan and report 6 GHz on chips that have it (MT7922, MT7921K); off by default: 6 GHz joins need SAE hash-to-element or OWE, not implemented ([WIFI-6GHZ.md](WIFI-6GHZ.md)) |
 | `amtk_roam=0` | no in-driver roaming: stay on the joined BSSID until the link drops ([ROAMING.md](ROAMING.md)) |
 | `amtk_awdl_offchan=0` | keep AWDL on the AP channel while associated (no PM handshake; AirDrop to phones on other channels fails) |
-| `amtk_awdl_idle_gap=MS` | while associated and AWDL is idle (macOS's Idle/Low Power AWDL schedule, no AirDrop/AWDL data), leave the AP channel for AWDL at most once per `MS` ms, alternating channels (default 1000, max 1500, `0` = every window as in 1.1.2). Each visit pauses the AP link ~200 ms ([issue #11](https://github.com/Dino-VN/MtkWireless/issues/11)) |
-| `amtk_awdl_infra_bw=0` | request AWDL windows on the AP's own channel at 20 MHz again (1.1.2); by default they keep the AP's 40/80 MHz tuning, AWDL frames still go out at 20 MHz |
+| `amtk_awdl_idle_gap=MS` | while associated and AWDL is idle (macOS's Idle/Low Power AWDL schedule, no AirDrop/AWDL data), leave the AP channel for AWDL at most once per `MS` ms, alternating channels (default 700, max 1500, `0` = every window as in 1.1.2). Unused off-channel ROC tails are released once the EAW ends ([issue #11](https://github.com/Dino-VN/MtkWireless/issues/11)) |
+| `amtk_awdl_txpool=N` | AWDL Skywalk TX packet/buffer pool count (`256..8192`, default `2048`; RX stays `256`) |
+| `amtk_awdl_renew_station=0` | disable automatic one-shot firmware station renewal on `MTKAWDLTXNoPeer` for authorized live peers (on by default) |
+| `amtk_awdl_infra_bw=1` | opt-in to request AWDL windows on the AP's own channel at the AP's 40/80 MHz width (default `0`, 20 MHz ROC; on 2026-11-25 MT7922 hardware with AP on ch 149/80 MHz, 80 MHz ROC acquire failed 28/28 ch-149 unicast TX while 20 MHz ch 6 succeeded 36/36) |
+| `amtk_awdl_tick_us=1000` | restore the 1 ms enqueue-to-service timer delay for AirDrop A/B tests. The default is 250 µs. |
 | `amtk_pmf=0` | no 802.11w PMF and therefore no WPA3-SAE: WPA3-transition networks are shown to macOS as WPA2-PSK again, WPA3-only and PMF-required networks cannot be joined (the 1.0.0 behaviour) |
+
+Queued unicast to a live AWDL peer, outgoing multicast mDNS queries/replies,
+Unicast MI requests and native peer cache additions pause the idle cap for
+3.5 seconds and keep it paused while an unexpired data frame to a live peer is
+still queued. This gives sparse discovery and TCP connection handshakes room to
+run across retransmit backoffs before bulk traffic or native traffic
+registration starts. Off-channel visits still use the AP power-save handshake,
+and unused off-channel grant tails are released on idle slots so the AP wakes
+promptly. `MTKAWDLIdleCapPeerTxAtUS` records the last qualifying enqueue. A
+1.1.6 run on channel 149 saw 13 TCP SYNs on `awdl0` without a SYN-ACK and no
+recorded deletion of the recipient's route. The queue-aware idle cap needs
+hardware verification.
 
 ## Country code and Location
 

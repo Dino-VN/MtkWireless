@@ -39,8 +39,8 @@ def model_boundaries(text):
                ' bool awdlIsEnabled() { return on && storage.sc_awdl_enabled && !storage.sc_resetting && !storage.sc_detaching && !storage.sc_awdl_stopping; }')
     text = one(text, ' bool awdlGrantSnapshot(mtkawdl::Reservation &out) { out=grant; return on; }',
                ' bool awdlGrantSnapshot(mtkawdl::Reservation &out) { if(!awdlIsEnabled())return false; out=grant; return true; }')
-    text = one(text, ' bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false;', r'''
- bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false;
+    text = one(text, ' bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false,onlyInfra=true;', r'''
+ bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false,onlyInfra=true;
  bool modelPS=false,modelScan=false,modelJoin=false,modelOffchan=true;
  uint64_t modelPMAt=0,modelPMRefused=0;
  std::set<unsigned> modelLegal{1,6,9,11,36,44,149};
@@ -49,9 +49,9 @@ def model_boundaries(text):
 ''')
     text = one(text, ' bool awdlChannelAllowed(unsigned c) { return fault.social&&(c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8)||(allow11&&c==11)); }',
                ' bool awdlChannelAllowed(unsigned c) { return fault.social&&modelLegal.count(c); }')
-    text = one(text, ' uint8_t awdlOnlyChannel() { return infraChannel; }',
+    text = one(text, ' uint8_t awdlOnlyChannel() { return onlyInfra ? infraChannel : 0; }',
                ' uint8_t awdlOnlyChannel() { return modelOffchan ? 0 : infraChannel; }')
-    text = one(text, ' bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!infraChannel||infraChannel==c); }',
+    text = one(text, ' bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!awdlOnlyChannel()||infraChannel==c); }',
                ' bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!awdlOnlyChannel()||awdlOnlyChannel()==c); }')
     text = one(text, ' void awdlInfraSleep(unsigned) { ++sleeps; }', r'''
  void awdlInfraSleep(unsigned c) {

@@ -144,46 +144,73 @@ we can copy (ours is ROC per window), but three of its findings apply:
   rounding) ran dry at FQ-CoDel's peak (672 per flow + submission +
   completion); the flowswitch then drops the batch with ENOMEM ("failed to
   allocate slab") without telling QUIC, which stays flow controlled.
-  Ours was 256 here; the 1.1.2 Skywalk work (docs/WIFI-SKYWALK-TEST.md,
-  not on this branch) already requests 2048 with `amtk_awdl_txpool`, so
-  this port leaves the pool alone.
+  `createDataPath()` now requests 2048 TX packets/buffers by default
+  (`amtk_awdl_txpool` 256..8192; RX stays 256).
 - **PHY.** Its Mac -> iPhone speed comes from VHT80 two-stream A-MPDUs
   (`-itlawdlcoexbatx` + `-itlawdlcaps`); peer capabilities are assumed, not
   parsed. Ours topped out at HT MCS 7, 20 MHz, one stream (65 Mbps PHY).
-  `amtk_awdl_phy` (default 1 since the 1.1.3 hardware test below):
+  `amtk_awdl_phy` (default 1):
   - 0: the old ladder and 20 MHz ROC.
-  - 1: + VHT MCS 7/8 two-stream at 20 MHz (130/156 Mbps) in 5 GHz windows.
-  - 2 (opt-in): + 80 MHz ROC on 36-48 / 149-161 (non-DFS, every 20 MHz channel
-    enabled, VHT80 flag) and VHT MCS 4/7/9 two-stream at 80 MHz
-    (351/585/780 Mbps). Associated, the block may not hold the AP's
-    channel unless it is the AWDL channel at the AP's own 80 MHz.
+  - 1 (default): + VHT MCS 7/8 two-stream at 20 MHz (130/156 Mbps) in 5 GHz
+    windows with 20 MHz ROC.
+  - 2 (opt-in): begin at 20 MHz. An active peer (via native traffic
+    registration or recent unicast AWDL data within 5 s, including AirDrop)
+    with a recent 80 MHz operating class and a VHT RX map supporting two
+    streams at MCS 9 can enable 80 MHz ROC on 36-48 / 149-161 (non-DFS, every
+    20 MHz channel enabled, VHT80 flag) and VHT MCS 4/7/9 two-stream at
+    80 MHz (351/585/780 Mbps). On 2026-11-25 MT7922 hardware
+    (`diagnostics/airdrop-benchmark-gpkoe571`), firmware accepted 116 80 MHz
+    ROC grants on channel 149 (center 155, bw 2) but received 0 frames
+    (`MTKAWDLRxWide=0`) and failed all 10 channel-149 TX frames after 15
+    retries, while 20 MHz grants received 609 frames (`MTKAWDLRxNarrow5=609`).
+    If opted into `amtk_awdl_phy=2`, 6 wide grants with 0 wide RX also trip
+    `sc_awdl_wide_off` back to 20 MHz. Associated, the block may not hold the
+    AP's channel unless it is the AWDL channel at the AP's own 80 MHz.
+    The driver advertises the allowed width through a separate operating
+    class schedule (TLV 18) alongside the VHT capability (TLV 17).
+    `MTKAWDLVHT80Channels` reports the negotiated primary-channel bitmap.
   2.4 GHz windows use a separate ladder (HT at most), so channel-6 losses
   no longer demote the 5 GHz rate. Wide rungs match TXS by NSS and TXS
-  bandwidth (bits 29..30) too. The TX ladder follows the granted window
-  (`band2g`, `wide`). Linux's MT7921 ROC is always 20 MHz; three
+  bandwidth (bits 29..30) too. The 80 MHz TX ladder requires the firmware
+  grant to report 80 MHz and the requested center. Linux's MT7921 ROC is
+  always 20 MHz. Three
   FirmwareStatus refusals of an 80 MHz acquire before any wide grant turn
   80 MHz off until AWDL is re-enabled. The peer WTBL gets WTBL_VHT for
   phy >= 1. ioreg on the controller: `MTKAWDLPhy`,
   `MTKAWDLROC{Wide,Narrow}Grants`, `MTKAWDLROCWideRejects`,
   `MTKAWDLROCWideOff`, `MTKAWDLWindowWide`; per-peer
-  `MTKAWDLTXPeer*RateMbps` now reads up to 780. A/B: `amtk_awdl_phy=1`,
-  then `0`. 1.0.16's "11ac/80 broke AirDrop" was the infrastructure knob,
+  `MTKAWDLTXPeer*RateMbps` now reads up to 780. 1.0.16's "11ac/80 broke
+  AirDrop" was the infrastructure knob,
   not AWDL; watch `MTKAWDLROCLatency*` for slower 80 MHz grants.
 - **Scans during transfers.** A firmware scan holds the radio for its
   whole channel list and `awdlReserve` refuses every ROC meanwhile.
-  While AWDL data moved within the last 3 s (TX status or, new, accepted
-  RX: `MtkMwx::awdlNoteDataRx`), `mt7921_mcu_hw_scan` scans
+  While AWDL is enabled, explicit WCL discovery scans are chunked even
+  before a peer is visible. Other scans are chunked if AWDL data moved
+  within the last 15 s (TX enqueue/status or accepted RX) or a valid peer action
+  frame arrived within 3 s. In those cases,
+  `mt7921_mcu_hw_scan` scans
   `amtk_scan_chunk` channels (default 4, 0 = whole list) per firmware
-  request and leaves `amtk_scan_gap` ms (default 250) for AWDL between
+  request and leaves `amtk_scan_gap` ms (default 400) for AWDL between
   them; SCAN_DONE of the last chunk ends the logical scan. Joins (WCL
   channel or fallback) are never chunked. A fresh scan, stop/reset or the
   scan ending during a gap drops the rest (generation check in
   `mwx_scan_chunk_task`); a refused chunk ends the scan with what earlier
-  chunks found. `deferScanForAWDL` still holds associated WCL scans while
-  data flows (now in both directions); the one it lets through every 30 s
-  is chunked. ioreg `MTKScanChunked`, `MTKScanChunks`,
+  chunks found. `deferScanForAWDL` holds associated WCL scans for 5 s after
+  AWDL data activity (RX, TXS, or live-peer unicast enqueue); the one it lets
+  through every 30 s is chunked. ioreg `MTKScanChunked`, `MTKScanChunks`,
   `MTKScanChunkAbandoned`, `MTKScanChunkSize`. Test:
   `scripts/test-wifi-scan-chunk.py`.
+
+  On 1.1.6, an iPhone-to-Mac AirDrop session completed PairVerify at
+  00:51:42. An automatic 4.059 s scan and an immediate 5.009 s scan
+  followed. macOS removed the peer from NDP during the first scan after
+  6.614 s without an action frame. The peer became routable again 151 ms
+  after the second scan finished, but the existing TCP socket failed with
+  `EHOSTUNREACH`. The previous 3 s window let a scan take the radio while
+  the session waited for a reply. A recent peer also protects discovery before
+  any payload has moved, following the scan scheduling approach in
+  [RTLAirLink](https://github.com/xnpty/RTLAirLink/blob/c073f4c8b1e20b10f88648338ecb1084f1716d19/Source-Build/src/compat_rtw89/rtw89_glue.c#L3607-L3622).
+  The new scan admission rules need hardware verification.
 
 1.1.3 hardware (2026-11-20, AP "2.4 GHz ch 10", iPhone16,2, default
 `amtk_awdl_phy=2`): AirDrop stuck at "Waiting". sharingd's application
@@ -195,3 +222,119 @@ under `amtk_awdl_phy=2`, turns 80 MHz off for the AWDL session after 16
 wide grants without one received AWDL frame. ioreg `MTKAWDLRxWide` /
 `MTKAWDLRxNarrow5` count AWDL frames received inside 80 / 20 MHz 5 GHz
 grants, `MTKAWDLWideAutoOff` the fallbacks.
+
+On the 1.1.6 November 25 capture, 16 accepted wide requests with zero RX
+in those windows triggered the old silence-based fallback. The accepted
+request count was based on the submitted width. The current code keeps
+negotiated 80 MHz enabled across empty windows. Compare
+`MTKAWDLROCWideGrants` (accepted requests) with `MTKAWDLROCWideConfirmed`
+(matching width and center). `MTKAWDLROCWideLast*` retains the last wide
+request's grant, even after a narrow/social window. `MTKAWDLRxVHT80Data`
+counts received data frames whose P-RXV reports VHT80. Those fields need
+hardware verification.
+
+In the 01:21 November 25 AirDrop attempt, the first Rapport TCP SYN went
+out immediately after recipient selection and the SYN-ACK arrived 1.93 s
+later. The same 98-byte TCP segment was sent seven times on `awdl0` over
+17.35 s before the remote ACK advanced. Native logs report no peer action
+frames for 6.06 s and removal from NDP during that interval. The Rapport
+session-start response took 20.79 s, followed by 2.04 s resolving the
+AirDrop service and 3.03 s to receive HELLO. In the 10:48 attempt, Rapport
+opened in 0.13 s and HELLO arrived in 1.46 s. The captures locate the
+largest delay in the early control exchange. They do not identify why
+each TCP retry went unacknowledged.
+
+## 2026-11-25 3.31 MiB/s throughput diagnosis and TX pipeline fixes (unverified on hardware)
+
+After fixing the 80 MHz ROC deafness (`amtk_awdl_phy=1`, `amtk_awdl_infra_bw=0`)
+and premature peer route removal, `diagnostics/airdrop-benchmark-702hhi02`
+completed a 64 MiB Mac -> iPhone AirDrop cleanly (879 ms to first flow packet,
+1.27 s to upload start, 99.97% TX ACKed at 156 Mbps VHT MCS 8 2x2 20 MHz),
+but plateaued at 3.31 MiB/s (`MTKAWDLTXTraceSummary` average submit-to-free
+latency 31.98 ms, `MTKAWDLNativeDroppedPackets=1013`, `MTKAWDLTXBackpressure=672`,
+`MTKAWDLTXTraceTXS=68856`, `MTKAWDLTxBATorn=14`). Analysis showed five
+compounding TX-path bottlenecks:
+
+1. **Missing QoS/LDPC/VHT A-MPDU WTBL flags (`MtkMwx::awdlPeer`).**
+   `STA_REC_BASIC.qos` and `WTBL_GENERIC.qos` were left 0 (unlike
+   infrastructure STA Wi-Fi), `WTBL_HT.af` was capped at 3 (64 KB) instead of
+   VHT's 7 (1 MB), and `WTBL_HT.ldpc` / `WTBL_VHT.ldpc` were 0.
+2. **Hardware evidence from `diagnostics/airdrop-benchmark-zez4jv9x` (UUID `5B2B22E2-3B65-3867-8C11-FC9659ECA441`).**
+   All 4 benchmark scenarios (`wifi`, `wifi-scan`, `wifi-disconnect`, `direct`)
+   completed cleanly (`shared`), `MTKAWDLNativeDroppedPackets` dropped from
+   1,013 in 1 trial to 67 across all 4 trials, and average `submit -> txfree`
+   latency dropped from 31.98 ms to 16.91 ms. However, clearing
+   `MT_TXD3_SN_VALID` while passing `p.seq` instead of `p.ssn` to
+   `awdlTxBlockAck` caused repeated 1-3 s iPhone RX-BA reorder freezes
+   (33.9 s of >=100 ms stalls in `01-01-wifi`, dropping average speed to
+   1.14-1.35 MiB/s). In addition, `MTKAWDLTXTraceTXS` `raw4` hardware TX
+   timestamps during full-ring bursts measured 4.67-5.87 ms per 16 frames
+   (291-366 us/frame), proving MT7922 still transmitted 1 MPDU per PPDU under
+   `MT_TXD2_FIX_RATE=1` despite `MT_TXD3_BA_DISABLE=0`.
+   - `handleTxBlockAckFrame` is restored to `p.ssn` and `amtk_awdl_txba_hwsn`
+     defaults back to `0` (`MT_TXD3_SN_VALID` kept) to eliminate the RX-BA
+     reorder freezes.
+   - **Hardware evidence from `diagnostics/airdrop-benchmark-9ldbi18y` (UUID `1E514F60-BED7-3658-929D-D4834E01FE6F`).**
+     Firmware RA on the P2P-discovery BSS (`MTKAWDLRAEnabled=Yes`) stayed
+     pinned at legacy OFDM 54 Mbps (`MTKAWDLRALastRate=76 / 0x004c`) and
+     stalled transfers (`0.14-0.23 MiB/s`). `amtk_awdl_ra` now defaults to `0`
+     (opt-in), restoring the 173.3 Mbps VHT MCS 8 2x2 SGI+LDPC ladder.
+   - **Hardware evidence from `diagnostics/airdrop-benchmark-ug4wr08p` & `ec717y5h` (UUID `368756C6-EEC8-3DAF-A684-54F90C5F8C89`).**
+     TCP/TLS PairVerify completed in ~167 ms on single QoS frames, then QUIC
+     Initial sent two back-to-back 1,262-byte UDP packets that `buildAmsdu`
+     collapsed into a 2,570-byte A-MSDU (`MTKAWDLAmsduFrames=129`) while the
+     rate ladder was still on 6-24 Mbps legacy OFDM (`0x004b..0x0049`); iPhone
+     802.11-ACKed them but dropped the payloads, causing `connect_timeout`.
+     `amtk_awdl_amsdu` now defaults to `0` (opt-in `amtk_awdl_amsdu=1`), keeping
+     the verified zero-stall single-MPDU path alongside all proven clean wins
+     (`kDataQueueSize=1024` + lossless Skywalk backpressure, `sc_txq=512`,
+     `awdlTickUS=100`, `MT_TXD6_SGI` 173.3 Mbps + `MT_TXD6_LDPC`,
+     `basic/generic.qos=1`, `TXS 1-in-16`), and adds low-contention AWDL WMM
+     EDCA (`wmm_idx=1`: `aifs=2, cw_min=3, cw_max=7, txop=94` = 3 ms TXOP;
+     `amtk_awdl_edca=0` restores AP BE params).
+   - **Hardware evidence from `diagnostics/airdrop-benchmark-xls_xrag` (UUID `F0BD459E-27CA-351F-8FC2-A693D7A9B62E`).**
+     All 4 benchmark scenarios passed (`shared`: `wifi` 2.99, `wifi-scan` 1.93,
+     `wifi-disconnect` 0.93, `direct` 1.63 MiB/s), `MTKAWDLNativeDroppedPackets`
+     dropped to 9 across all 4 trials (vs 1,013 in 1 baseline trial), and
+     hardware TXS `raw4` burst spacing dropped to `4.25 ms` per 16 MPDUs
+     (`265 us/MPDU`, sustained 5.3-5.6 MiB/s 100 ms bursts, 4.39 MiB/s full-s
+     peak). Packet-phase analysis proved two exact causes for the remaining
+     stalls:
+     1. In `01-01-wifi`, all 5 blackouts (5.52 s total, each 1.04-1.18 s) began
+        at the exact 1,048.576 ms superframe phase right after the channel 6
+        social window (`phase = 343-351 ms`): with up to 512 frames in `sc_txq`
+        (`MTKAWDLTXTraceMaxLatencyUS = 207 ms`) plus 8 ms trailing peer-gate
+        slack after iPhone hopped to ch 6, frames stranded in MT7922's hardware
+        FIFO exhausted all 15 retries in ~2.2 ms, dropping an MPDU and locking
+        iPhone's RX-BA reorder buffer for ~1 s. Fix: cap AWDL unicast hardware
+        in-flight depth at 48 TXWIs (`~12.7 ms`, `amtk_awdl_hw_inflight`),
+        stop submitting unicast data 14 ms before peer channel departure and
+        remove trailing post-departure slack (`amtk_awdl_peer_drain_us`), and
+        briefly drain in-flight TXWIs (`<= 12 ms`) inside `mwx_awdl_abort`.
+     2. In `01-04-direct`, unassociated `airportd` auto-join 41-channel scans
+        ran 4 channels x `dwell=120` (~1 s firmware blackout per chunk),
+        causing 20.29 s of QUIC PTO / PMTUD blackhole stalls while scan-free
+        intervals ran at 3.6-3.93 MiB/s. Fix: during active AWDL data (<3 s),
+        chunk scans to 2 channels with firmware auto-dwell (`dwell=0`, keeping
+        `timeout_value = nchan * 120`). Hardware verification pending.
+3. **Per-MPDU TXS flood and Long GI / BCC on HT/VHT data.**
+   Every unicast data frame set `MT_TXD5_TX_STATUS_HOST`, generating 68,856
+   extra 32-byte RX events per upload, while HT/VHT fixed rates omitted Short
+   GI and LDPC. Once a TX-BA peer settles at its top rung, unicast data now
+   samples TXS 1-in-16 (`amtk_awdl_txs_sample`, default 16, 1 = every frame),
+   and HT/VHT data enables 400 ns Short GI (`amtk_awdl_sgi=0` off; 156 -> 173.3
+   Mbps at VHT MCS 8 2x2 20 MHz) and LDPC (`amtk_awdl_ldpc=0` off).
+4. **Silent Skywalk queue drops during QUIC slow-start bursts.**
+   `kDataQueueSize` was 256 while QUIC sent 644-packet bursts in 5.4 ms,
+   causing `submitNative` to drop 1,013 packets while reporting them consumed.
+   `kDataQueueSize` is now 1024 and `submitNative` stops consuming (`break`)
+   when full to apply lossless Skywalk backpressure.
+5. **2 ms TX-backpressure sleep and half-sized TX DMA ring.**
+   `sc_txq` allocated only 256 descriptors despite `MWX_TXWI_MAX=512`, and
+   `serviceInGate` slept 2,000 us after every `mwx_tx_full` break. `sc_txq` now
+   matches `MWX_TXWI_MAX` (512), `awdlTickUS` defaults to 100 us
+   (`amtk_awdl_tick_us`), and TX backpressure caps the re-arm delay to
+   `awdlTickUS()`.
+
+Hardware benchmark verification after installing the rebuilt Wi-Fi kext and
+rebooting is pending.

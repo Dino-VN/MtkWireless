@@ -139,6 +139,12 @@ export! {
         if data.is_null() { return 0; }
         s.as_mut().map_or(0, |s| p::build_action_with_template(s, bytes_mut(f, capacity), now, bytes(data, n)))
     }
+    fn mtk_awdl_peer_vht80_channels(f: *const u8, n: usize) -> u8 {
+        p::peer_vht80_channels(bytes(f, n))
+    }
+    fn mtk_awdl_advertise_vht80(f: *mut u8, capacity: usize, n: usize, s: *const Sequence, wide: u8) -> usize {
+        s.as_ref().map_or(n, |s| p::advertise_vht80(bytes_mut(f, capacity), n, s, wide))
+    }
     fn mtk_awdl_block_ack_action(f: *const u8, n: usize, own: *const u8) -> bool {
         !f.is_null() && mac(own).is_some_and(|m| p::block_ack_action(bytes(f, n), m))
     }
@@ -378,7 +384,7 @@ static LAYOUT: &[usize] = layout! {
         action_failed, last_status, last_sequence, last_wcid, last_pid, rates, ofdm_only, phy, band_2g, wide,
         rates_2g }
     Reservation { deadline, grant_observed_at, requested_at, token, channel, pending, granted, response_delay_us }
-    RocGrant { bss, token, status, channel, request_type, duration_ms }
+    RocGrant { bss, token, status, channel, request_type, bandwidth, center_channel, duration_ms }
     DataView { destination, source, payload, length, sequence }
     Window { start, end, counter, channel, presence }
     RocLeadTiming { samples, lead_us, count, next, updates, decreases }

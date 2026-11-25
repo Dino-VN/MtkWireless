@@ -52,7 +52,12 @@ struct ieee80211_node { unsigned ni_flags=0; uint16_t ni_associd=0; uint8_t ni_m
 struct ieee80211com { void *ic_softc=nullptr; unsigned ic_flags=0; ieee80211_node *ic_bss=nullptr; ieee80211_edca_ac_params ic_edca_ac[4]{}; };
 struct mwx_node { ieee80211_node ni; uint16_t wcid; unsigned flags; };
 struct mwx_vif { uint8_t idx=0,wmm_idx=0; };
-struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; };
+struct mwx_softc { ieee80211com sc_ic; mwx_vif sc_vif; mwx_vif sc_awdl_vif; };
+int awdlEdcaBootArg=-1;
+bool PE_parse_boot_argn(const char *arg,void *buf,int len) {
+    if(strcmp(arg,"amtk_awdl_edca")!=0||awdlEdcaBootArg<0||len!=sizeof(int)) return false;
+    memcpy(buf,&awdlEdcaBootArg,sizeof(int)); return true;
+}
 std::vector<uint8_t> message;
 int sendError=0;
 int mwx_mcu_send_msg(mwx_softc *,unsigned cmd,void *data,size_t n,int *seq) {
@@ -89,6 +94,15 @@ int main() {
     sc.sc_ic.ic_edca_ac[0].ac_ecwmin=0; sc.sc_ic.ic_edca_ac[0].ac_ecwmax=255;
     assert(mt7921_mcu_set_tx(&sc,&sc.sc_vif)==0&&word(0)==5&&word(2)==32767);
     mwx_vif secondary; secondary.idx=4; assert(mt7921_mcu_set_tx(&sc,&secondary)==0); checkDefault();
+    sc.sc_awdl_vif.idx=5; sc.sc_awdl_vif.wmm_idx=1;
+    assert(mt7921_mcu_set_tx(&sc,&sc.sc_awdl_vif)==0&&message[40]==5&&message[41]==1&&message[42]==1);
+    for(unsigned ac=0;ac<4;++ac) {
+        assert(word(ac*10)==3&&word(ac*10+2)==7&&word(ac*10+4)==94&&word(ac*10+6)==2);
+        assert(message[ac*10+8]==0&&message[ac*10+9]==0);
+    }
+    awdlEdcaBootArg=0;
+    assert(mt7921_mcu_set_tx(&sc,&sc.sc_awdl_vif)==0&&message[40]==5&&message[41]==0&&message[42]==1); checkDefault();
+    awdlEdcaBootArg=-1;
     ap.ni_flags=0; assert(mt7921_mcu_set_tx(&sc,&sc.sc_vif)==0); checkDefault();
     sendError=EIO; assert(mt7921_mcu_set_tx(&sc,&sc.sc_vif)==EIO); sendError=0;
     // More than one WCID wrap must not touch the associated AP's WTBL entry.

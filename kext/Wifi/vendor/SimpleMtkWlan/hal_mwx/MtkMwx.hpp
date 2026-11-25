@@ -116,6 +116,8 @@ public:
     // AWDL data was received now: WCL scans are deferred while data flows
     // in either direction (deferScanForAWDL); TX is noted from TXS.
     void awdlNoteDataRx();
+    void awdlNotePeer();
+    uint8_t awdlVht80Channels(const uint8_t *peer, uint8_t peerChannels);
     IOReturn awdlTransmit(mbuf_t frame, uint8_t channel);
     // Queue API: leave *frame owned by the caller on a transient failure;
     // clear it after successful submission or permanent rejection.

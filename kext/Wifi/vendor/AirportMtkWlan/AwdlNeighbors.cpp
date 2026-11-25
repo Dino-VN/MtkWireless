@@ -91,18 +91,21 @@ void AwdlNeighbors::update(const char *name,const uint8_t mac[6],const Peer *pee
         }
         Slot &s=slots[slot];
         live[slot]=true; cachedNow[slot]=peers[i].cached; s.lastLiveUS=now;
-        if(peers[i].cached || now>=s.suppressUntilUS) s.want=true;
+        s.want=true;
     }
     for(unsigned j=0;j<kSlots;++j) {
         Slot &s=slots[j];
         if(!s.used) continue;
-        if(s.cached && !cachedNow[j]) {
-            // Native removed the peer from its cache: delete now and do not
-            // re-add for 10 s unless native caches it again.
-            s.want=false; s.suppressUntilUS=now+kUncachedHoldUS;
-        } else if(!live[j] && now-s.lastLiveUS>kPeerGraceUS) s.want=false;
+        // Hardware (2026-11-25, AirDrop upload): macOS can send
+        // PEER_CACHE_CONTROL op=2 (remove) 0.5 s after UPLOAD START while
+        // QUIC is actively sending over awdl0. Deleting the static neighbour
+        // immediately (and suppressing re-add for 10 s) caused EHOSTUNREACH
+        // and permanently closed the awdl0 QUIC path (validated -> unavailable).
+        // Let peers expire only after kPeerGraceUS (30 s) without liveness, on
+        // AWDL down (5 s), or on stop().
+        if(!live[j] && now-s.lastLiveUS>kPeerGraceUS) s.want=false;
         s.cached=cachedNow[j];
-        if(!s.want && !s.owned && !running && now>=s.suppressUntilUS) s.used=false;
+        if(!s.want && !s.owned && !running) s.used=false;
     }
     armLocked(0);
     IOLockUnlock(lock);

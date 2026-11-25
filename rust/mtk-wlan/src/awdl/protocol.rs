@@ -1261,6 +1261,103 @@ pub fn write_sequence(p: &mut [u8], s: &Sequence) {
     copy(p, 6, &s.channels[..(s.count as usize).min(SLOTS)]);
 }
 
+pub const VHT80_PRIMARIES: [u8; 8] = [36, 40, 44, 48, 149, 153, 157, 161];
+
+fn vht80_bit(channel: u8) -> u8 {
+    VHT80_PRIMARIES.iter().position(|&primary| primary == channel).map_or(0, |i| 1 << i)
+}
+
+/// Require an explicit 80 MHz operating class and the RX MCS map needed by
+/// the local two-stream rate ladder. The caller has validated the action.
+pub fn peer_vht80_channels(frame: &[u8]) -> u8 {
+    let Some(tlvs) = frame.get(40..) else { return 0 };
+    let mut reader = Reader::new(tlvs);
+    let mut vht = None;
+    let mut channels = 0;
+    while reader.remaining() >= 3 {
+        let (Ok(kind), Ok(length)) = (reader.u8(), reader.le16()) else { return 0 };
+        let Ok(value) = reader.take(length as usize) else { return 0 };
+        match kind {
+            17 => {
+                if vht.is_some() || value.len() != 14 || !value.starts_with(&[191, 12]) {
+                    return 0;
+                }
+                vht = Some(le16(value, 6) & 0xf == 0xa && le16(value, 10) & 3 != 3);
+            }
+            18 if value.get(1) == Some(&3) => {
+                let Some(sequence) = parse_sequence(value) else { return 0 };
+                for (i, &channel) in sequence.channels[..sequence.count as usize].iter().enumerate() {
+                    if value[7 + 2 * i] == 128 {
+                        channels |= vht80_bit(channel);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if vht == Some(true) { channels } else { 0 }
+}
+
+/// Add an operating-class schedule for the PHY widths the radio will use.
+/// Keep the legacy schedule intact for peers that only read it.
+pub fn advertise_vht80(frame: &mut [u8], size: usize, sequence: &Sequence, wide: u8) -> usize {
+    if wide == 0 || !valid_sequence(sequence) || !(40..=2048).contains(&size) || size > frame.len() {
+        return size;
+    }
+    let mut reader = Reader::new(&frame[40..size]);
+    let mut capability = None;
+    while reader.remaining() >= 3 {
+        let at = size - reader.remaining();
+        let (Ok(kind), Ok(length)) = (reader.u8(), reader.le16()) else { return size };
+        let Ok(value) = reader.take(length as usize) else { return size };
+        if kind == 18 {
+            return size;
+        }
+        if kind == 17 {
+            if capability.is_some() || value.len() != 14 {
+                return size;
+            }
+            capability = Some(at + 3);
+        }
+    }
+    if reader.remaining() != 0 {
+        return size;
+    }
+    let channels = &sequence.channels[..sequence.count as usize];
+    if !channels.iter().any(|&channel| wide & vht80_bit(channel) != 0) {
+        return size;
+    }
+    let seq_at = size + if capability.is_some() { 0 } else { 17 };
+    let end = seq_at + 9 + 2 * channels.len();
+    if end > frame.len().min(2048) {
+        return size;
+    }
+    let cap_at = capability.unwrap_or(size + 3);
+    if capability.is_none() {
+        frame[size..size + 3].copy_from_slice(&[17, 14, 0]);
+    }
+    // MT7921/MT7922 two-stream VHT MCS 0–9. No optional SGI, STBC or
+    // beamforming claims. The HAL gates this on the local MCS maps.
+    frame[cap_at..cap_at + 14].copy_from_slice(&[191, 12, 0, 0, 0, 0, 0xfa, 0xff, 0, 0, 0xfa, 0xff, 0, 0]);
+    let seq_len = (6 + 2 * channels.len()) as u8;
+    frame[seq_at..seq_at + 9].copy_from_slice(&[18, seq_len, 0, sequence.count - 1, 3, 0, sequence.step, 0xff, 0xff]);
+    for (slot, &channel) in frame[seq_at + 9..end].chunks_exact_mut(2).zip(channels) {
+        slot[0] = channel;
+        slot[1] = match channel {
+            0 => 0,
+            _ if wide & vht80_bit(channel) != 0 => 128,
+            1..=13 => 81,
+            14 => 82,
+            36..=48 => 115,
+            52..=64 => 118,
+            100..=144 => 121,
+            149..=161 => 124,
+            _ => 125,
+        };
+    }
+    end
+}
+
 pub fn write_sync(s: &State, p: &mut [u8], now: u64) {
     let channel = s.channel(now);
     set(p, 0, channel);
@@ -2276,6 +2373,8 @@ pub struct RocGrant {
     pub status: u8,
     pub channel: u8,
     pub request_type: u8,
+    pub bandwidth: u8,
+    pub center_channel: u8,
     pub duration_ms: u32,
 }
 
@@ -2283,36 +2382,37 @@ pub struct RocGrant {
 /// the header). MT7921's grant tag is 0 and 20 bytes long.
 pub fn decode_roc_grant(p: &[u8], out: &mut RocGrant) -> RocResult {
     *out = RocGrant::default();
-    let n = p.len();
-    if n < 4 {
+    let mut reader = Reader::new(p);
+    if reader.take(4).is_err() {
         return RocResult::Malformed;
     }
     let mut found = false;
-    let mut at_ = 4;
-    while at_ < n {
-        if n - at_ < 4 {
+    while reader.remaining() != 0 {
+        let (Ok(tag), Ok(len)) = (reader.le16(), reader.le16()) else {
             return RocResult::Malformed;
-        }
-        let tag = le16(p, at_);
-        let len = le16(p, at_ + 2) as usize;
-        if len < 4 || len > n - at_ {
+        };
+        let Some(value_len) = len.checked_sub(4) else {
             return RocResult::Malformed;
-        }
+        };
+        let Ok(value) = reader.take(value_len as usize) else {
+            return RocResult::Malformed;
+        };
         if tag == 0 {
             if found || len != 20 {
                 return RocResult::Malformed;
             }
             found = true;
             *out = RocGrant {
-                bss: p[at_ + 4],
-                token: p[at_ + 5],
-                status: p[at_ + 6],
-                channel: p[at_ + 7],
-                request_type: p[at_ + 13],
-                duration_ms: le32(p, at_ + 16),
+                bss: value[0],
+                token: value[1],
+                status: value[2],
+                channel: value[3],
+                request_type: value[9],
+                bandwidth: value[6],
+                center_channel: value[7],
+                duration_ms: le32(value, 12),
             };
         }
-        at_ += len;
     }
     if found {
         RocResult::Accepted
@@ -2351,6 +2451,48 @@ pub fn receive_roc_grant(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roc_grant_reports_firmware_bandwidth_and_center() {
+        let mut event = [
+            0, 0, 0, 0, 0, 0, 20, 0, 3, 7, 0, 149, 1, 2, 2, 155, 0, 1, 0xff, 0, 44, 1, 0, 0,
+        ];
+        let mut grant = RocGrant::default();
+        assert_eq!(decode_roc_grant(&event, &mut grant), RocResult::Accepted);
+        assert_eq!((grant.channel, grant.bandwidth, grant.center_channel), (149, 2, 155));
+        assert_eq!((grant.request_type, grant.duration_ms), (1, 300));
+        event[14] = 0;
+        event[15] = 149;
+        assert_eq!(decode_roc_grant(&event, &mut grant), RocResult::Accepted);
+        assert_eq!((grant.channel, grant.bandwidth, grant.center_channel), (149, 0, 149));
+        assert_eq!(decode_roc_grant(&event[..23], &mut grant), RocResult::Malformed);
+    }
+
+    #[test]
+    fn vht80_advertises_only_negotiated_channels() {
+        let now = 10_000_000;
+        let mut state = State::default();
+        state.init(&[2, 1, 2, 3, 4, 5], now);
+        let mut seq = state.sequence;
+        seq.channels[..4].copy_from_slice(&[6, 44, 149, 0]);
+        assert!(state.set_sequence(&seq, now));
+        let mut frame = [0; 256];
+        let len = build_action(&mut state, &mut frame, now);
+        assert!(len > 40);
+        assert_eq!(peer_vht80_channels(&frame[..len]), 0);
+        let wide = vht80_bit(149);
+        assert_eq!(advertise_vht80(&mut frame[..len], len, &seq, wide), len);
+        let end = advertise_vht80(&mut frame, len, &seq, wide);
+        assert!(end > len);
+        assert_eq!(parse_action(&frame[..end]).unwrap().sequence, seq);
+        assert_eq!(peer_vht80_channels(&frame[..end]), wide);
+        assert_eq!(&frame[len + 26..len + 34], &[6, 81, 44, 115, 149, 128, 0, 0]);
+        // One spatial stream or a truncated schedule must stay at 20 MHz.
+        frame[len + 9] = 0xfe;
+        assert_eq!(peer_vht80_channels(&frame[..end]), 0);
+        frame[len + 9] = 0xfa;
+        assert_eq!(peer_vht80_channels(&frame[..end - 1]), 0);
+    }
 
     #[test]
     fn mdns_matches_only_complete_multicast_udp() {

@@ -30,6 +30,7 @@ diagnostics = (vendor / 'mtk80211/openbsd/net80211/mtk_join_diag.h').read_text()
 diagnostics = diagnostics[:diagnostics.index('/* MtkWireless: a failed attempt.')] + '#endif\n'
 code = r'''
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -70,6 +71,7 @@ struct ieee80211com : _ifnet {
     bool ic_wcl_join_requested=false;
     unsigned ic_wcl_scan_ssid_length=0, ic_des_esslen=0;
     uint8_t ic_wcl_scan_ssid[32]{}, ic_wcl_scan_channels[32]{};
+    uint64_t ic_awdl_data_at=0, ic_awdl_scan_defer_since=0, ic_awdl_scan_deferred=0;
     mtk_wlan_scan_ssids ic_wcl_scan_targets;
     mtk_join_diag ic_join_diag{};
     ieee80211_channel ic_channels[197];
@@ -89,12 +91,15 @@ bool scanChannelSelected(const uint8_t*,bool,unsigned){return true;}
 struct Hal {ieee80211com ic; ieee80211com*get80211Controller(){return &ic;}};
 void ieee80211_begin_cache_bgscan(_ifnet*p){
     // The production routine sets BGSCAN before calling the HAL.
-    auto ic=reinterpret_cast<ieee80211com*>(reinterpret_cast<char*>(p)-sizeof(_ifnet));
+    auto ic=reinterpret_cast<ieee80211com*>(reinterpret_cast<char*>(p)-offsetof(ieee80211com, ic_if));
     ic->ic_flags |= IEEE80211_F_BGSCAN;
 }
 void ieee80211_clean_inactive_nodes(ieee80211com*,int){}
 unsigned starts=0,bssSelections=0;
 int requestScan(ieee80211com*ic,int,int){++starts;ic->ic_wcl_scan_inflight=true;return 0;}
+uint64_t testNowUS=10000000;
+uint64_t mtk_join_now(){return testNowUS;}
+bool PE_parse_boot_argn(const char*,void*,int){return false;}
 struct CountryMock {unsigned checks=0;bool countryCodeAnnounceNeeded(){++checks;return false;}};
 struct AirportMtkSkywalkInterface {
     Hal radio; Hal*fHalService=&radio; Timer timer; Timer*scanSource=&timer;
@@ -102,14 +107,14 @@ struct AirportMtkSkywalkInterface {
     void deferWCLCountryUpdate(){++countryUpdates;}
     bool scanPending=false,joinPending=false,roamPending=false,scanCompleted=false,scanSkipCompletion=false;
     IOReturn beginWCLScan(apple80211ScanRequest*);
-    bool deferScanForAWDL(ieee80211com*){return false;}
+    bool deferScanForAWDL(ieee80211com*);
     void scanDone(){auto ic=&radio.ic;switch(IEEE80211_EVT_SCAN_DONE){
 ''' + completion + r'''
     }}
 };
 AirportMtkSkywalkInterface*current;
 void event(ieee80211com*,int,void*){current->scanDone();}
-''' + function(wcl, 'IOReturn AirportMtkSkywalkInterface::beginWCLScan(') + end_scan + r'''
+''' + function(wcl, 'IOReturn AirportMtkSkywalkInterface::beginWCLScan(') + function(wcl, 'bool AirportMtkSkywalkInterface::deferScanForAWDL(') + end_scan + r'''
 struct mbuf {};
 struct mt76_connac_hw_scan_req {};
 struct mwx_softc {
@@ -202,7 +207,16 @@ int main(){
     assert(mt7921_mcu_hw_scan(&sc,1)==99 && aborts==2);
     sc.sc_ic.ic_state=IEEE80211_S_SCAN;sc.sc_ic.ic_wcl_join_requested=false;
     assert(mt7921_mcu_hw_scan(&sc,0)==99 && aborts==3);
-    puts("PASS: idle scan release, explicit scan restart/completion, stale completion, join priority, AWDL scan admission");
+    // Associated WCL scans defer for 5 s after AWDL data activity, capped at 30 s.
+    d.scanPending=false;d.joinPending=false;d.roamPending=false;
+    ic.ic_state=IEEE80211_S_RUN;ic.ic_flags=0;ic.ic_wcl_join_requested=false;
+    ic.ic_awdl_data_at=testNowUS-4500000;
+    assert(d.beginWCLScan(&request)==kIOReturnBusy && ic.ic_awdl_scan_deferred==1);
+    testNowUS+=30000000;ic.ic_awdl_data_at=testNowUS-1000000;
+    assert(d.beginWCLScan(&request)==kIOReturnSuccess && ic.ic_awdl_scan_deferred==1);
+    d.scanPending=false;ic.ic_flags=0;ic.ic_awdl_data_at=testNowUS-5000001;
+    assert(d.beginWCLScan(&request)==kIOReturnSuccess);
+    puts("PASS: idle scan release, explicit scan restart/completion, stale completion, join priority, AWDL scan admission/deferral");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='mtk-wifi-scan-') as directory:

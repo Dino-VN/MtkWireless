@@ -65,7 +65,7 @@ INTERFACE_GROUPS = {
     "canonical_origin": "admitDataRx inputCanonicalView deliverNativeView inputNativeView",
     "init_teardown": "initWithController setBSDInterface getHardwareAddress getSelfMacAddr isChipInterfaceReady shutdown shutdownGated shutdownInGate stop stopGated stopInGate free",
     "public_controls": "setMacAddress macAddressGated setMacAddressInGate setInterfaceEnable interfaceEnableGated setInterfaceEnableInGate setLinkState linkStateGated setLinkStateInGate setSync syncGated awdlSystemReady cancelSyncEnable syncEnableCurrent scheduleSyncEnable publishSyncStatus continueSyncEnable serviceSyncEnable setSyncInGate finishAvailabilityWindowForDisable",
-    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics updateNeighbors publishScheduler liveGrantServesNext serviceClockReacquisition mdnsReplyUsesQueryChannel serviceInGate receive",
+    "timer_polling_windows": "makeFrame buildAmsdu txBaSlot convertQos serviceTxBlockAck handleTxBlockAckFrame output outputGated outputInGate tick service drainTxStatus notifyAvailabilityWindowStart notifyAvailabilityWindowEnd publishRocDiagnostics publishCacheDiagnostics updateNeighbors publishScheduler liveGrantServesNext serviceClockReacquisition mdnsReplyUsesQueryChannel updateVht80Channels serviceInGate receive",
     "native_controls": "setAWDL_SYNC_STATE setAWDL_SYNC_PARAMS setAWDL_PRESENCE_MODE setAWDL_MASTER_CHANNEL setAWDL_SECONDARY_MASTER_CHANNEL setAWDL_SYNCHRONIZATION_CHANNEL_SEQUENCE setAWDL_SYNC_FRAME_TEMPLATE getAWDL_AF_SECONDARY_PAYLOAD_CAPABILITIES getPEER_CACHE_MAXIMUM_SIZE getAWDL_DEVICE_CAPABILITIES setAWDL_OOB_REQUEST oobRequestGated setOobRequestInGate setAWDL_ELECTION_PARAMS setAWDL_AWDL_ADVERTISERS setAWDL_SYNC_ENABLED getAWDL_SYNC_ENABLED setAWDL_CONFIG remapInfraSlot applySequence updatePresence updateIdleCap idleCapAllows channelReachable planOnlyChannel setAWDL_PEER_TRAFFIC_REGISTRATION peerTrafficGated setPeerTrafficInGate",
 }
 OWNER_NAMES = "recordAwdlCreation requestAwdlCreation createAwdlGated createVirtualInterface enableVirtualInterface disableVirtualInterface createAwdlInterfaceRequest createAwdlInterface stopAwdlInterface".split()
@@ -448,7 +448,7 @@ HAL_AFTER_ABI = r'''
  } storage;
  Com *com=&storage;
  IC &ic=storage.sc_ic;
- bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false;
+ bool on=false,thirdChannel=false,homeChannel8=false,allow11=false,dense=false,onlyInfra=true;
  // Firmware startup has a ready infrastructure link. NativeFixture later
  // removes this modeled link after the actual first-sync readiness check.
  uint8_t infraChannel=6,requested=0,preparedChannel=0;
@@ -467,10 +467,12 @@ HAL_AFTER_ABI = r'''
  bool awdlChannelAllowed(unsigned c) { return fault.social&&(c==6||c==44||(thirdChannel&&c==149)||(homeChannel8&&c==8)||(allow11&&c==11)); }
  uint8_t awdlInfraChannel() { return infraChannel; }
  unsigned awdlPeerCapacity() const { return 3; }
- uint8_t awdlOnlyChannel() { return infraChannel; }
- bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!infraChannel||infraChannel==c); }
+ uint8_t awdlOnlyChannel() { return onlyInfra ? infraChannel : 0; }
+ bool awdlChannelReachable(unsigned c) { return awdlChannelAllowed(c)&&(!awdlOnlyChannel()||infraChannel==c); }
  void awdlInfraSleep(unsigned) { ++sleeps; }
  void awdlInfraWakeIfIdle() { ++wakes; }
+ void awdlNotePeer() {}
+ uint8_t awdlVht80Channels(const uint8_t*,uint8_t channels) { return channels; }
  bool awdlDensePresenceAllowed(uint8_t) { return dense; }
  bool awdlIsEnabled() { return on; }
  bool awdlGrantSnapshot(mtkawdl::Reservation &out) { out=grant; return on; }
@@ -524,8 +526,10 @@ struct IOSkywalkPacketBufferPool:OSObject {
  unsigned id; std::function<void()> onAllocate,onDeallocate;
  IOSkywalkPacketBufferPool():id(++fault.factory) { ++poolsLive; }
  ~IOSkywalkPacketBufferPool() override { --poolsLive; mark("pool-release-"+std::to_string(id)); }
- static IOSkywalkPacketBufferPool *withName(const char *,OSObject *,unsigned,const PoolOptions *options) {
-  gatedBoundary(); assert(options->packets==256&&options->buffers==256&&options->size==2048&&options->maxBuffers==1);
+ static IOSkywalkPacketBufferPool *withName(const char *name,OSObject *,unsigned,const PoolOptions *options) {
+  gatedBoundary();
+  const unsigned expected = name && strstr(name,"TX") ? 2048u : 256u;
+  assert(options->packets==expected&&options->buffers==expected&&options->size==2048&&options->maxBuffers==1);
   if(fault.factory+1==fault.failFactory){++fault.factory; return nullptr;}
   return new IOSkywalkPacketBufferPool;
  }
@@ -1040,7 +1044,74 @@ void checkOrigins() {
   origin->onAllocate=[&]{origin->onAllocate=nullptr;d.releaseDataPath();assert(d.createDataPath());d.enableDatapath();};
   gate.enter([&]{assert(!d.inputNativeView(view));return 0;});assert(rxReclaimed==reclaimed+1&&d.rxPool!=origin&&origin->refs==1);origin->release();
  }noResources();
- puts("PASS origins: production generation/programming fail-closed exhaustion and before/after invalidation; full native traffic handoff; detached metadata and original batch/pool/queue cleanup under recursion/replacement; allocation-origin retains and cancellation.");
+ resetFaults(); {
+  NativeFixture d; d.radio.infraChannel=149; d.radio.thirdChannel=true; d.radio.onlyInfra=false;
+  d.hostSequenceValid=true; d.hostSequence.count=16;
+  d.hostSequence.channels[0]=149; d.hostSequence.channels[2]=6;
+  const uint64_t now=clockUS.load();
+  uint8_t peer[6]={2,1,2,3,4,6};
+  uint8_t eth[54]={}; eth[12]=0x86; eth[13]=0xdd; eth[14]=0x60;
+  d.idleCapOffAt=now-100000;
+  gate.enter([&]{
+   d.updateIdleCap(now); assert(d.idleCapActive&&d.planOnlyChannel(now)==149);
+   // Multicast and unknown unicast do not lift the idle cap.
+   eth[0]=0x33; assert(d.output(d.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+   memcpy(eth,peer,6); assert(d.output(d.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+   d.updateIdleCap(now); assert(d.idleCapActive&&!d.idleCapPeerTxAt);
+   assert(d.observeDataPeer(peer,now)>=0);
+   assert(d.output(d.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+   d.updateIdleCap(now); assert(!d.idleCapActive&&d.planOnlyChannel(now)==0&&d.channelReachable(6));
+   d.radio.onlyInfra=true; assert(d.planOnlyChannel(now)==149&&!d.channelReachable(6));
+   d.radio.onlyInfra=false;
+   const auto expiry=d.queueDeadline[(d.queueHead+d.queueCount-1)%d.kDataQueueSize];
+   assert(expiry>now+d.kIdleCapPeerTxGraceUS);
+   assert(d.cacheDataPeer(peer,true,now));
+   d.updateIdleCap(now+d.kIdleCapPeerTxGraceUS);
+   assert(!d.idleCapActive && d.channelReachable(6));
+   d.updateIdleCap(expiry); assert(d.idleCapActive);
+   // Outgoing mDNS query lifts the idle cap for discovery; non-mDNS multicast above did not.
+   uint8_t mdnsQuery[74]={0x33,0x33,0,0,0,0xfb,2,1,2,3,4,5};
+   mdnsQuery[12]=0x86; mdnsQuery[13]=0xdd; mdnsQuery[14]=0x60; mdnsQuery[19]=20; mdnsQuery[20]=17;
+   mdnsQuery[38]=0xff; mdnsQuery[39]=2; mdnsQuery[53]=0xfb;
+   mdnsQuery[54]=mdnsQuery[56]=0x14; mdnsQuery[55]=mdnsQuery[57]=0xe9; mdnsQuery[59]=20;
+   clockUS=expiry;
+   assert(d.output(d.makeFrame(mdnsQuery,sizeof(mdnsQuery)))==kIOReturnOutputSuccess);
+   d.updateIdleCap(expiry); assert(!d.idleCapActive);
+   clockUS=now;
+   // AirDrop data peer negotiates VHT80 even without native traffic registration,
+   // then returns to 20 MHz once idle for 5 s.
+   d.nativePeerSamples[0]={}; d.nativePeerSamples[0].valid=true;
+   d.nativePeerSamples[0].received=now; d.nativePeerSamples[0].wideChannels=0x10;
+   memcpy(d.nativePeerSamples[0].peer,peer,6);
+   assert(!d.trafficActive && d.updateVht80Channels(now)==0x10);
+   assert(d.updateVht80Channels(now+5000000)==0);
+   // Dead off-channel ROC tail is aborted on an idle slot so the AP wakes immediately.
+   d.radio.infraChannel=9; d.radio.onlyInfra=false; d.idleCapActive=false;
+   mtkawdl::Sequence seq9{{6,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0},16,3};
+   d.hostSequence=seq9; d.hostSequenceValid=true;
+   assert(d.state.setSequence(seq9,now));
+   mtkawdl::Window w0{}; assert(mtkawdl::currentWindow(d.state,now,w0) && w0.channel==6);
+   d.requestedWindow=w0; d.requestedChannel=6;
+   clockUS=w0.start; d.radio.give(1,6,215);
+   clockUS=w0.end+1000; unsigned abortsBefore=d.radio.aborts, wakesBefore=d.radio.wakes;
+   d.serviceInGate();
+   assert(d.radio.aborts==abortsBefore+1 && d.radio.wakes>wakesBefore && !d.radio.grant.granted);
+   // A coalesced off-channel grant covering a following window on the same channel is kept.
+   const uint64_t t2=clockUS.load();
+   mtkawdl::Sequence seqCoal{{149,0,149,0,0,0,0,0,6,0,149,0,0,0,0,0},16,3};
+   d.hostSequence=seqCoal; d.state.baseCounter=0; d.state.epoch=t2;
+   assert(d.state.setSequence(seqCoal,t2));
+   mtkawdl::Window wCoal{}; assert(mtkawdl::currentWindow(d.state,t2,wCoal) && wCoal.channel==149);
+   d.requestedWindow=wCoal; d.requestedChannel=149;
+   clockUS=wCoal.start; d.radio.give(2,149,250);
+   clockUS=wCoal.end+1000; abortsBefore=d.radio.aborts;
+   d.serviceInGate();
+   assert(d.radio.aborts==abortsBefore && d.radio.grant.granted);
+   clockUS=now;
+   d.resetDataPeers(); assert(!d.idleCapPeerTxAt && !d.lastDataPeerAt); return 0;
+  });
+ }noResources();
+ puts("PASS origins: generation/programming invalidation, native traffic handoff, allocation-origin cleanup and sparse unicast discovery admission.");
 }
 void checkModulePoll() {
  resetFaults(); {
@@ -1303,12 +1374,25 @@ void checkIssue10() {
   assert(d.mdnsReplyUsesQueryChannel(reply,queued,queued));
   assert(!d.mdnsReplyUsesQueryChannel(reply,now-1,queued));
   assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued+1100001));
+  d.radio.infraChannel=44;
+  assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued)); // Hard AP-only policy.
+  d.radio.onlyInfra=false;
+  mtkawdl::Sequence homeOnly{{44,0,0,0},4,0};
+  assert(d.state.setSequence(homeOnly,now));
+  assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued)); // No slot on the query channel.
+  assert(d.state.setSequence(seq,now));
+  d.hostSequence={{44,0,6},16,0}; d.hostSequenceValid=true;
+  d.idleCapOffAt=now;
+  d.updateIdleCap(now); assert(d.idleCapActive&&!d.idleCapAllows(6,now));
+  assert(d.output(d.makeFrame(eth,sizeof(eth)))==kIOReturnOutputSuccess);
+  d.updateIdleCap(now); assert(!d.idleCapActive && d.idleCapAllows(6,now));
+  d.updateIdleCap(now+d.kIdleCapPeerTxGraceUS); assert(d.idleCapActive);
   d.resetDataPeers();
   assert(!d.mdnsReplyUsesQueryChannel(reply,queued,queued));
   mbuf_freem(reply);
   return 0;
  });
- puts("PASS issue #10: same-channel coverage, short/served grants, admitted mDNS query and bounded reply override");
+ puts("PASS issue #10: same-channel coverage, short/served grants, and bounded mDNS reply admission with ordinary fallback");
 }
 int main(int argc,char **argv) {
  assert(argc==2);assert(mwx_awdl_native_history_init());

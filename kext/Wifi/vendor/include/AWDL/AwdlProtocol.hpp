@@ -26,6 +26,8 @@ bool mtk_awdl_valid_action_envelope(const uint8_t *f, size_t n);
 bool mtk_awdl_is_mdns(const uint8_t *payload, size_t n, bool response);
 bool mtk_awdl_reacquire_native_clock(mtkawdl::State *s, uint64_t now);
 bool mtk_awdl_parse_action(const uint8_t *f, size_t n, mtkawdl::Advertisement *out);
+uint8_t mtk_awdl_peer_vht80_channels(const uint8_t *f, size_t n);
+size_t mtk_awdl_advertise_vht80(uint8_t *f, size_t capacity, size_t n, const mtkawdl::Sequence *s, uint8_t wide);
 uint8_t mtk_awdl_peer_channel(const mtkawdl::Peer *p, uint64_t now);
 void mtk_awdl_data_peers_reset(mtkawdl::DataPeers *d);
 bool mtk_awdl_data_peers_probe(const mtkawdl::DataPeers *d, size_t index, size_t stream, uint16_t seq, uint64_t now);
@@ -328,7 +330,7 @@ struct Reservation {
 // Unified ROC event: four-byte header followed by bounded TLVs. MT7921's
 // grant tag is zero and its complete structure is 20 bytes (mt7921.h).
 struct RocGrant {
-    uint8_t bss, token, status, channel, requestType;
+    uint8_t bss, token, status, channel, requestType, bandwidth, centerChannel;
     uint32_t durationMs;
 };
 inline RocResult decodeRocGrant(const uint8_t *p,size_t n,RocGrant &out) { return mtk_awdl_decode_roc_grant(p,n,&out); }

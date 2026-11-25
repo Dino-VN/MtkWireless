@@ -384,6 +384,8 @@ private:
     uint64_t idleCapGapUS = 0; bool idleCapActive = false;
     uint64_t idleCapActiveSince = 0, idleCapActiveUS = 0, idleCapTransitions = 0;
     uint64_t idleCapOffAt = 0, idleCapVisits = 0, idleCapBlocked = 0;
+    uint64_t idleCapPeerTxAt = 0;
+    static constexpr uint64_t kIdleCapPeerTxGraceUS = 3500000;
     uint8_t idleCapOffChannel = 0, idleCapOffToken = 0, idleCapBlockedChannel = 0;
     uint64_t idleCapBlockedWindow = 0;
     void updateIdleCap(uint64_t now);
@@ -402,7 +404,7 @@ private:
     // session (amtk_awdl_txba=0 off) so the firmware aggregates.
     struct TxBaPeer {
         uint8_t mac[6]; uint16_t seq; uint8_t state; uint8_t token; uint8_t failures;
-        uint16_t ssn; uint64_t requestAt, retryAt, lastData;
+        uint16_t ssn; uint16_t txSeq; bool amsdu; uint64_t requestAt, retryAt, lastData;
     } txBa[4] = {};
     enum : uint8_t { txBaIdle=0, txBaRequested=1, txBaActive=2 };
     uint64_t txBaRequests = 0, txBaAccepted = 0, txBaRejected = 0, txBaTimeouts = 0;
@@ -418,9 +420,10 @@ private:
     mtkawdl::Window requestedWindow={};
     struct NativePeerSample {
         mtkawdl::Advertisement advertisement;
-        uint8_t peer[6]; uint64_t received; bool valid;
+        uint8_t peer[6], wideChannels; uint64_t received; bool valid;
     } nativePeerSamples[16]={};
     unsigned nativePeerSampleNext=0;
+    uint8_t updateVht80Channels(uint64_t now);
     uint64_t advertisersRequests=0, advertisersApplied=0, advertisersRejected=0;
     uint64_t advertisersGeneration=0, advertisersAppliedGeneration=0;
     mtkawdl::AdvertiserRecord advertisersRecord={};
@@ -451,9 +454,10 @@ private:
     IOReturn setPeerTrafficInGate(apple80211_awdl_peer_traffic_registration*);
     uint8_t requestedChannel = 0, grantedChannel = 0; uint64_t nextAction = 0, requestDeadline = 0;
     uint8_t syncTemplate[2048]; size_t templateLength = 0;
-    // 64 frames is ~15 ms at 54 Mbps; an off-channel AWDL slot lasts
-    // ~220 ms, so a full-rate sender overflowed it once per period.
-    static constexpr unsigned kDataQueueSize = 256;
+    // 256 frames overflowed during QUIC slow-start bursts (644 pkts in 5.4 ms
+    // on 2026-11-25, causing 1,013 silent Skywalk drops). 1024 absorbs full
+    // bursts while keeping per-interface heap footprint modest (~24 KB).
+    static constexpr unsigned kDataQueueSize = 1024;
     mbuf_t queue[kDataQueueSize] = {};
     uint64_t queueTime[kDataQueueSize], queueDeadline[kDataQueueSize];
     unsigned queueHead = 0, queueCount = 0;
@@ -467,6 +471,7 @@ private:
     apple80211_awdl_min_rate minRate;
     apple80211_awdl_sync_channel_sequence channelSequence;
     uint8_t trafficPeer[6] = {}, installedTrafficPeer[6] = {}; bool trafficActive = false, trafficPeerInstalled = false;
+    uint8_t lastDataPeer[6] = {}; uint64_t lastDataPeerAt = 0;
 };
 #endif
 #endif

@@ -226,7 +226,7 @@ def generate(ex):
         wire += ex.structure(REG, name)
     wire += ex.structure(L.HAL, "mwx_node")+ex.structure(L.HAL, "mwx_vif")
     text = one(text, "struct MtkMwx:IOService {", wire+"\nstruct MtkMwx:IOService {")
-    text = one(text, "  struct { uint64_t Attempt=0; } ic_join_diag;", "  void *ic_softc=nullptr;\n  struct { uint64_t Attempt=0,RequestedState=0,AuthRequestedAtUS=0,AssocRequestedAtUS=0,RunRequestedAtUS=0; bool Active=false; } ic_join_diag;")
+    text = one(text, "  struct { uint64_t Attempt=0; } ic_join_diag;", "  void *ic_softc=nullptr;\n  uint64_t ic_awdl_data_at=0;\n  struct { uint64_t Attempt=0,RequestedState=0,AuthRequestedAtUS=0,AssocRequestedAtUS=0,RunRequestedAtUS=0; bool Active=false; } ic_join_diag;")
     text = one(text, "  struct Node { uint8_t ni_bssid[6]={2,9,9,9,9,9}; bool ni_port_valid=true; } modelBss; Node *ic_bss=&modelBss;",
                "  using Node=ieee80211_node; Node modelBss; Node *ic_bss=&modelBss;")
     text = one(text, "  uint32_t sc_awdl_epoch=0; AwdlRocTiming sc_awdl_roc_timing{};", r'''
@@ -239,8 +239,11 @@ def generate(ex):
   bool sc_awdl_peer_used[3]{},sc_awdl_station_pending[4]{};
   TraceBoundary *sc_awdl_tx_trace=nullptr;
   struct { bool ofdmOnly=false; uint8_t phy=0; bool band2g=false,wide=false; } sc_awdl_tx_status;
-  bool sc_awdl_roc_wide=false,sc_awdl_wide_off=false;
-  uint64_t sc_awdl_wide_grants_session=0,sc_awdl_rx_wide=0;
+  uint8_t sc_awdl_roc_center80=0,sc_awdl_peer_wide_channels=0;
+  bool sc_awdl_wide_off=false;
+  bool sc_awdl_ra_off=false;
+  uint16_t sc_awdl_ra_last_rate=0;
+  uint64_t sc_awdl_rx_wide=0,sc_awdl_peer_seen_at=0;
   bool sc_awdl_roc_infra_wide=false,sc_awdl_infra_wide_off=false;
   uint64_t sc_awdl_infra_wide_rejects=0,sc_awdl_infra_wide_grants_session=0;
   taskq modelQueue; taskq *sc_nswq=&modelQueue; task sc_newstate_task,sc_scan_task; int sc_ns_arg=0;

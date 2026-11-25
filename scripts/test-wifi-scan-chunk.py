@@ -94,15 +94,17 @@ struct task { int queued=0; };
 struct taskq {};
 void task_add(taskq*,task*t){++t->queued;}
 int splnet(){return 0;} void splx(int){}
-uint64_t nowUS=10000000;
+uint64_t nowUS=30000000;
 uint64_t mtk_join_now(){return nowUS;}
+namespace mtkawdl { constexpr uint64_t peerLifetimeUs=3000000; }
 int timeout_add_sec(int*t,int s){*t=s*1000;return 0;}
 int timeout_add_msec(int*t,int ms){*t=ms;return 0;}
 int timeout_del(int*t){*t=0;return 0;}
+bool useBootGap=false;
 uint32_t bootChunk=4, bootGap=250;
 bool PE_parse_boot_argn(const char*name,void*out,int){
     if(!strcmp(name,"amtk_scan_chunk")){memcpy(out,&bootChunk,4);return true;}
-    if(!strcmp(name,"amtk_scan_gap")){memcpy(out,&bootGap,4);return true;}
+    if(!strcmp(name,"amtk_scan_gap") && useBootGap){memcpy(out,&bootGap,4);return true;}
     return false;
 }
 struct mwx_softc {
@@ -112,6 +114,7 @@ struct mwx_softc {
     unsigned sc_flags=0, sc_scan_join_attempt=0; uint8_t sc_scan_seq_num=0;
     uint32_t sc_bgscan_dwell=MWX_BGSCAN_DWELL_AUTO;
     uint64_t sc_awdl_scan_preempted=0;
+    uint64_t sc_awdl_peer_seen_at=0;
     uint32_t sc_scan_done_count=0, sc_scan_last_ieee80211_nodes=0;
     uint32_t sc_rx_pkt_normal=0, sc_rx_fill_fail=0;
     int sc_scan_to=0, sc_scan_chunk_to=0;
@@ -173,15 +176,34 @@ int main(){
     assert(sc.sc_scan_task.queued==1 && !sc.sc_scan_chunk_to && !sc.sc_scan_chunked);
     reset(sc);
 
-    // AWDL on but idle (no data for 3 s): still one whole scan.
-    sc.sc_awdl_enabled=true; sc.sc_ic.ic_awdl_data_at=nowUS-3000000;
+    // An unrequested unassociated scan with idle AWDL still covers all channels.
+    sc.sc_awdl_enabled=true; sc.sc_ic.ic_awdl_data_at=nowUS-15000000;
+    sc.sc_ic.ic_wcl_scan_requested=false;
     assert(mt7921_mcu_hw_scan(&sc,0)==0 && channels(sent.back()).size()==15);
     done(sc); assert(sc.sc_scan_task.queued==1 && !sc.sc_scan_chunk_to);
     reset(sc);
-    sc.sc_ic.ic_awdl_data_at=nowUS-100000;
 
-    // AWDL data flowing: 4 + 4 + 4 + 3 channels, the radio released between chunks,
-    // the logical scan ended once, after the last chunk.
+    // Before a session has exchanged data, one recent peer still protects
+    // discovery, even while the Mac is searching for an AP.
+    sc.sc_ic.ic_awdl_data_at=0;
+    sc.sc_awdl_peer_seen_at=nowUS-100000;
+    assert(mt7921_mcu_hw_scan(&sc,0)==0 && channels(sent.back()).size()==4);
+    done(sc); assert(sc.sc_scan_chunk_to==400);
+    sc.sc_awdl_peer_seen_at=nowUS-mtkawdl::peerLifetimeUs;
+    assert(mt7921_mcu_hw_scan(&sc,0)==0 && channels(sent.back()).size()==15);
+    done(sc); assert(!sc.sc_scan_chunk_to);
+    reset(sc);
+    // WCL discovery still gets all channels, in chunks, before a peer arrives.
+    // A queued join does not turn this separate scan into a join scan.
+    sc.sc_ic.ic_wcl_scan_requested=true; sc.sc_ic.ic_wcl_join_requested=true;
+    assert(mt7921_mcu_hw_scan(&sc,0)==0 && channels(sent.back()).size()==4);
+    done(sc); assert(sc.sc_scan_chunk_to==400);
+    sc.sc_ic.ic_wcl_join_requested=false;
+    reset(sc);
+    sc.sc_ic.ic_awdl_data_at=nowUS-9000000;
+
+    // A quiet AWDL handshake still needs radio access: 4 + 4 + 4 + 3 channels,
+    // with a gap between chunks and one logical completion.
     sc.sc_awdl_enabled=true;
     assert(mt7921_mcu_hw_scan(&sc,0)==0 && aborts==1);
     std::vector<unsigned> all;
@@ -193,12 +215,13 @@ int main(){
         assert(sc.sc_flags & MWX_FLAG_SCANNING);
         done(sc);
         assert(!(sc.sc_flags & MWX_FLAG_SCANNING));
-        if(i<3){ assert(sc.sc_scan_chunk_to==250 && !sc.sc_scan_task.queued); gap(sc); }
+        if(i<3){ assert(sc.sc_scan_chunk_to==400 && !sc.sc_scan_task.queued); gap(sc); }
     }
     assert(sc.sc_scan_task.queued==1 && !sc.sc_scan_chunk_next && sent.size()==4 && aborts==4);
     assert((all==std::vector<unsigned>{1,2,3,4,5,6,7,8,9,10,11,36,40,44,48}));
-    assert(sc.sc_scan_chunked==1 && sc.sc_scan_chunks==4);
+    assert(sc.sc_scan_chunked==3 && sc.sc_scan_chunks==6);
     reset(sc);
+    sc.sc_ic.ic_awdl_data_at=nowUS-100000;
 
     // A fresh scan during the gap supersedes the pending chunk.
     assert(mt7921_mcu_hw_scan(&sc,0)==0); done(sc);

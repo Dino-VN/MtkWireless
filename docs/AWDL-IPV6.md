@@ -54,10 +54,14 @@ in the controller gate.
 - **Peer neighbours.** `RTF_HOST|RTF_STATIC` (the kernel adds `RTF_LLINFO`),
   with an `AF_LINK` gateway set to the peer MAC, as `ndp -s` sets them. An
   existing entry (EEXIST) is deleted and added once, as `ndp.c set()` does.
-- **Removal.** Entries go when native removes the peer from its cache (and
-  are not re-added for 10 s unless native caches the peer again), 30 s after
-  the peer was last live, when AWDL goes down (no update for 5 s), and on
-  `stop()`. The driver deletes only entries its own `RTM_ADD` created.
+- **Removal.** Entries go 30 s after the peer was last live, when AWDL goes
+  down (no update for 5 s), and on `stop()`. Native peer-cache removal
+  (`PEER_CACHE_CONTROL op=2`) no longer deletes or suppresses the neighbour
+  immediately: on 2026-11-25 hardware (`diagnostics/airdrop-benchmark-gpkoe571`),
+  macOS issued `op=2` 0.5 s after `UPLOAD START`, and deleting the route caused
+  `EHOSTUNREACH` and permanently closed QUIC's `awdl0` path
+  (`validated -> unavailable`). The driver deletes only entries its own
+  `RTM_ADD` created.
 - **Refresh.** Every 15th pass (about 30 s) re-adds owned entries, in case
   something deleted them.
 - **Re-attach.** The awdl0 index is resolved by name on every pass. Entries
@@ -103,9 +107,10 @@ The driver enables these changes on startup without extra boot arguments.
   `MTKAWDLClockRejectStreak`, `MTKAWDLClockReacquires` and
   `MTKAWDLClockReacquireFailed`.
 - Prefer the receive channel for a multicast IPv6 mDNS reply queued within
-  350 ms of an admitted peer's query. The ordinary multicast schedule
-  resumes when the override expires after 1.1 s or the peer is no longer
-  live. This applies to existing granted windows. See
+  350 ms of an admitted peer's query. A qualifying reply pauses the idle cap
+  so the scheduler can take that channel's next window. Hard channel limits
+  still apply. Use ordinary multicast scheduling if the channel is unavailable,
+  the peer is no longer live, or the override expires after 1.1 s. See
   `MTKAWDLMdnsQueriesObserved` and `MTKAWDLMdnsRepliesOnQueryChannel`.
 - Allow an AW start up to 9 TU (9216 µs) after its scheduled edge. Native AW
   duration and grant coverage still use the 10 TU tolerance.

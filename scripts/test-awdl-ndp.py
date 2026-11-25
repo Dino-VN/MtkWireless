@@ -296,18 +296,21 @@ int main() {
         assert(table.size() == 1 && table[routeKey(11)] == std::vector<uint8_t>(6, 9));
         done(n);
     }
-    // 5. Native cache removal deletes at once and holds re-adds for 10 s;
-    //    a non-live peer is kept for 30 s.
+    // 5. Native peer-cache removal (cached: true -> false) keeps a live peer's
+    //    neighbour entry intact (preventing mid-transfer QUIC EHOSTUNREACH),
+    //    and a non-live peer is kept for the 30 s grace window before removal.
     {
         auto *n = fresh();
         tick(*n, {P(peerA, true), P(peerB, false)});
         assert(table.count(peerKey(peerA, 11)) && table.count(peerKey(peerB, 11)));
         advance(1); tick(*n, {P(peerA, false), P(peerB, false)});
-        assert(!table.count(peerKey(peerA, 11)) && table.count(peerKey(peerB, 11)));
-        run(*n, 8, {P(peerA, false), P(peerB, false)});
-        assert(!table.count(peerKey(peerA, 11)));
-        run(*n, 3, {P(peerA, false), P(peerB, false)});
-        assert(table.count(peerKey(peerA, 11)));   // hold over, live peer back
+        assert(table.count(peerKey(peerA, 11)) && table.count(peerKey(peerB, 11)));
+        // Peer A drops out of dataPeers briefly (cache wipe before next RX),
+        // then returns: route must stay installed throughout.
+        run(*n, 5, {P(peerB, false)});
+        assert(table.count(peerKey(peerA, 11)) && table.count(peerKey(peerB, 11)));
+        run(*n, 2, {P(peerA, false), P(peerB, false)});
+        assert(table.count(peerKey(peerA, 11)) && table.count(peerKey(peerB, 11)));
         run(*n, 29, {P(peerA, false)});
         assert(table.count(peerKey(peerB, 11)));   // within the 30 s grace
         run(*n, 3, {P(peerA, false)});

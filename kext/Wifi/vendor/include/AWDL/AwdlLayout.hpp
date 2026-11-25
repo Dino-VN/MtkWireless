@@ -72,7 +72,7 @@ static const size_t kLayout[] = {
     MTK_AWDL_AT(Reservation, responseDelayUS),
     MTK_AWDL_TYPE(RocGrant), MTK_AWDL_AT(RocGrant, bss), MTK_AWDL_AT(RocGrant, token),
     MTK_AWDL_AT(RocGrant, status), MTK_AWDL_AT(RocGrant, channel), MTK_AWDL_AT(RocGrant, requestType),
-    MTK_AWDL_AT(RocGrant, durationMs),
+    MTK_AWDL_AT(RocGrant, bandwidth), MTK_AWDL_AT(RocGrant, centerChannel), MTK_AWDL_AT(RocGrant, durationMs),
     MTK_AWDL_TYPE(DataView), MTK_AWDL_AT(DataView, destination), MTK_AWDL_AT(DataView, source),
     MTK_AWDL_AT(DataView, payload), MTK_AWDL_AT(DataView, length), MTK_AWDL_AT(DataView, sequence),
     MTK_AWDL_TYPE(Window), MTK_AWDL_AT(Window, start), MTK_AWDL_AT(Window, end), MTK_AWDL_AT(Window, counter),
