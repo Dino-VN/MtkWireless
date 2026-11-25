@@ -61,6 +61,7 @@ public:
     // or its reverse (false). Call with the interface already stopped.
     IOReturn systemPower(bool suspend);
     void systemPowerStats(uint32_t out[9]);
+    void publishHealthDiagnostics();
 
     // Called on the driver's main workloop. RX callback borrows the frame;
     // awdlTransmit always consumes its mbuf, including on error.

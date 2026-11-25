@@ -116,7 +116,8 @@ struct mwx_softc {
     uint64_t sc_awdl_scan_preempted=0;
     uint64_t sc_awdl_peer_seen_at=0;
     uint32_t sc_scan_done_count=0, sc_scan_last_ieee80211_nodes=0;
-    uint32_t sc_rx_pkt_normal=0, sc_rx_fill_fail=0;
+    uint32_t sc_rx_pkt_normal=0, sc_rx_pkt_normal_mcu=0, sc_rx_fill_fail=0;
+    uint32_t sc_scan_start_rx=0;
     int sc_scan_to=0, sc_scan_chunk_to=0;
     taskq queue; taskq*sc_nswq=&queue;
     task sc_scan_task, sc_scan_chunk_task;
@@ -139,6 +140,7 @@ int mwx_mcu_send_mbuf(mwx_softc*,int cmd,mbuf*m,void*){
 }
 int mwx_mcu_send_msg(mwx_softc*,int cmd,void*,size_t,void*){assert(cmd==MCU_CE_CMD_CANCEL_HW_SCAN);return 0;}
 int mt7921_mcu_hw_scan_cancel(mwx_softc*);
+static bool mwx_scan_check_rx_deaf(mwx_softc*,uint32_t,uint32_t,uint32_t,uint32_t){return false;}
 void mwx_scan_chunk_timeo(void*);
 void mwx_scan_chunk_task(void*);
 ''' + functions + r'''

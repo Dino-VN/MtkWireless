@@ -727,6 +727,16 @@ struct mwx_softc {
 	uint32_t		sc_rx_data_cnt;
 	uint32_t		sc_dma_stalls;
 	uint32_t		sc_full_resets;
+	uint32_t		sc_fullreset_last_reason;
+	uint64_t		sc_fullreset_last_at_us;
+	uint32_t		sc_ser_events;
+	uint32_t		sc_rx_irq_rescues;
+	uint32_t		sc_rx_deaf_resets;
+	uint32_t		sc_rx_deaf_scans;
+	uint32_t		sc_rx_deaf_channels;
+	uint32_t		sc_rx_deaf_mdrdy;
+	uint32_t		sc_rx_deaf_baseline;
+	uint32_t		sc_scan_start_rx;
 	uint32_t		sc_mcu_cmd_irqs;
 	uint32_t		sc_last_mcu_cmd;
 	int			sc_dma_stall_logged;
@@ -1095,8 +1105,19 @@ void		mwx_end_scan_task(void *);
 void		mwx_scan_timeo(void *);
 void		mwx_scan_chunk_timeo(void *);
 void		mwx_scan_chunk_task(void *);
+enum {
+	MWX_FULLRESET_NONE = 0,
+	MWX_FULLRESET_DMA_DISABLED = 1,
+	MWX_FULLRESET_SER = 2,
+	MWX_FULLRESET_DEAF_RX = 3,
+};
+
 void		mwx_dma_timeo(void *);
 void		mwx_fullreset_task(void *);
+static bool	mwx_request_fullreset(struct mwx_softc *, const char *, uint32_t);
+static void	mwx_scan_reset_rx_deaf(struct mwx_softc *);
+static bool	mwx_scan_check_rx_deaf(struct mwx_softc *, uint32_t, uint32_t,
+		    uint32_t, uint32_t);
 void		mwx_edca_task(void *);
 void		mwx_update_edca(struct ieee80211com *);
 void		mwx_dump_dma_state(struct mwx_softc *, const char *);
@@ -1443,6 +1464,7 @@ mwx_init_running(struct ifnet *ifp)
 	ifq_clr_oactive(&ifp->if_snd);
 	MWX_DEV_LOG(sc, "init interface running flags=0x%x\n", ifp->if_flags);
 	sc->sc_dma_stall_logged = 0;
+	mwx_scan_reset_rx_deaf(sc);
 	timeout_add_sec(&sc->sc_dma_to, 2);
 
 	if (ic->ic_opmode == IEEE80211_M_MONITOR) {
@@ -1502,6 +1524,7 @@ mwx_stop(struct ifnet *ifp)
 	timeout_del(&sc->sc_reset_to);
 	timeout_del(&sc->sc_scan_to);
 	timeout_del(&sc->sc_dma_to);
+	mwx_scan_reset_rx_deaf(sc);
 
 	ifp->if_timer = 0;
 	ifp->if_flags &= ~IFF_RUNNING;
@@ -1509,9 +1532,22 @@ mwx_stop(struct ifnet *ifp)
 
 	if (was_running) {
 		struct mwx_node *mn;
+		/* MtkWireless: during an automatic WFDMA/SER full reset, skip
+		 * firmware teardown MCU commands if WFDMA is already stopped or
+		 * unreadable — those commands would only burn 3 s timeouts each
+		 * before WFSYS reset wipes firmware state anyway. */
+		uint32_t glo = sc->sc_resetting ? mwx_read(sc, MT_WFDMA0_GLO_CFG) :
+		    (MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+		bool fw_dma_up = glo != UINT32_MAX &&
+		    (glo & (MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN)) ==
+		    (MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
         if (sc->sc_awdl_configured) {
-            mwx_awdl_restore_filter(sc);
-            mwx_awdl_remove_context(sc,sc->sc_awdl_epoch);
+            if (fw_dma_up) {
+                mwx_awdl_restore_filter(sc);
+                mwx_awdl_remove_context(sc,sc->sc_awdl_epoch);
+            } else {
+                sc->sc_awdl_configured = false;
+            }
         }
         sc->sc_awdl_filter_active=false;
 
@@ -1519,21 +1555,25 @@ mwx_stop(struct ifnet *ifp)
 		sc->sc_bgscan_arg = NULL;
 		sc->sc_bgscan_arg_size = 0;
 		if (sc->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
-			mt7921_mcu_hw_scan_cancel(sc);
+			if (fw_dma_up) {
+				mt7921_mcu_hw_scan_cancel(sc);
+				/*
+				 * The cancel is asynchronous. Removing the vif while
+				 * the firmware is still leaving the scan channel makes
+				 * it coredump (power off while associated + bgscan).
+				 */
+				delay(200 * 1000);
+			}
 			sc->sc_flags &= ~(MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN);
-			/*
-			 * The cancel is asynchronous. Removing the vif while
-			 * the firmware is still leaving the scan channel makes
-			 * it coredump (power off while associated + bgscan).
-			 */
-			delay(200 * 1000);
 		}
-		mt7921_mac_sta_remove(sc);
+		if (fw_dma_up) {
+			mt7921_mac_sta_remove(sc);
 
-		mn = &sc->sc_vif.vif_mn;
-		mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);
-		mwx_mcu_set_deep_sleep(sc, 1);
-		mt7921_mcu_set_mac_enable(sc, 0, 0);
+			mn = &sc->sc_vif.vif_mn;
+			mt7921_mcu_uni_add_dev(sc, &sc->sc_vif, mn, 0);
+			mwx_mcu_set_deep_sleep(sc, 1);
+			mt7921_mcu_set_mac_enable(sc, 0, 0);
+		}
 	}
 
 	sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
@@ -1875,7 +1915,9 @@ mwx_newstate_task(void *ptr)
 			task_del(sc->sc_nswq, &sc->sc_setkey_task);
 			memset(sc->sc_setkey_arg, 0, sizeof(sc->sc_setkey_arg));
 			sc->sc_setkey_cur = sc->sc_setkey_tail = 0;
-			mwx_mcu_set_deep_sleep(sc, 1);
+			/* MtkWireless: keep deep sleep disabled while IFF_RUNNING.
+			 * Allowing deep sleep on RUN -> SCAN lets firmware drop
+			 * WFDMA context without mwx_dma_reinit_cond() running. */
 		}
 		break;
 	case IEEE80211_S_SCAN:
@@ -2672,6 +2714,11 @@ mwx_intr(void *arg)
 		mwx_write(sc, MT_MCU_CMD, intr_sw);
 		if (intr_sw & MT_MCU_CMD_ERROR_MASK)
 			mwx_dump_dma_state(sc, "firmware error");
+		if (intr_sw != UINT32_MAX &&
+		    (intr_sw & (MT_MCU_CMD_STOP_DMA | MT_MCU_CMD_STOP_DMA_FW_RELOAD))) {
+			sc->sc_ser_events++;
+			mwx_request_fullreset(sc, "firmware SER", MWX_FULLRESET_SER);
+		}
 		if (intr_sw & MT_MCU_CMD_WAKE_RX_PCIE)
 			intr |= MT_INT_RX_DONE_DATA;
 	}
@@ -2687,7 +2734,7 @@ mwx_intr(void *arg)
 		mwx_dma_rx_done(sc, &sc->sc_rxq);
 
 	intr = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
-	if (intr == UINT32_MAX || (intr & mask) == 0 || loops >= 8)
+	if (intr == UINT32_MAX || (intr & mask) == 0 || loops >= 32)
 		break;
 	}
 
@@ -2915,7 +2962,9 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	MWX_DEV_LOG(sc, "attach chip id=0x%04x hwrev=0x%02x interrupt=%s\n",
 	    hwid, hwrev, pci_intr_string(pa->pa_pc, ih));
 
-	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA,
+	    MT_MCU_CMD_WAKE_RX_PCIE | MT_MCU_CMD_STOP_DMA |
+	    MT_MCU_CMD_STOP_DMA_FW_RELOAD);
 	if (mwx_wfsys_reset(sc) != 0) {
 		MWX_DEV_LOG(sc, "attach WFSYS reset failed\n");
 		goto fail;
@@ -3092,8 +3141,11 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	 */
 	/* 1.0.48: 1.0.46 (80 MHz + 8000/8) and 1.0.47 (20 MHz + 8000/8) both froze,
 	 * so the common variable is the 8000/8 aggregate, not the bandwidth. Put
-	 * 80 MHz back with 2560/4 to test the bandwidth knob alone. NO_HE stays. */
-	sc->sc_knobs = MWX_KNOB_DATA_RA | MWX_KNOB_NO_HE;
+	 * 80 MHz back with 2560/4 to test the bandwidth knob alone. NO_HE stays.
+	 * MtkWireless: enable MWX_KNOB_AUTORESET by default so WFDMA stalls,
+	 * firmware SER, and deaf-RX hangs recover without a reboot; boot-arg
+	 * amtk_autoreset=0 disables it. */
+	sc->sc_knobs = MWX_KNOB_DATA_RA | MWX_KNOB_NO_HE | MWX_KNOB_AUTORESET;
 	/* A/B tests: boot-arg amtk_knobs=<MWX_KNOB_* bits> replaces the complete
 	 * default mask. Changes require a reboot, not a runtime user client. */
 	{
@@ -3102,6 +3154,13 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 			sc->sc_knobs = knobs;
 			if (knobs & MWX_KNOB_NO_TXBA)
 				sc->sc_ic.ic_caps &= ~IEEE80211_C_TX_AMPDU;
+		}
+		int autoreset = 1;
+		if (PE_parse_boot_argn("amtk_autoreset", &autoreset, sizeof(autoreset))) {
+			if (autoreset == 0)
+				sc->sc_knobs &= ~MWX_KNOB_AUTORESET;
+			else
+				sc->sc_knobs |= MWX_KNOB_AUTORESET;
 		}
 	}
 	sc->sc_bgscan_dwell = MWX_BGSCAN_DWELL_AUTO;
@@ -3301,7 +3360,9 @@ mwx_syspm_unquiesce_gated(OSObject *, void *arg, void *, void *, void *)
 
 	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0xff);
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, sc->sc_intr_mask);
-	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA,
+	    MT_MCU_CMD_WAKE_RX_PCIE | MT_MCU_CMD_STOP_DMA |
+	    MT_MCU_CMD_STOP_DMA_FW_RELOAD);
 	mwx_set(sc, MT_WFDMA0_GLO_CFG,
 	    MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
 	mwx_barrier(sc);
@@ -5310,7 +5371,9 @@ mwx_dma_enable(struct mwx_softc *sc)
 
 	/* enable interrupts for TX/RX rings */
 	mwx_write(sc, MT_WFDMA0_HOST_INT_ENA, sc->sc_intr_mask);
-	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
+	mwx_set(sc, MT_MCU2HOST_SW_INT_ENA,
+	    MT_MCU_CMD_WAKE_RX_PCIE | MT_MCU_CMD_STOP_DMA |
+	    MT_MCU_CMD_STOP_DMA_FW_RELOAD);
 	mwx_write(sc, MT_PCIE_MAC_INT_ENABLE, 0xff);
 }
 
@@ -6381,6 +6444,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 
 	sc->sc_flags |= MWX_FLAG_SCANNING;
 	ic->ic_wcl_scan_inflight = true;
+	sc->sc_scan_start_rx = sc->sc_rx_pkt_normal + sc->sc_rx_pkt_normal_mcu;
 	sc->sc_scan_seq_num = (sc->sc_scan_seq_num + 1) & 0x7f;
 
 	req->seq_num = sc->sc_scan_seq_num /* | sc->sc_band_idx << 7 */;
@@ -6705,37 +6769,113 @@ mwx_dump_dma_state(struct mwx_softc *sc, const char *why)
 	}
 }
 
+/* MtkWireless: schedule one rate-limited full hardware/firmware reset from
+ * the interrupt workloop gate (WFDMA disabled, firmware SER, or deaf RX). */
+static bool
+mwx_request_fullreset(struct mwx_softc *sc, const char *reason,
+    uint32_t reason_code)
+{
+	const uint64_t cooldown_us = 30000000ULL;
+	uint64_t now;
+
+	if ((sc->sc_knobs & MWX_KNOB_AUTORESET) == 0 || sc->sc_resetting ||
+	    sc->sc_detaching || sc->sc_sys_suspended || sc->sc_nswq == NULL ||
+	    (sc->sc_ic.ic_if.if_flags & IFF_RUNNING) == 0)
+		return false;
+	now = mtk_join_now();
+	if (sc->sc_fullreset_last_at_us != 0 && now >= sc->sc_fullreset_last_at_us &&
+	    now - sc->sc_fullreset_last_at_us < cooldown_us)
+		return false;
+	sc->sc_fullreset_last_reason = reason_code;
+	sc->sc_fullreset_last_at_us = now;
+	sc->sc_resetting = 1;
+	MWX_DEV_LOG(sc, "requesting full reset (%s, code=%u)\n",
+	    reason, reason_code);
+	task_add(sc->sc_nswq, &sc->sc_fullreset_task);
+	return true;
+}
+
+static bool
+mwx_dma_rx_pending(struct mwx_softc *sc, struct mwx_queue *q)
+{
+	uint32_t hw;
+
+	if (q->mq_count == 0 || q->mq_desc == NULL || q->mq_data == NULL)
+		return false;
+	if (!mtk_wlan_dma_hw_index(mwx_read(sc, q->mq_regbase + MT_DMA_DMA_IDX),
+	    q->mq_count, &hw))
+		return false;
+	return hw != (uint32_t)q->mq_cons;
+}
+
 void
 mwx_dma_timeo(void *arg)
 {
 	struct mwx_softc *sc = (struct mwx_softc *)arg;
 	struct ifnet *ifp = &sc->sc_ic.ic_if;
+	uint32_t glo, mcu_cmd;
+	const uint32_t dma_en =
+	    MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN;
 
 	if ((ifp->if_flags & IFF_RUNNING) == 0 || sc->sc_resetting ||
-	    sc->sc_detaching)
+	    sc->sc_detaching || sc->sc_sys_suspended)
 		return;
 
-	/* Timer callbacks share the interrupt workloop gate. Retry RX rings
-	 * under memory pressure even if a drained ring produces no more IRQs. */
-	mwx_queue_fill(sc, &sc->sc_rxq);
-	mwx_queue_fill(sc, &sc->sc_rxmcuq);
-	mwx_queue_fill(sc, &sc->sc_rxfwdlq);
-
-	if ((mwx_read(sc, MT_WFDMA0_GLO_CFG) & MT_WFDMA0_GLO_CFG_TX_DMA_EN) == 0 &&
-	    !sc->sc_dma_stall_logged) {
-		sc->sc_dma_stall_logged = 1;
-		sc->sc_dma_stalls++;
-		mwx_dump_dma_state(sc, "TX DMA disabled");
-		if (sc->sc_knobs & MWX_KNOB_AUTORESET) {
-			sc->sc_resetting = 1;
-			task_add(sc->sc_nswq, &sc->sc_fullreset_task);
+	glo = mwx_read(sc, MT_WFDMA0_GLO_CFG);
+	if (glo == UINT32_MAX) {
+		if (!sc->sc_dma_stall_logged) {
+			sc->sc_dma_stall_logged = 1;
+			sc->sc_dma_stalls++;
+			MWX_DEV_LOG(sc, "dma watchdog: GLO_CFG reads all ones\n");
+		}
+		timeout_add_sec(&sc->sc_dma_to, 2);
+		return;
+	}
+	if ((glo & dma_en) != dma_en) {
+		if (!sc->sc_dma_stall_logged) {
+			sc->sc_dma_stall_logged = 1;
+			sc->sc_dma_stalls++;
+			mwx_dump_dma_state(sc, "WFDMA disabled");
+		}
+		if (mwx_request_fullreset(sc, "WFDMA disabled",
+		    MWX_FULLRESET_DMA_DISABLED))
 			return;
+		timeout_add_sec(&sc->sc_dma_to, 2);
+		return;
+	}
+
+	mcu_cmd = mwx_read(sc, MT_MCU_CMD);
+	if (mcu_cmd != UINT32_MAX &&
+	    (mcu_cmd & (MT_MCU_CMD_STOP_DMA | MT_MCU_CMD_STOP_DMA_FW_RELOAD))) {
+		sc->sc_ser_events++;
+		sc->sc_last_mcu_cmd = mcu_cmd;
+		mwx_write(sc, MT_MCU_CMD, mcu_cmd);
+		mwx_dump_dma_state(sc, "firmware SER (poll)");
+		if (mwx_request_fullreset(sc, "firmware SER",
+		    MWX_FULLRESET_SER))
+			return;
+	}
+
+	/* Timer callbacks share the interrupt workloop gate. Drain any RX ring
+	 * that missed an edge-triggered MSI interrupt (preventing PSE RX FIFO
+	 * exhaustion) and retry partial refills under memory pressure. */
+	struct mwx_queue *rxqs[3] = { &sc->sc_rxq, &sc->sc_rxmcuq, &sc->sc_rxfwdlq };
+	for (int i = 0; i < 3; i++) {
+		if (mwx_dma_rx_pending(sc, rxqs[i])) {
+			sc->sc_rx_irq_rescues++;
+			mwx_dma_rx_done(sc, rxqs[i]);
+		} else {
+			mwx_queue_fill(sc, rxqs[i]);
 		}
 	}
+	if (sc->sc_txq.mq_cons != sc->sc_txq.mq_prod ||
+	    sc->sc_txmcuq.mq_cons != sc->sc_txmcuq.mq_prod)
+		mwx_dma_tx_done(sc);
+
 	timeout_add_sec(&sc->sc_dma_to, 2);
 }
 
-/* Reset WFSYS and reload firmware; the only way out of a WFDMA stop. */
+/* Reset WFSYS and reload firmware; the only way out of a WFDMA/LMAC stop. */
 void
 mwx_fullreset_task(void *arg)
 {
@@ -6744,18 +6884,28 @@ mwx_fullreset_task(void *arg)
 	int rv, s = splnet();
 
 	sc->sc_full_resets++;
-	MWX_DEV_LOG(sc, "full reset %u start\n", sc->sc_full_resets);
+	MWX_DEV_LOG(sc, "full reset %u start reason=%u\n",
+	    sc->sc_full_resets, sc->sc_fullreset_last_reason);
 	mwx_dump_dma_state(sc, "before reset");
 	sc->sc_resetting = 1;
+	mwx_scan_reset_rx_deaf(sc);
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
 	else
 		mwx_awdl_quiesce(sc);
+	/* Ensure driver owns the chip before WFSYS reset + firmware reload. */
+	if ((mwx_read(sc, MT_CONN_ON_LPCTL) & PCIE_LPCR_HOST_OWN_SYNC) != 0)
+		(void)mwx_mcu_drv_pmctrl(sc);
 	/* mwx_init_hardware performs the WFSYS/ring reset once, under the
 	 * interrupt gate. Do not reset live RX hardware here outside it. */
 	sc->sc_fw_restart = 1;
 	/* Channel/media setup from preinit stays valid; only redo hardware. */
 	rv = mwx_init_hardware(sc);
+	if (rv != 0 && !sc->sc_detaching) {
+		MWX_DEV_LOG(sc, "full reset hardware init retry after rv=%d\n", rv);
+		sc->sc_fw_restart = 1;
+		rv = mwx_init_hardware(sc);
+	}
 	MWX_DEV_LOG(sc, "full reset hardware init rv=%d\n", rv);
 	if(rv==0) {
         // Reloading firmware destroys every old station, including entries
@@ -6769,6 +6919,60 @@ mwx_fullreset_task(void *arg)
 		rv = mwx_init(ifp);
 	MWX_DEV_LOG(sc, "full reset done init rv=%d\n", rv);
 	splx(s);
+}
+
+static void
+mwx_scan_reset_rx_deaf(struct mwx_softc *sc)
+{
+	sc->sc_rx_deaf_scans = 0;
+	sc->sc_rx_deaf_channels = 0;
+	sc->sc_rx_deaf_mdrdy = 0;
+	sc->sc_rx_deaf_baseline = 0;
+}
+
+/*
+ * MtkWireless: MT7922 LMAC/RMAC/PSE can wedge its data RX path while the MCU
+ * and PHY keep running: scans complete every channel with hundreds of PHY
+ * MDRDY detections (mdrdy_sum > 0), yet firmware reports 0 beacons/probe
+ * responses and host RX (normal + normal_mcu) is frozen until WFSYS reset.
+ */
+static bool
+mwx_scan_check_rx_deaf(struct mwx_softc *sc, uint32_t complete_ch,
+    uint32_t beacon_scan, uint32_t probe_sum, uint32_t mdrdy_sum)
+{
+	uint32_t rx_now = sc->sc_rx_pkt_normal + sc->sc_rx_pkt_normal_mcu;
+
+	if (complete_ch == 0)
+		return false;
+	if (beacon_scan > 0 || probe_sum > 0 || rx_now != sc->sc_scan_start_rx) {
+		mwx_scan_reset_rx_deaf(sc);
+		return false;
+	}
+	if (mdrdy_sum == 0)
+		return false;
+	if (sc->sc_rx_deaf_scans == 0 || rx_now != sc->sc_rx_deaf_baseline) {
+		sc->sc_rx_deaf_scans = 0;
+		sc->sc_rx_deaf_channels = 0;
+		sc->sc_rx_deaf_mdrdy = 0;
+		sc->sc_rx_deaf_baseline = rx_now;
+	}
+	sc->sc_rx_deaf_scans++;
+	sc->sc_rx_deaf_channels += complete_ch;
+	sc->sc_rx_deaf_mdrdy += mdrdy_sum;
+	if (sc->sc_rx_deaf_scans >= 2 && sc->sc_rx_deaf_channels >= 16 &&
+	    sc->sc_rx_deaf_mdrdy >= 64) {
+		MWX_DEV_LOG(sc,
+		    "deaf RX detected: scans=%u channels=%u mdrdy=%u rx=%u; requesting full reset\n",
+		    sc->sc_rx_deaf_scans, sc->sc_rx_deaf_channels,
+		    sc->sc_rx_deaf_mdrdy, rx_now);
+		mwx_scan_reset_rx_deaf(sc);
+		if (mwx_request_fullreset(sc, "deaf RX during scan",
+		    MWX_FULLRESET_DEAF_RX)) {
+			sc->sc_rx_deaf_resets++;
+			return true;
+		}
+	}
+	return false;
 }
 
 void
@@ -6818,6 +7022,9 @@ mt7921_mcu_scan_event(struct mwx_softc *sc, struct mbuf *m)
 		    probe_sum, mdrdy_sum, le32toh(event->beacon_2g_num),
 		    le32toh(event->beacon_5g_num), nodes_before,
 		    sc->sc_rx_pkt_normal, sc->sc_rx_fill_fail);
+		if (mwx_scan_check_rx_deaf(sc, event->complete_channel_num,
+		    le32toh(event->beacon_scan_num), probe_sum, mdrdy_sum))
+			return;
 	} else {
 		MWX_DEV_LOG(sc,
 		    "scan done #%u short event len=%zu nodes_before=%d rx_norm=%u rx_fail=%u\n",
@@ -9545,6 +9752,27 @@ MtkMwx::systemPower(bool suspend)
 			return kIOReturnNotAttached;
 	}
 	return kIOReturnTimeout;
+}
+
+void
+MtkMwx::publishHealthDiagnostics()
+{
+    if (!com || !mwxController())
+        return;
+    mwxController()->setProperty("MTKWiFiDMAStalls", com->sc_dma_stalls, 32);
+    mwxController()->setProperty("MTKWiFiFullResets", com->sc_full_resets, 32);
+    mwxController()->setProperty("MTKWiFiFullResetLastReason", com->sc_fullreset_last_reason, 32);
+    mwxController()->setProperty("MTKWiFiSEREvents", com->sc_ser_events, 32);
+    mwxController()->setProperty("MTKWiFiRxIRQRescues", com->sc_rx_irq_rescues, 32);
+    mwxController()->setProperty("MTKWiFiRxDeafResets", com->sc_rx_deaf_resets, 32);
+    mwxController()->setProperty("MTKWiFiRxDeafScans", com->sc_rx_deaf_scans, 32);
+    mwxController()->setProperty("MTKWiFiRxNormalPackets", com->sc_rx_pkt_normal, 32);
+    mwxController()->setProperty("MTKWiFiRxNormalMCUPackets", com->sc_rx_pkt_normal_mcu, 32);
+    mwxController()->setProperty("MTKWiFiRxFillFail", com->sc_rx_fill_fail, 32);
+    mwxController()->setProperty("MTKWiFiMCUTimeouts", com->sc_mcu_timeouts, 32);
+    mwxController()->setProperty("MTKWiFiLastMCUCmd", com->sc_last_mcu_cmd, 32);
+    mwxController()->setProperty("MTKWiFiAutoResetEnabled",
+        (com->sc_knobs & MWX_KNOB_AUTORESET) != 0);
 }
 
 void

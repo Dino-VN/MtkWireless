@@ -158,6 +158,8 @@ IOReturn AirportMtkWlan::publishJoinDiagnosticsGated(OSObject *owner, void *, vo
     self->setProperty("MTKWiFiPMPowerState", uint64_t(self->pmPowerState), 32);
     self->setProperty("MTKWiFiInterfaceFlags", uint64_t(ic->ic_if.if_flags), 32);
     self->setProperty("MTKWiFiNativeLinkStatus", uint64_t(self->currentStatus), 32);
+    if (auto *hal = OSDynamicCast(MtkMwx, self->fHalService))
+        hal->publishHealthDiagnostics();
     return kIOReturnSuccess;
 }
 
