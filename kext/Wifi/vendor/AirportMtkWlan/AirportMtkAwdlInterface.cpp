@@ -1579,8 +1579,8 @@ void AirportMtkAwdlInterface::serviceTxBlockAck(uint64_t now)
         f[24]=mtkawdl::blockAckCategory; f[25]=mtkawdl::addbaRequest; f[26]=++p.token;
         uint16_t params=uint16_t((awdlAmsduEnabled() ? 1 : 0) | 2 | (0<<2) | (64<<6));
         f[27]=uint8_t(params); f[28]=uint8_t(params>>8);
-        // timeout 0 at 29..30; SSN = next QoS sequence to this peer.
-        p.ssn=p.seq; uint16_t ssn=uint16_t(p.ssn<<4);
+        // timeout 0 at 29..30; SSN is refreshed from txSeq when transmitted.
+        p.ssn=p.txSeq; uint16_t ssn=uint16_t(p.ssn<<4);
         f[31]=uint8_t(ssn); f[32]=uint8_t(ssn>>8);
         mbuf_t m=makeFrame(f,sizeof(f));
         if(!m) continue;
@@ -2884,18 +2884,28 @@ void AirportMtkAwdlInterface::serviceInGate()
                     m=aggregate;
                 }
             }
-            // Keep TID 0 MPDU sequence numbers strictly contiguous when A-MSDU
-            // collapses multiple queued QoS frames into one MPDU under TX-BA.
+            // Assign TID 0 MPDU sequence numbers from one monotonic submission
+            // counter (txSeq) across idle/requested/active BA states, and stamp
+            // outgoing ADDBA Requests with the exact next txSeq as SSN.
+            if(blockAck && mbuf_len(m)>=33 && f[25]==mtkawdl::addbaRequest) {
+                int addbaSlot=txBaSlot(f+4,now,false);
+                if(addbaSlot>=0 && txBa[addbaSlot].state==txBaRequested &&
+                   txBa[addbaSlot].token==f[26]) {
+                    uint8_t *hdr=static_cast<uint8_t *>(mbuf_data(m));
+                    txBa[addbaSlot].ssn=txBa[addbaSlot].txSeq;
+                    uint16_t ssn=uint16_t((txBa[addbaSlot].ssn&0xfff)<<4);
+                    hdr[31]=uint8_t(ssn); hdr[32]=uint8_t(ssn>>8);
+                }
+            }
             uint16_t sentSn=0;
+            bool stampedSn=false;
+            uint8_t savedSc0=0, savedSc1=0;
             if(baIndex>=0 && mbuf_len(m)>=24) {
                 uint8_t *hdr=static_cast<uint8_t *>(mbuf_data(m));
-                if(baActive) {
-                    sentSn=txBa[baIndex].txSeq;
-                    uint16_t sc=uint16_t((sentSn&0xfff)<<4);
-                    hdr[22]=uint8_t(sc); hdr[23]=uint8_t(sc>>8);
-                } else {
-                    sentSn=uint16_t((mtkawdl::le16(hdr+22)>>4)&0xfff);
-                }
+                savedSc0=hdr[22]; savedSc1=hdr[23]; stampedSn=true;
+                sentSn=txBa[baIndex].txSeq;
+                uint16_t sc=uint16_t((sentSn&0xfff)<<4);
+                hdr[22]=uint8_t(sc); hdr[23]=uint8_t(sc>>8);
             }
             IOReturn txStatus=hal->awdlTryTransmit(&m,channel);
             if(unicastMI) umiStatus=txStatus; else if(!blockAck) dataTxStatus=txStatus;
@@ -2928,26 +2938,46 @@ void AirportMtkAwdlInterface::serviceInGate()
                         }
                         if(txStatus==kIOReturnSuccess) {
                             if(m) mbuf_freem(m);
-                            if(baIndex>=0) txBa[baIndex].txSeq=(sentSn+1)&0xfff;
+                            if(baIndex>=0) { txBa[baIndex].txSeq=(sentSn+1)&0xfff; txBa[baIndex].seq=txBa[baIndex].txSeq; }
                             ++submitted;
                             continue;
                         }
                     }
                     // One missing station must not block multicast/other peers.
-                    unsigned tail=(queueHead+queueCount)%kDataQueueSize;
-                    queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
-                    ++deferred;
+                    // programDataPeer can release the gate and let Skywalk fill
+                    // the freed slot; never overwrite queueHead when full.
+                    if(stampedSn && mbuf_len(m)>=24) {
+                        uint8_t *hdr=static_cast<uint8_t *>(mbuf_data(m));
+                        hdr[22]=savedSc0; hdr[23]=savedSc1;
+                    }
+                    if(queueCount<kDataQueueSize) {
+                        unsigned tail=(queueHead+queueCount)%kDataQueueSize;
+                        queue[tail]=m; queueTime[tail]=time; queueDeadline[tail]=expiry; ++queueCount;
+                        ++deferred;
+                    } else {
+                        mbuf_freem(m);
+                        ++failed;
+                    }
                     continue;
                 }
-                queueHead=(queueHead+kDataQueueSize-1)%kDataQueueSize;
-                queue[queueHead]=m; queueTime[queueHead]=time; queueDeadline[queueHead]=expiry; ++queueCount;
-                ++deferred;
+                if(stampedSn && mbuf_len(m)>=24) {
+                    uint8_t *hdr=static_cast<uint8_t *>(mbuf_data(m));
+                    hdr[22]=savedSc0; hdr[23]=savedSc1;
+                }
+                if(queueCount<kDataQueueSize) {
+                    queueHead=(queueHead+kDataQueueSize-1)%kDataQueueSize;
+                    queue[queueHead]=m; queueTime[queueHead]=time; queueDeadline[queueHead]=expiry; ++queueCount;
+                    ++deferred;
+                } else {
+                    mbuf_freem(m);
+                    ++failed;
+                }
                 // Busy/grant/ring pressure applies to the rest of this batch.
                 if(txStatus==kIOReturnNoResources) txBackpressure=true;
                 break;
             }
             if(txStatus==kIOReturnSuccess) {
-                if(baIndex>=0) txBa[baIndex].txSeq=(sentSn+1)&0xfff;
+                if(baIndex>=0) { txBa[baIndex].txSeq=(sentSn+1)&0xfff; txBa[baIndex].seq=txBa[baIndex].txSeq; }
                 ++submitted;
                 if(mdnsReply) ++mdnsRepliesOnQueryChannel;
                 if(amsduCount) {

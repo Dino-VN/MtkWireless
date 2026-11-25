@@ -591,6 +591,7 @@ struct mwx_softc {
     mtkawdl::TxStatusCounters sc_awdl_tx_status;
     uint32_t sc_awdl_txs_seq;
     bool sc_awdl_ra_off;
+    bool sc_awdl_roc_draining;
     uint16_t sc_awdl_ra_last_rate;
     // Bounded diagnostic rings and watchdog snapshot, allocated once on attach.
     // Retained through sync-off/reset; no per-packet allocation.
@@ -11033,6 +11034,11 @@ bool MtkMwx::awdlChannelAllowed(uint8_t channel)
 static int mwx_awdl_abort(mwx_softc *sc)
 {
     IOLockLock(sc->sc_awdl_lock);
+    while(sc->sc_awdl_roc_draining && !sc->sc_detaching && !sc->sc_resetting) {
+        IOLockUnlock(sc->sc_awdl_lock);
+        tsleep_nsec(&sc->sc_awdl_roc_draining, 0, "awdl-abtwait", MSEC_TO_NSEC(1));
+        IOLockLock(sc->sc_awdl_lock);
+    }
     bool wasGranted=sc->sc_awdl_roc.granted;
     bool reserved=sc->sc_awdl_roc.pending || wasGranted;
     if(sc->sc_awdl_roc.pending && mwx_awdl_now()>=sc->sc_awdl_roc.deadline)
@@ -11045,6 +11051,8 @@ static int mwx_awdl_abort(mwx_softc *sc)
     uint8_t token=sc->sc_awdl_roc_abort_token;
     uint32_t epoch=sc->sc_awdl_epoch;
     sc->sc_awdl_roc.cancel();
+    bool drain=abortPending && wasGranted && !sc->sc_detaching && !sc->sc_resetting;
+    if(drain) sc->sc_awdl_roc_draining=true;
     IOLockUnlock(sc->sc_awdl_lock);
     if(!abortPending) return 0;
     // MtkWireless: let the bounded in-flight hardware TX FIFO drain briefly
@@ -11052,7 +11060,7 @@ static int mwx_awdl_abort(mwx_softc *sc)
     // queued AWDL MPDUs finish over the air instead of failing retries and
     // stalling the peer's RX-BA reorder buffer for ~1 s. tsleep_nsec releases
     // the command gate so TX_FREE interrupts run normally.
-    if (wasGranted && !sc->sc_detaching && !sc->sc_resetting) {
+    if (drain) {
         for (unsigned wait = 0; wait < 12; ++wait) {
             IOLockLock(mwx_txq_lock);
             u_int inuse = sc->sc_txwi.mt_inuse;
@@ -11061,6 +11069,13 @@ static int mwx_awdl_abort(mwx_softc *sc)
                 break;
             tsleep_nsec(&sc->sc_txwi, 0, "awdl-txdrain", MSEC_TO_NSEC(1));
         }
+        IOLockLock(sc->sc_awdl_lock);
+        sc->sc_awdl_roc_draining=false;
+        bool stillPending=sc->sc_awdl_roc_abort_pending &&
+            sc->sc_awdl_roc_abort_token==token &&
+            sc->sc_awdl_epoch==epoch;
+        IOLockUnlock(sc->sc_awdl_lock);
+        if (!stillPending) return 0;
     }
     uint8_t request[16]={};
     mtkawdl::put16(request+4,1); mtkawdl::put16(request+6,12);
@@ -11385,6 +11400,15 @@ IOReturn MtkMwx::awdlReserve(uint8_t channel,uint32_t durationMs,AwdlRocTiming *
     int abortRv=mwx_awdl_abort(com);
     if(!operation.valid()) return kIOReturnAborted;
     if(abortRv) return kIOReturnIOError;
+    // Re-check join/scan ownership after mwx_awdl_abort may have slept.
+    if(mwx_awdl_infra_joining(com)) {
+        ++com->sc_awdl_roc_join_blocked;
+        if(com->sc_ic.ic_join_diag.Active) ++com->sc_ic.ic_join_diag.ROCRefused;
+        return kIOReturnNotReady;
+    }
+    if(com->sc_flags & (MWX_FLAG_SCANNING | MWX_FLAG_BGSCAN)) {
+        ++com->sc_awdl_roc_scan_blocked; return kIOReturnNotReady;
+    }
     // A P2P discovery device has no persistent RLM channel context. Match
     // mt7921_mcu_set_roc: acquire carries all channel/band/width fields.
     // Programming RLM here couples discovery to an active BSS and blocks
@@ -11819,7 +11843,13 @@ IOReturn MtkMwx::awdlTryTransmit(mbuf_t *packet,uint8_t channel)
         }
         inflightLimit = static_cast<unsigned>(limit);
     }
-    if (mwx_tx_full(com) || (inflightLimit && com->sc_txwi.mt_inuse >= inflightLimit)) {
+    bool txFull = mwx_tx_full(com);
+    if (!txFull && inflightLimit) {
+        IOLockLock(mwx_txq_lock);
+        txFull = com->sc_txwi.mt_inuse >= inflightLimit;
+        IOLockUnlock(mwx_txq_lock);
+    }
+    if (txFull) {
         ++com->sc_awdl_tx_backpressure; return kIOReturnNoResources;
     }
     mbuf_t attempt=NULL;
