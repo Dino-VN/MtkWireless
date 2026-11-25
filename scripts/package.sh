@@ -1,5 +1,5 @@
 #!/bin/bash
-# Zip both kexts with the OpenCore snippet into dist/.
+# Zip both kexts into dist/.
 #
 #   scripts/package.sh [Debug|Release]    (run scripts/build.sh first)
 set -euo pipefail
@@ -9,13 +9,12 @@ VERSION="${MODULE_VERSION:-$(cat VERSION)}"
 UP="$(echo "$CONF" | tr '[:lower:]' '[:upper:]')"
 
 stage="$(mktemp -d)/MtkWireless-$VERSION-$UP"
-mkdir -p "$stage/Kexts" dist
+mkdir -p "$stage" dist
 for name in MtkWirelessWifi MtkWirelessBT; do
     test -d "build/$CONF/$name.kext" || { echo "missing build/$CONF/$name.kext" >&2; exit 1; }
-    cp -R "build/$CONF/$name.kext" "$stage/Kexts/"
+    cp -R "build/$CONF/$name.kext" "$stage/"
 done
-cp docs/config-snippet.plist docs/*.md scripts/install.sh scripts/collect-logs.sh "$stage/"
-cp LICENSES/*.txt "$stage/"
+rm -f "dist/$(basename "$stage").zip"
 (cd "$(dirname "$stage")" && zip -qry "$OLDPWD/dist/$(basename "$stage").zip" "$(basename "$stage")")
 rm -rf "$(dirname "$stage")"
 echo "dist/$(basename "$stage").zip"
