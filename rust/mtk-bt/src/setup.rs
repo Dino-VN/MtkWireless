@@ -302,7 +302,7 @@ pub fn subsystem_reset<T: Transport>(t: &mut T, chip: Chip) -> Result<(), SetupE
             io("reset write", t.uhw_write(MTK_BT_SUBSYS_RST, v | 1))?;
             t.sleep_ms(100);
         }
-        Chip::Mt7961 => {
+        Chip::Mt7961 | Chip::Mt7902 => {
             io(
                 "reset ep opt",
                 t.uhw_write(MTK_EP_RST_OPT, MTK_EP_RST_IN_OUT_OPT),
@@ -630,5 +630,31 @@ mod tests {
             ]
         );
         assert_eq!(t.calls.last(), Some(&Call::RegRead(MTK_BT_READ_DEV_ID)));
+    }
+
+    #[test]
+    fn mt7902_setup_and_reset_sequence() {
+        let mut t = Fake::new(0x7902, Some(image(&[&[5; 16]])));
+        t.fw_version = 0;
+        let info = setup(&mut t).unwrap();
+        assert_eq!(info.chip, Chip::Mt7902);
+        assert_eq!(info.firmware.as_str(), "BT_RAM_CODE_MT7902_1_1_hdr.bin");
+
+        let mut reset_t = Fake::new(0x7902, None);
+        subsystem_reset(&mut reset_t, Chip::Mt7902).unwrap();
+        assert_eq!(
+            reset_t.calls[..4],
+            [
+                Call::UhwWrite(MTK_EP_RST_OPT, MTK_EP_RST_IN_OUT_OPT),
+                Call::UhwRead(MTK_BT_WDT_STATUS),
+                Call::UhwWrite(MTK_BT_SUBSYS_RST, 1),
+                Call::UhwWrite(MTK_UDMA_INT_STA_BT, 0xff),
+            ]
+        );
+        assert!(reset_t.calls.contains(&Call::UhwWrite(MTK_BT_SUBSYS_RST, 0)));
+        assert_eq!(
+            reset_t.calls.last(),
+            Some(&Call::RegRead(MTK_BT_READ_DEV_ID))
+        );
     }
 }

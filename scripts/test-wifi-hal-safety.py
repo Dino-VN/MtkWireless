@@ -115,10 +115,11 @@ struct Interrupt:OSObject { WorkLoop *workloop=nullptr; };
 using pci_intr_handle_t=Interrupt *;
 constexpr unsigned MT_WFDMA0_HOST_INT_ENA=1,MT_PCIE_MAC_INT_ENABLE=2;
 constexpr unsigned MT_CONN_ON_MISC=3,MT_TOP_MISC2_FW_N9_RDY=4,MT_TOP_MISC2_FW_PWR_ON=8,MT_TOP_MISC_FW_STATE=12;
-constexpr unsigned MCU_CMD_NIC_POWER_CTRL=20,MCU_CMD_FW_SCATTER=21,MCU_CE_CMD_SET_RATE_TX_POWER=22;
+constexpr unsigned MCU_CMD_NIC_POWER_CTRL=20,MCU_CMD_FW_SCATTER=21,MCU_CE_CMD_SET_RATE_TX_POWER=22,MCU_CE_QUERY_REG_READ=23;
+constexpr unsigned MT_PSE_BASE=0x820c8000u;
 constexpr unsigned MWX_FW_CHUNK=4096;
-constexpr int MWX_HW_MT7921=0,MWX_HW_MT7922=1,M_DEVBUF=0;
-const char *MT7921_ROM_PATCH="patch1",*MT7921_FIRMWARE_WM="ram1",*MT7922_ROM_PATCH="patch2",*MT7922_FIRMWARE_WM="ram2";
+constexpr int MWX_HW_MT7921=0,MWX_HW_MT7922=1,MWX_HW_MT7902=2,M_DEVBUF=0;
+const char *MT7921_ROM_PATCH="patch1",*MT7921_FIRMWARE_WM="ram1",*MT7922_ROM_PATCH="patch2",*MT7922_FIRMWARE_WM="ram2",*MT7902_ROM_PATCH="patch3",*MT7902_FIRMWARE_WM="ram3";
 '''
 
 MODEL = r'''
@@ -158,11 +159,25 @@ void mwx_queue_reset(mwx_softc *,mwx_queue *q) {
 void mwx_dma_enable(mwx_softc *) { assert(gated); ++enables; }
 std::vector<std::vector<uint8_t>> messages;
 int sendError=0;
+unsigned pseReads=0,pseWaits=0;
 void mt7921_mcu_build_sku(mwx_softc *,int band,int8_t *power) { memset(power,band,MT_SKU_POWER_LIMIT); }
 int mwx_mcu_send_mbuf(mwx_softc *,unsigned cmd,mbuf *m,int *) {
     assert(cmd==MCU_CE_CMD_SET_RATE_TX_POWER);
     auto bytes=mtod(m,const uint8_t *); messages.emplace_back(bytes,bytes+m->length);
     m_freem(m); return sendError;
+}
+int mwx_mcu_send_msg(mwx_softc *,unsigned cmd,const void *data,size_t len,int *seqp) {
+    if(cmd==MCU_CE_QUERY_REG_READ) {
+        assert(len==8&&seqp!=nullptr);
+        uint32_t addr=0; std::memcpy(&addr,data,4);
+        assert(addr==MT_PSE_BASE);
+        *seqp=7; ++pseReads;
+    }
+    return 0;
+}
+int mwx_mcu_wait_resp_int(mwx_softc *,unsigned cmd,int seq,uint32_t *val) {
+    assert(cmd==MCU_CE_QUERY_REG_READ&&seq==7&&val!=nullptr);
+    ++pseWaits; *val=0; return 0;
 }
 '''
 
@@ -172,7 +187,6 @@ unsigned semGets=0,releases=0,patches=0,rams=0,starts=0,firmwareBuffers=0;
 unsigned mwx_ebusy_sleeps=0,mwx_enomem_retries=0;
 uint32_t mwx_read(mwx_softc *,unsigned) { return 0; }
 int mwx_poll(mwx_softc *,unsigned,unsigned,unsigned,unsigned) { return 0; }
-int mwx_mcu_send_msg(mwx_softc *,unsigned,const void *,size_t,int *) { return 0; }
 int loadfirmware(const char *,unsigned char **out,size_t *n) {
     *n=64; *out=static_cast<unsigned char *>(std::malloc(*n)); assert(*out); ++firmwareBuffers; return 0;
 }
@@ -216,6 +230,9 @@ static void powerTables() {
     allocationBudget=0; assert(mt7921_mcu_rate_txpower_band(&sc,1,reinterpret_cast<const uint8_t *>("1"),1,1)==ENOMEM);
     allocationBudget=-1; sendError=EIO; messages.clear(); const uint8_t channels[9]={};
     assert(mt7921_mcu_rate_txpower_band(&sc,1,channels,9,1)==EIO&&messages.size()==1&&!liveMbufs); sendError=0;
+    assert(pseReads==0&&pseWaits==0);
+    sc.sc_hwtype=MWX_HW_MT7902; messages.clear();
+    assert(mt7921_mcu_rate_txpower_band(&sc,2,channels,9,1)==0&&messages.size()==2&&pseReads==2&&pseWaits==2&&!liveMbufs);
 }
 static void refill() {
     {
@@ -244,9 +261,14 @@ static void reset() {
     for(auto &mt:sc.sc_txwi.mt_data) assert(!mt.busy);
     dmaError=EIO; assert(mwx_dma_reset(&sc,0)==EIO&&resets==6&&enables==1); dmaError=0;
     sc.sc_ih=nullptr; assert(mwx_dma_reset(&sc,1)==ENXIO&&loop.calls==2);
+    // MT7902 has no sc_rxmcuq (RX ring 4): reset succeeds with mq_map=nullptr,
+    // resets 5 queues and refills only sc_rxq + sc_rxfwdlq.
+    mwx_softc sc02; sc02.sc_hwtype=MWX_HW_MT7902; sc02.sc_rxmcuq.mq_map=nullptr;
+    sc02.sc_ih=&interrupt; resets=0; enables=0;
+    assert(mwx_dma_reset(&sc02,1)==0&&resets==5&&enables==1&&liveMbufs==15);
 }
 static void firmware() {
-    for(int chip:{MWX_HW_MT7921,MWX_HW_MT7922}) for(int sem:{-1,0,EIO}) for(int badPatch:{0,EINVAL}) {
+    for(int chip:{MWX_HW_MT7921,MWX_HW_MT7922,MWX_HW_MT7902}) for(int sem:{-1,0,EIO}) for(int badPatch:{0,EINVAL}) {
         mwx_softc sc; sc.sc_hwtype=chip; semaphoreResult=sem; patchError=badPatch;
         semGets=releases=patches=rams=starts=0;
         int rv=mwx_load_firmware(&sc);

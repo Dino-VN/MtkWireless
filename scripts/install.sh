@@ -72,12 +72,13 @@ while read -r dev; do
         0608) WIFI_ID="14c3:0608"; WIFI_NAME="MT7921K (RZ608)" ;;
         7922) WIFI_ID="14c3:7922"; WIFI_NAME="MT7922" ;;
         0616) WIFI_ID="14c3:0616"; WIFI_NAME="MT7922 (RZ616)" ;;
+        7902) WIFI_ID="14c3:7902"; WIFI_NAME="MT7902" ;;
     esac
 done < <(ioreg -r -c IOPCIDevice -l -w0 | awk '
     /"vendor-id" = </ { v = substr($0, index($0, "<") + 1, 4) }
     /"device-id" = </ { d = substr($0, index($0, "<") + 1, 4) }
     /^[ |]*}$/ { if (v == "c314") print substr(d, 3, 2) substr(d, 1, 2); v = ""; d = "" }')
-if [ -n "$WIFI_ID" ]; then ok "Wi-Fi: $WIFI_NAME ($WIFI_ID)"; else warn "no supported MediaTek PCIe Wi-Fi card found (14c3:7961/0608/7922/0616)"; fi
+if [ -n "$WIFI_ID" ]; then ok "Wi-Fi: $WIFI_NAME ($WIFI_ID)"; else warn "no supported MediaTek PCIe Wi-Fi card found (14c3:7961/0608/7922/0616/7902)"; fi
 
 USB_IDS="$(ioreg -p IOUSB -l -w0 | awk '
     /"idVendor" = / { v = $NF }
@@ -122,7 +123,7 @@ for id in $USB_IDS; do
     if printf '%s\n' "$BT_MATCH" | grep -qx "$id"; then BT_ID="$id"; break; fi
 done
 if [ -n "$BT_ID" ]; then ok "Bluetooth: MediaTek USB $BT_ID"; else warn "no supported MediaTek USB Bluetooth controller found"; fi
-[ -n "$WIFI_ID" ] || [ -n "$BT_ID" ] || die "no MediaTek MT7921/MT7922 hardware found, nothing to install"
+[ -n "$WIFI_ID" ] || [ -n "$BT_ID" ] || die "no MediaTek MT7921/MT7922/MT7902 hardware found, nothing to install"
 
 INSTALL_WIFI=0 INSTALL_BT=0
 [ -n "$WIFI_ID" ] && INSTALL_WIFI=1
@@ -246,9 +247,9 @@ function run(argv) {
       if (btf < lilu) out.push('WARN BlueToolFixup is listed before Lilu in Kernel > Add');
     }
   }
-  if (wifi === '1') { add.addObject(entry('MtkWirelessWifi', 'MtkWirelessWifi', 'MediaTek MT7921/MT7922 Wi-Fi (macOS 26)', '25.0.0', '25.99.99')); out.push('add MtkWirelessWifi'); }
+  if (wifi === '1') { add.addObject(entry('MtkWirelessWifi', 'MtkWirelessWifi', 'MediaTek MT7921/MT7922/MT7902 Wi-Fi (macOS 26)', '25.0.0', '25.99.99')); out.push('add MtkWirelessWifi'); }
   if (bt === '1') {
-    add.addObject(entry('MtkWirelessBT', 'MtkWirelessBT', 'MediaTek MT7921/MT7922 Bluetooth', '', '')); out.push('add MtkWirelessBT');
+    add.addObject(entry('MtkWirelessBT', 'MtkWirelessBT', 'MediaTek MT7921/MT7922/MT7902 Bluetooth', '', '')); out.push('add MtkWirelessBT');
     const guid = '7C436110-AB2A-4BBB-A880-FE41995C9F82';
     let nv = pl.objectForKey('NVRAM');
     if (!nv || nv.isNil()) { nv = $.NSMutableDictionary.dictionary; pl.setObjectForKey(nv, 'NVRAM'); }
@@ -358,7 +359,7 @@ if ! vlt "$NEWVER" 1.1.1; then
 fi
 if [ $INSTALL_WIFI = 1 ]; then
     ok "Wi-Fi: scan, join, WPA2/WPA3, AWDL, 2.4/5 GHz"
-    case "$WIFI_ID" in 14c3:7922|14c3:0616|14c3:0608) echo "    6 GHz: off by default, boot-arg amtk_6ghz=1 (OWE/SAE-H2E networks cannot be joined yet)";; esac
+    case "$WIFI_ID" in 14c3:7922|14c3:0616|14c3:0608|14c3:7902) echo "    6 GHz: off by default, boot-arg amtk_6ghz=1 (OWE/SAE-H2E networks cannot be joined yet)";; esac
 fi
 if [ $INSTALL_BT = 1 ]; then
     ok "Bluetooth: pairing, audio, AirPods (AAC-ELD), BLE scanning"

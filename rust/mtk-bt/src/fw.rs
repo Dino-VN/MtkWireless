@@ -177,4 +177,24 @@ pub(crate) mod tests {
         let img = PatchImage::parse(&data).unwrap();
         assert!(img.sections().next().unwrap().is_err());
     }
+
+    #[test]
+    fn shipped_bt_patches_parse() {
+        for name in [
+            "BT_RAM_CODE_MT7961_1_2_hdr.bin",
+            "BT_RAM_CODE_MT7961_1a_2_hdr.bin",
+            "BT_RAM_CODE_MT7922_1_1_hdr.bin",
+            "BT_RAM_CODE_MT7902_1_1_hdr.bin",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../firmware/bt")
+                .join(name);
+            let data = std::fs::read(path).expect("firmware/bt present");
+            let img = PatchImage::parse(&data).unwrap();
+            assert!(img.section_count >= 1, "{name}");
+            let sections: Vec<_> = img.sections().map(Result::unwrap).collect();
+            assert_eq!(sections.len(), img.section_count as usize, "{name}");
+            assert!(sections.iter().any(|s| !s.data.is_empty()), "{name}");
+        }
+    }
 }

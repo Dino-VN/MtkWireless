@@ -8,6 +8,7 @@ pub enum Chip {
     /// MT7921 family; the Bluetooth core reports 0x7961.
     Mt7961,
     Mt7922,
+    Mt7902,
 }
 
 impl Chip {
@@ -16,6 +17,7 @@ impl Chip {
         match dev_id {
             0x7961 => Some(Chip::Mt7961),
             0x7922 => Some(Chip::Mt7922),
+            0x7902 => Some(Chip::Mt7902),
             _ => None,
         }
     }
@@ -24,6 +26,7 @@ impl Chip {
         match self {
             Chip::Mt7961 => 0x7961,
             Chip::Mt7922 => 0x7922,
+            Chip::Mt7902 => 0x7902,
         }
     }
 }
@@ -109,6 +112,15 @@ mod tests {
         assert_eq!(
             FirmwareName::new(mt7922, 0x00, 1).as_str(),
             "BT_RAM_CODE_MT7922_1_1_hdr.bin"
+        );
+        let mt7902 = Chip::from_dev_id(0x7902).unwrap();
+        assert_eq!(
+            FirmwareName::new(mt7902, 0x00, 0).as_str(),
+            "BT_RAM_CODE_MT7902_1_1_hdr.bin"
+        );
+        assert_eq!(
+            FirmwareName::new(mt7902, 0x00, 1).as_str(),
+            "BT_RAM_CODE_MT7902_1_1_hdr.bin"
         );
     }
 

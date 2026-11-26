@@ -4,7 +4,7 @@ pub const PCI_VENDOR_MEDIATEK: u16 = 0x14c3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
-    /// MT7921 / MT7922: Connac2 MCU interface (mt7921 in Linux, mwx(4) in OpenBSD).
+    /// MT7921 / MT7922 / MT7902: Connac2 MCU interface (mt7921 in Linux, mwx(4) in OpenBSD).
     Connac2,
 }
 
@@ -12,6 +12,7 @@ pub enum Family {
 pub enum Chip {
     Mt7921,
     Mt7922,
+    Mt7902,
 }
 
 /// Firmware images, by the names they are embedded under.
@@ -24,7 +25,7 @@ pub struct Firmware {
 impl Chip {
     pub const fn family(self) -> Family {
         match self {
-            Chip::Mt7921 | Chip::Mt7922 => Family::Connac2,
+            Chip::Mt7921 | Chip::Mt7922 | Chip::Mt7902 => Family::Connac2,
         }
     }
 
@@ -37,6 +38,10 @@ impl Chip {
             Chip::Mt7922 => Firmware {
                 rom_patch: "mwx-mt7922_patch_mcu_1_1_hdr",
                 ram: "mwx-mt7922_ram_code_1",
+            },
+            Chip::Mt7902 => Firmware {
+                rom_patch: "mwx-mt7902_patch_mcu_1_1_hdr",
+                ram: "mwx-mt7902_ram_code_1",
             },
         }
     }
@@ -71,6 +76,11 @@ pub static CHIPS: &[ChipDesc] = &[
         chip: Chip::Mt7922,
         name: "MT7922 (RZ616)",
     },
+    ChipDesc {
+        pci_device: 0x7902,
+        chip: Chip::Mt7902,
+        name: "MT7902",
+    },
 ];
 
 pub fn lookup_pci(vendor: u16, device: u16) -> Option<&'static ChipDesc> {
@@ -88,6 +98,18 @@ mod tests {
     fn rz616_uses_mt7922_firmware() {
         let desc = lookup_pci(PCI_VENDOR_MEDIATEK, 0x0616).unwrap();
         assert_eq!(desc.chip.firmware().ram, "mwx-mt7922_ram_code_1");
+        assert_eq!(desc.chip.family(), Family::Connac2);
+    }
+
+    #[test]
+    fn mt7902_uses_mt7902_firmware() {
+        let desc = lookup_pci(PCI_VENDOR_MEDIATEK, 0x7902).unwrap();
+        assert_eq!(desc.chip, Chip::Mt7902);
+        assert_eq!(
+            desc.chip.firmware().rom_patch,
+            "mwx-mt7902_patch_mcu_1_1_hdr"
+        );
+        assert_eq!(desc.chip.firmware().ram, "mwx-mt7902_ram_code_1");
         assert_eq!(desc.chip.family(), Family::Connac2);
     }
 

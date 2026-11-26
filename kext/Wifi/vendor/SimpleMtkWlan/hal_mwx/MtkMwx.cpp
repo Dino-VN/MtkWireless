@@ -77,6 +77,7 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
 #define PCI_PRODUCT_MEDIATEK_MT7922    0x7922
 #define PCI_PRODUCT_MEDIATEK_RZ616     0x0616	/* MT7922 variant; Linux mt7921e loads MT7922 firmware */
+#define PCI_PRODUCT_MEDIATEK_MT7902    0x7902	/* Connac2 1x1 Wi-Fi 6E; ring 15 TX MCU, shared RX ring 0 */
 
 #define MWX_LOG(x...) printf("SimpleMtkWlan-mwx: " x)
 #define MWX_DEV_LOG(sc, fmt, args...) \
@@ -275,6 +276,7 @@ static const struct pci_matchid mwx_devices[] = {
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7921K },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7922 },
 	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_RZ616 },
+	{ PCI_VENDOR_MEDIATEK, PCI_PRODUCT_MEDIATEK_MT7902 },
 };
 
 /* Keep the OpenBSD DPRINTF path available, but do not enable it by default.
@@ -285,6 +287,8 @@ static const struct pci_matchid mwx_devices[] = {
 #define	MT7921_FIRMWARE_WM	"mwx-mt7961_ram_code_1"
 #define	MT7922_ROM_PATCH	"mwx-mt7922_patch_mcu_1_1_hdr"
 #define	MT7922_FIRMWARE_WM	"mwx-mt7922_ram_code_1"
+#define	MT7902_ROM_PATCH	"mwx-mt7902_patch_mcu_1_1_hdr"
+#define	MT7902_FIRMWARE_WM	"mwx-mt7902_ram_code_1"
 
 #if NBPFILTER > 0
 struct mwx_rx_radiotap_header {
@@ -523,7 +527,18 @@ struct mwx_awdl_native_tx_table {
 enum mwx_hw_type {
 	MWX_HW_MT7921,
 	MWX_HW_MT7922,
+	MWX_HW_MT7902,
 };
+
+static inline const char *
+mwx_hw_name(enum mwx_hw_type hw)
+{
+	switch (hw) {
+	case MWX_HW_MT7922: return "MT7922";
+	case MWX_HW_MT7902: return "MT7902";
+	default: return "MT7921";
+	}
+}
 
 struct mwx_setkey_task_arg {
 	struct ieee80211_node	*ni;
@@ -2676,12 +2691,14 @@ mwx_intr(void *arg)
 			intr |= MT_INT_RX_DONE_DATA;
 	}
 
-	if (intr & MT_INT_TX_DONE_ALL)
+	const uint32_t tx_done_mask = sc->sc_hwtype == MWX_HW_MT7902 ?
+	    MT7902_INT_TX_DONE_ALL : MT_INT_TX_DONE_ALL;
+	if (intr & tx_done_mask)
 		mwx_dma_tx_done(sc);
 
 	if (intr & MT_INT_RX_DONE_WM)
 		mwx_dma_rx_done(sc, &sc->sc_rxfwdlq);
-	if (intr & MT_INT_RX_DONE_WM2)
+	if (sc->sc_hwtype != MWX_HW_MT7902 && (intr & MT_INT_RX_DONE_WM2))
 		mwx_dma_rx_done(sc, &sc->sc_rxmcuq);
 	if (intr & MT_INT_RX_DONE_DATA)
 		mwx_dma_rx_done(sc, &sc->sc_rxq);
@@ -2873,15 +2890,22 @@ mwx_attach(struct device *parent, struct device *self, void *aux)
 	sc->sc_pc = pa->pa_pc;
 	sc->sc_tag = pa->pa_tag;
 	sc->sc_dmat = pa->pa_dmat;
-	sc->sc_intr_mask = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
-	    MT_INT_MCU_CMD;
-	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
+	if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7902)
+		sc->sc_hwtype = MWX_HW_MT7902;
+	else if (PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_MT7922 ||
 	    PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_MEDIATEK_RZ616)
 		sc->sc_hwtype = MWX_HW_MT7922;
 	else
 		sc->sc_hwtype = MWX_HW_MT7921;
+	/* MtkWireless: MT7902 uses MCU TX ring 15 (ENA15) and has no RX ring 4 (WM2). */
+	if (sc->sc_hwtype == MWX_HW_MT7902)
+		sc->sc_intr_mask = MT7902_INT_RX_DONE_ALL |
+		    MT7902_INT_TX_DONE_ALL | MT_INT_MCU_CMD;
+	else
+		sc->sc_intr_mask = MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
+		    MT_INT_MCU_CMD;
 	MWX_DEV_LOG(sc, "attach hardware type=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	    mwx_hw_name(sc->sc_hwtype));
 
 	memtype = pci_mapreg_type(pa->pa_pc, pa->pa_tag, PCI_MAPREG_START);
 	if (pci_mapreg_map(pa, PCI_MAPREG_START, memtype, 0,
@@ -3947,6 +3971,7 @@ mwx_queue_fill(struct mwx_softc *sc, struct mwx_queue *q)
 int
 mwx_dma_alloc(struct mwx_softc *sc)
 {
+	const bool is_mt7902 = sc->sc_hwtype == MWX_HW_MT7902;
 	int rv;
 
 	MWX_DEV_LOG(sc, "dma alloc start\n");
@@ -3955,22 +3980,25 @@ mwx_dma_alloc(struct mwx_softc *sc)
 	    MT_TX_DATA_RING_BASE)) != 0)
 		return rv;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txmcuq, 256,
-	    MT_TX_MCU_RING_BASE)) != 0)
+	    is_mt7902 ? MT7902_TX_MCU_RING_BASE : MT_TX_MCU_RING_BASE)) != 0)
 		return rv;
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_txfwdlq, 16 /* XXX */,
 	    MT_TX_FWDL_RING_BASE)) != 0)
 		return rv;
 
-	/* RX queues */
+	/* RX queues: MT7902 has no RX ring 4 (MCU_WA); RX ring 0 is 512 entries
+	 * and shared for both MCU events and TX-done notifications. */
 	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxq, 256,
 	    MT_RX_DATA_RING_BASE)) != 0 ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxq)) != 0)
 		return rv;
-	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxmcuq, 256,
+	if (!is_mt7902 &&
+	    ((rv = mwx_queue_alloc(sc, &sc->sc_rxmcuq, 256,
 	    MT_RX_MCU_RING_BASE)) != 0 ||
-	    (rv = mwx_queue_fill(sc, &sc->sc_rxmcuq)) != 0)
+	    (rv = mwx_queue_fill(sc, &sc->sc_rxmcuq)) != 0))
 		return rv;
-	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxfwdlq, 16 /* XXX */,
+	if ((rv = mwx_queue_alloc(sc, &sc->sc_rxfwdlq,
+	    is_mt7902 ? MT7902_RX_MCU_RING_SIZE : 16 /* XXX */,
 	    MT_RX_FWDL_RING_BASE)) != 0 ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxfwdlq)) != 0)
 		return rv;
@@ -4008,7 +4036,8 @@ mwx_dma_reset_gated(OSObject *, void *arg, void *reset, void *, void *)
 
 	/* RX queues */
 	mwx_queue_reset(sc, &sc->sc_rxq);
-	mwx_queue_reset(sc, &sc->sc_rxmcuq);
+	if (sc->sc_hwtype != MWX_HW_MT7902)
+		mwx_queue_reset(sc, &sc->sc_rxmcuq);
 	mwx_queue_reset(sc, &sc->sc_rxfwdlq);
 
 	/* Reset rings no longer refer to old TXP tokens. Reclaim them for
@@ -4021,7 +4050,8 @@ mwx_dma_reset_gated(OSObject *, void *arg, void *reset, void *, void *)
 
 	/* refill RX queues */
 	if ((rv = mwx_queue_fill(sc, &sc->sc_rxq)) != 0 ||
-	    (rv = mwx_queue_fill(sc, &sc->sc_rxmcuq)) != 0 ||
+	    (sc->sc_hwtype != MWX_HW_MT7902 &&
+	    (rv = mwx_queue_fill(sc, &sc->sc_rxmcuq)) != 0) ||
 	    (rv = mwx_queue_fill(sc, &sc->sc_rxfwdlq)) != 0)
 		return rv;
 
@@ -4038,7 +4068,8 @@ mwx_dma_reset(struct mwx_softc *sc, int fullreset)
 
 	if (!ih || !ih->workloop || !sc->sc_txq.mq_map ||
 	    !sc->sc_txmcuq.mq_map || !sc->sc_txfwdlq.mq_map ||
-	    !sc->sc_rxq.mq_map || !sc->sc_rxmcuq.mq_map ||
+	    !sc->sc_rxq.mq_map ||
+	    (sc->sc_hwtype != MWX_HW_MT7902 && !sc->sc_rxmcuq.mq_map) ||
 	    !sc->sc_rxfwdlq.mq_map)
 		return ENXIO;
 	return ih->workloop->runAction(mwx_dma_reset_gated, ih, sc,
@@ -4081,7 +4112,8 @@ mwx_dma_reinit_cond(struct mwx_softc *sc)
 		return EBUSY;
 	if (!ih || !ih->workloop || !sc->sc_txq.mq_map ||
 	    !sc->sc_txmcuq.mq_map || !sc->sc_txfwdlq.mq_map ||
-	    !sc->sc_rxq.mq_map || !sc->sc_rxmcuq.mq_map ||
+	    !sc->sc_rxq.mq_map ||
+	    (sc->sc_hwtype != MWX_HW_MT7902 && !sc->sc_rxmcuq.mq_map) ||
 	    !sc->sc_rxfwdlq.mq_map)
 		return ENXIO;
 	return ih->workloop->runAction(mwx_dma_reinit_gated, ih, sc);
@@ -4097,7 +4129,8 @@ mwx_dma_free(struct mwx_softc *sc)
 
 	/* RX queues */
 	mwx_queue_free(sc, &sc->sc_rxq);
-	mwx_queue_free(sc, &sc->sc_rxmcuq);
+	if (sc->sc_rxmcuq.mq_map)
+		mwx_queue_free(sc, &sc->sc_rxmcuq);
 	mwx_queue_free(sc, &sc->sc_rxfwdlq);
 }
 
@@ -5155,8 +5188,8 @@ mwx_dump_mcu_state(struct mwx_softc *sc, uint32_t cmd, int seq)
 	    mwx_read(sc, MT_WFDMA0_HOST_INT_STA),
 	    mwx_read(sc, MT_WFDMA0_HOST_INT_ENA));
 	MWX_DEV_LOG(sc, "timeout diag rxmcu cpu=%u dma=%u cons=%u rxfwdl cpu=%u dma=%u cons=%u txmcu cpu=%u dma=%u cons=%u\n",
-	    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX),
-	    mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX),
+	    sc->sc_rxmcuq.mq_map ? mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_CPU_IDX) : 0,
+	    sc->sc_rxmcuq.mq_map ? mwx_read(sc, sc->sc_rxmcuq.mq_regbase + MT_DMA_DMA_IDX) : 0,
 	    sc->sc_rxmcuq.mq_cons,
 	    mwx_read(sc, sc->sc_rxfwdlq.mq_regbase + MT_DMA_CPU_IDX),
 	    mwx_read(sc, sc->sc_rxfwdlq.mq_regbase + MT_DMA_DMA_IDX),
@@ -5268,22 +5301,40 @@ void
 mwx_dma_enable(struct mwx_softc *sc)
 {
 #define PREFETCH(base, depth)   ((base) << 16 | (depth))
-	/* configure perfetch settings */
-	mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x40, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0x80, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING4_EXT_CTRL, PREFETCH(0xc0, 0x4));
-	mwx_write(sc, MT_WFDMA0_RX_RING5_EXT_CTRL, PREFETCH(0x100, 0x4));
+	/* configure prefetch settings */
+	if (sc->sc_hwtype == MWX_HW_MT7902) {
+		/* Linux mt792x_dma_prefetch: MT7902 RX0..3 and TX0..6, 15, 16 */
+		mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0000, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING1_EXT_CTRL, PREFETCH(0x0040, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x0080, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0x00c0, 0x4));
 
-	mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x140, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x180, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x1c0, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x200, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x240, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x280, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x2c0, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x340, 0x4));
-	mwx_write(sc, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x380, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x0100, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x0140, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x0180, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x01c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x0200, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x0240, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x0280, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING15_EXT_CTRL, PREFETCH(0x02c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x0300, 0x4));
+	} else {
+		mwx_write(sc, MT_WFDMA0_RX_RING0_EXT_CTRL, PREFETCH(0x0, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING2_EXT_CTRL, PREFETCH(0x40, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING3_EXT_CTRL, PREFETCH(0x80, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING4_EXT_CTRL, PREFETCH(0xc0, 0x4));
+		mwx_write(sc, MT_WFDMA0_RX_RING5_EXT_CTRL, PREFETCH(0x100, 0x4));
+
+		mwx_write(sc, MT_WFDMA0_TX_RING0_EXT_CTRL, PREFETCH(0x140, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING1_EXT_CTRL, PREFETCH(0x180, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING2_EXT_CTRL, PREFETCH(0x1c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING3_EXT_CTRL, PREFETCH(0x200, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING4_EXT_CTRL, PREFETCH(0x240, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING5_EXT_CTRL, PREFETCH(0x280, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING6_EXT_CTRL, PREFETCH(0x2c0, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING16_EXT_CTRL, PREFETCH(0x340, 0x4));
+		mwx_write(sc, MT_WFDMA0_TX_RING17_EXT_CTRL, PREFETCH(0x380, 0x4));
+	}
 
 	/* reset dma idx */
 	mwx_write(sc, MT_WFDMA0_RST_DTX_PTR, ~0);
@@ -5600,7 +5651,8 @@ mwx_load_firmware(struct mwx_softc *sc)
 	int i, rv, sem;
 
 	MWX_DEV_LOG(sc, "firmware load start hwtype=%s\n",
-	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921");
+	    sc->sc_hwtype == MWX_HW_MT7922 ? "MT7922" :
+	    sc->sc_hwtype == MWX_HW_MT7902 ? "MT7902" : "MT7921");
 	reg = mwx_read(sc, MT_CONN_ON_MISC) & MT_TOP_MISC2_FW_N9_RDY;
 	if (reg != 0 && sc->sc_fw_restart) {
 		/* Like mt76_connac_mcu_restart(): drop the running firmware. */
@@ -5623,6 +5675,13 @@ mwx_load_firmware(struct mwx_softc *sc)
 		return 0;
 	}
 	sc->sc_fw_restart = 0;
+	// Linux mt792x_load_firmware: ensure MCU is in PWR_ON state before patch download.
+	if (sc->sc_hwtype == MWX_HW_MT7902 &&
+	    mwx_poll(sc, MT_CONN_ON_MISC, MT_TOP_MISC2_FW_PWR_ON,
+	    MT_TOP_MISC_FW_STATE, 1000) != 0) {
+		MWX_DEV_LOG(sc, "MCU not ready before ROM patch misc=0x%08x\n",
+		    mwx_read(sc, MT_CONN_ON_MISC));
+	}
 	// Do not identify an already-running, unexamined image as the bundled one.
 	memset(&sc->sc_capa.fw_features, 0, sizeof(sc->sc_capa.fw_features));
 	sc->sc_capa.fw_features_error = ENOENT;
@@ -5636,6 +5695,10 @@ mwx_load_firmware(struct mwx_softc *sc)
 	case MWX_HW_MT7922:
 		rompatch = MT7922_ROM_PATCH;
 		fw = MT7922_FIRMWARE_WM;
+		break;
+	case MWX_HW_MT7902:
+		rompatch = MT7902_ROM_PATCH;
+		fw = MT7902_FIRMWARE_WM;
 		break;
 	}
 	MWX_DEV_LOG(sc, "firmware selected patch=%s wm=%s\n", rompatch, fw);
@@ -6718,7 +6781,8 @@ mwx_dma_timeo(void *arg)
 	/* Timer callbacks share the interrupt workloop gate. Retry RX rings
 	 * under memory pressure even if a drained ring produces no more IRQs. */
 	mwx_queue_fill(sc, &sc->sc_rxq);
-	mwx_queue_fill(sc, &sc->sc_rxmcuq);
+	if (sc->sc_rxmcuq.mq_map)
+		mwx_queue_fill(sc, &sc->sc_rxmcuq);
 	mwx_queue_fill(sc, &sc->sc_rxfwdlq);
 
 	if ((mwx_read(sc, MT_WFDMA0_GLO_CFG) & MT_WFDMA0_GLO_CFG_TX_DMA_EN) == 0 &&
@@ -7203,6 +7267,21 @@ mt7921_mcu_rate_txpower_band(struct mwx_softc *sc, int band,
 		    NULL);
 		if (rv != 0)
 			break;
+		/* Linux 14a7ba034fcd: read MT_PSE_BASE via MCU on MT7902 to
+		 * avoid PSE buffer underflow after large TX-power commands. */
+		if (sc->sc_hwtype == MWX_HW_MT7902) {
+			struct {
+				uint32_t addr;
+				uint32_t val;
+			} __packed reg_req = { htole32(MT_PSE_BASE), 0 };
+			int reg_seq = 0;
+			uint32_t reg_val = 0;
+
+			if (mwx_mcu_send_msg(sc, MCU_CE_QUERY_REG_READ,
+			    &reg_req, sizeof(reg_req), &reg_seq) == 0)
+				(void)mwx_mcu_wait_resp_int(sc,
+				    MCU_CE_QUERY_REG_READ, reg_seq, &reg_val);
+		}
 	}
 
 	return rv;
@@ -9569,7 +9648,7 @@ MtkMwx::getFirmwareVersion()
 {
 	if (com == NULL)
 		return "MT792x";
-	return com->sc_hwtype == MWX_HW_MT7922 ? "MT7922" : "MT7921";
+	return mwx_hw_name(com->sc_hwtype);
 }
 
 int16_t
@@ -9601,6 +9680,8 @@ MtkMwx::getFirmwareName()
 {
 	if (com == NULL || com->sc_hwtype == MWX_HW_MT7922)
 		return MT7922_FIRMWARE_WM;
+	if (com->sc_hwtype == MWX_HW_MT7902)
+		return MT7902_FIRMWARE_WM;
 	return MT7921_FIRMWARE_WM;
 }
 
@@ -10815,13 +10896,20 @@ static uint8_t mwx_awdl_phy()
     return (uint8_t)value;
 }
 
+// Single-stream radios (MT7902) stay on the 1SS HT MCS 7 ladder (phy=0)
+// instead of climbing onto 2SS VHT rungs.
+static uint8_t mwx_awdl_phy_for(const struct mwx_softc *sc)
+{
+    return (sc && sc->sc_capa.num_streams < 2) ? 0 : mwx_awdl_phy();
+}
+
 // Center of the non-DFS 80 MHz block holding a 5 GHz AWDL channel, or 0 to
 // stay at 20 MHz. Associated, never overlap the AP's block with another
 // primary channel, and on the AP's own channel only at the AP's 80 MHz
 // (one tuning for both; ForbiddenItlwm #26 saw losses otherwise).
 static uint8_t mwx_awdl_center80(mwx_softc *sc,uint8_t channel)
 {
-    if(mwx_awdl_phy()<2 || sc->sc_awdl_wide_off || sc->sc_awdl_tx_status.ofdmOnly) return 0;
+    if(mwx_awdl_phy_for(sc)<2 || sc->sc_awdl_wide_off || sc->sc_awdl_tx_status.ofdmOnly) return 0;
     uint8_t first;
     if(channel>=36 && channel<=48) first=36;
     else if(channel>=149 && channel<=161) first=149;
@@ -11317,7 +11405,7 @@ IOReturn MtkMwx::awdlEnable(const uint8_t *address, bool enable, const AwdlSyncG
     mwx_clear(sc,MT_WF_RFCR(0),mwx_awdl_filter_mask);
     for(unsigned i=0;i<3;++i) mwx_awdl_reset_rate(sc,i);
     sc->sc_awdl_tx_status.ofdmOnly=!mwx_awdl_ht_enabled();
-    sc->sc_awdl_tx_status.phy=mwx_awdl_phy();
+    sc->sc_awdl_tx_status.phy=mwx_awdl_phy_for(sc);
     sc->sc_awdl_tx_status.band2g=false;
     sc->sc_awdl_tx_status.wide=false;
     sc->sc_awdl_roc_center80=0;
@@ -12105,7 +12193,7 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
         basic->extra_info=htole16(EXTRA_INFO_VER | (add ? EXTRA_INFO_NEW : 0));
         memcpy(basic->peer_addr,address,6);
         if(add && includeRa && mwx_awdl_txba_enabled()) {
-            const bool vht=mwx_awdl_phy()>=1;
+            const bool vht=mwx_awdl_phy_for(com)>=1;
             const bool ldpc=mwx_awdl_ldpc_enabled();
             const bool sgi=mwx_awdl_sgi_enabled();
             uint16_t htCap=IEEE80211_HTCAP_SMPS_DIS << IEEE80211_HTCAP_SMPS_SHIFT;
@@ -12155,11 +12243,11 @@ IOReturn MtkMwx::awdlPeer(const uint8_t *address,bool add)
             if(mwx_awdl_txba_enabled()) {
                 auto ht=(wtbl_ht *)mwx_append_tlv(msg,&wcount,WTBL_HT,sizeof(wtbl_ht));
                 ht->ht=1; ht->ldpc=mwx_awdl_ldpc_enabled() ? 1 : 0;
-                ht->af=mwx_awdl_phy()>=1 ? 7 : 3; ht->mm=0;
+                ht->af=mwx_awdl_phy_for(com)>=1 ? 7 : 3; ht->mm=0;
                 wlen+=sizeof(*ht);
                 // MtkWireless: VHT rungs (amtk_awdl_phy >= 1) are aggregated
                 // as VHT A-MPDUs; the MAC needs the peer marked VHT for that.
-                if(mwx_awdl_phy()>=1) {
+                if(mwx_awdl_phy_for(com)>=1) {
                     auto vht=(wtbl_vht *)mwx_append_tlv(msg,&wcount,WTBL_VHT,sizeof(wtbl_vht));
                     vht->vht=1; vht->ldpc=mwx_awdl_ldpc_enabled() ? 1 : 0;
                     wlen+=sizeof(*vht);

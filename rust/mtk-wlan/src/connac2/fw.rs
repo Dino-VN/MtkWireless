@@ -359,6 +359,7 @@ mod tests {
         for name in [
             "mwx-mt7961_patch_mcu_1_2_hdr",
             "mwx-mt7922_patch_mcu_1_1_hdr",
+            "mwx-mt7902_patch_mcu_1_1_hdr",
         ] {
             let data = firmware(name);
             let img = PatchImage::parse(&data).unwrap();
@@ -373,7 +374,11 @@ mod tests {
 
     #[test]
     fn shipped_ram_images_parse() {
-        for name in ["mwx-mt7961_ram_code_1", "mwx-mt7922_ram_code_1"] {
+        for name in [
+            "mwx-mt7961_ram_code_1",
+            "mwx-mt7922_ram_code_1",
+            "mwx-mt7902_ram_code_1",
+        ] {
             let data = firmware(name);
             let img = RamImage::parse(&data).unwrap();
             assert!(img.regions >= 2, "{name}");
